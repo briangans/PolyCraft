@@ -14,7 +14,7 @@ PolyCraft is a trimmed-down Maya clone written in Rust, built to leverage decade
 
 ## 3. Architectural Rules
 - **Viewport:** `wgpu` clears to Maya-gray `(r: 0.196, g: 0.196, b: 0.196)`.
-- **State Management:** Strict decoupling. The event loop should only handle OS events; render logic and mesh data live in separate State structs.
+- **State Management:** Strict decoupling. The `State` struct encapsulates all `wgpu` initialization, buffers, and render passes. The `winit` event loop strictly routes OS events (resizes, mouse inputs) to the `State` and `CameraController`.
 - **Undo System:** Command pattern. Every mesh operation is a struct implementing `execute()` and `undo()`.
 
 ## 4. File Structure (Current)
@@ -24,5 +24,5 @@ polycraft/
 ├── docs/
 │   └── AI_DIGEST.md
 └── src/
-    ├── main.rs     # winit event loop, wgpu setup, and camera uniform buffer logic
+    ├── main.rs     # winit event loop, wgpu State struct, Camera, and CameraController
     └── shader.wgsl # Vertex/fragment shader with Camera projection math

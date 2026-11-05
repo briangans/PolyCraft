@@ -1,11 +1,11 @@
 use cgmath::SquareMatrix;
 use std::sync::Arc;
+use wgpu::util::DeviceExt;
 use winit::{
-    event::{Event, WindowEvent},
+    event::{DeviceEvent, ElementState, Event, MouseButton, WindowEvent},
     event_loop::EventLoop,
     window::{Window, WindowBuilder},
 };
-use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -33,6 +33,75 @@ const VERTICES: &[Vertex] = &[
     Vertex { position: [0.5, -0.5, 0.0], color: [0.0, 0.0, 1.0] },
 ];
 
+// --- NEW CAMERA SYSTEM ---
+
+struct Camera {
+    target: cgmath::Point3<f32>,
+    distance: f32,
+    yaw: f32,
+    pitch: f32,
+}
+
+impl Camera {
+    fn build_view_projection_matrix(&self, aspect: f32) -> cgmath::Matrix4<f32> {
+        let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
+        let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
+
+        // Calculate the camera's physical position in space based on orbit angles
+        let eye = cgmath::Point3::new(
+            self.target.x + self.distance * cos_pitch * sin_yaw,
+            self.target.y + self.distance * sin_pitch,
+            self.target.z + self.distance * cos_pitch * cos_yaw,
+        );
+
+        let view = cgmath::Matrix4::look_at_rh(eye, self.target, cgmath::Vector3::unit_y());
+        let proj = cgmath::perspective(cgmath::Deg(45.0), aspect, 0.1, 100.0);
+        
+        let wgpu_correction = cgmath::Matrix4::new(
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.5, 0.0,
+            0.0, 0.0, 0.5, 1.0,
+        );
+        
+        wgpu_correction * proj * view
+    }
+}
+
+struct CameraController {
+    is_drag_active: bool,
+    speed: f32,
+}
+
+impl CameraController {
+    fn new(speed: f32) -> Self {
+        Self {
+            is_drag_active: false,
+            speed,
+        }
+    }
+
+    fn process_mouse_input(&mut self, state: ElementState, button: MouseButton) -> bool {
+        if button == MouseButton::Left {
+            self.is_drag_active = state == ElementState::Pressed;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn process_mouse_motion(&mut self, dx: f64, dy: f64, camera: &mut Camera) {
+        if self.is_drag_active {
+            camera.yaw -= (dx as f32) * self.speed;
+            camera.pitch += (dy as f32) * self.speed;
+
+            // Clamp pitch to prevent the camera from flipping upside down at the poles
+            let safe_angle = std::f32::consts::FRAC_PI_2 - 0.01;
+            camera.pitch = camera.pitch.clamp(-safe_angle, safe_angle);
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
@@ -41,27 +110,14 @@ struct CameraUniform {
 
 impl CameraUniform {
     fn new() -> Self {
-        Self {
-            view_proj: cgmath::Matrix4::identity().into(),
-        }
+        Self { view_proj: cgmath::Matrix4::identity().into() }
     }
-
-    fn update_matrices(&mut self, aspect: f32) {
-        let view = cgmath::Matrix4::look_at_rh(
-            cgmath::Point3::new(0.0, 1.0, 2.0),
-            cgmath::Point3::new(0.0, 0.0, 0.0),
-            cgmath::Vector3::unit_y(),
-        );
-        let proj = cgmath::perspective(cgmath::Deg(45.0), aspect, 0.1, 100.0);
-        let wgpu_correction = cgmath::Matrix4::new(
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 0.5, 0.0,
-            0.0, 0.0, 0.5, 1.0,
-        );
-        self.view_proj = (wgpu_correction * proj * view).into();
+    fn update_view_proj(&mut self, camera: &Camera, aspect: f32) {
+        self.view_proj = camera.build_view_projection_matrix(aspect).into();
     }
 }
+
+// --- STATE INTEGRATION ---
 
 struct State<'a> {
     surface: wgpu::Surface<'a>,
@@ -72,6 +128,9 @@ struct State<'a> {
     window: Arc<Window>,
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
+    
+    camera: Camera,
+    camera_controller: CameraController,
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -82,7 +141,6 @@ impl<'a> State<'a> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window.clone()).unwrap();
-        
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
@@ -90,7 +148,6 @@ impl<'a> State<'a> {
         }).await.unwrap();
 
         let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor::default(), None).await.unwrap();
-
         let config = surface.get_default_config(&adapter, size.width, size.height).unwrap();
         surface.configure(&device, &config);
 
@@ -99,9 +156,18 @@ impl<'a> State<'a> {
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
+        // Initialize Camera
+        let camera = Camera {
+            target: cgmath::Point3::new(0.0, 0.0, 0.0),
+            distance: 2.0,
+            yaw: 0.0,
+            pitch: 0.2, // Start slightly above the triangle
+        };
+        let camera_controller = CameraController::new(0.005);
+        
         let aspect_ratio = config.width as f32 / config.height as f32;
         let mut camera_uniform = CameraUniform::new();
-        camera_uniform.update_matrices(aspect_ratio);
+        camera_uniform.update_view_proj(&camera, aspect_ratio);
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera Buffer"),
@@ -114,11 +180,7 @@ impl<'a> State<'a> {
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             }],
         });
@@ -126,10 +188,7 @@ impl<'a> State<'a> {
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Camera Bind Group"),
             layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() }],
         });
 
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -178,17 +237,8 @@ impl<'a> State<'a> {
         });
 
         Self {
-            surface,
-            device,
-            queue,
-            config,
-            size,
-            window,
-            render_pipeline,
-            vertex_buffer,
-            camera_uniform,
-            camera_buffer,
-            camera_bind_group,
+            surface, device, queue, config, size, window, render_pipeline, vertex_buffer,
+            camera, camera_controller, camera_uniform, camera_buffer, camera_bind_group,
         }
     }
 
@@ -198,11 +248,15 @@ impl<'a> State<'a> {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
-
-            let aspect = self.config.width as f32 / self.config.height as f32;
-            self.camera_uniform.update_matrices(aspect);
-            self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+            self.update_camera_matrix();
         }
+    }
+
+    // Explicit function to push matrix changes to the GPU
+    fn update_camera_matrix(&mut self) {
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        self.camera_uniform.update_view_proj(&self.camera, aspect);
+        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -246,10 +300,19 @@ async fn run() {
 
     let _ = event_loop.run(move |event, elwt| {
         match event {
+            // 1. Capture unbounded mouse delta for rotation
+            Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta }, .. } => {
+                state.camera_controller.process_mouse_motion(delta.0, delta.1, &mut state.camera);
+                state.update_camera_matrix();
+            }
             Event::WindowEvent { ref event, window_id } if window_id == state.window.id() => {
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(physical_size) => state.resize(*physical_size),
+                    // 2. Track left-click hold state
+                    WindowEvent::MouseInput { state: button_state, button, .. } => {
+                        state.camera_controller.process_mouse_input(*button_state, *button);
+                    }
                     WindowEvent::RedrawRequested => {
                         match state.render() {
                             Ok(_) => {}
