@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug PolyCraft",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=polycraft",
+                    "--package=polycraft"
+                ],
+                "filter": {
+                    "name": "polycraft",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

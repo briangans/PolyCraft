@@ -1,0 +1,11 @@
+[package]
+name = "polycraft"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.29.15"
+wgpu = "0.20.0"
+pollster = "0.3.0"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+cgmath = "0.18.0"
