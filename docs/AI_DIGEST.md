@@ -13,8 +13,8 @@ PolyCraft is a trimmed-down Maya clone written in Rust, built to leverage decade
 - **Export (Planned):** `fbxcel` or C++ bindings to Autodesk FBX SDK.
 
 ## 3. Architectural Rules
-- **Viewport:** `wgpu` clears to Maya-gray `(r: 0.196, g: 0.196, b: 0.196)`.
-- **State Management:** Strict decoupling. The `State` struct encapsulates all `wgpu` initialization, buffers, and render passes. The `winit` event loop strictly routes OS events (resizes, mouse inputs) to the `State` and `CameraController`.
+- **Viewport:** `wgpu` clears to Maya-gray `(r: 0.196, g: 0.196, b: 0.196)` and uses a 32-bit float Depth Stencil to properly occlude hidden faces.
+- **State Management:** Strict decoupling. The `State` struct encapsulates all `wgpu` initialization, buffers, and render passes. The `winit` event loop strictly routes OS events (resizes, mouse inputs, key modifiers) to the `State` and `CameraController`.
 - **Undo System:** Command pattern. Every mesh operation is a struct implementing `execute()` and `undo()`.
 
 ## 4. File Structure (Current)
@@ -24,5 +24,5 @@ polycraft/
 ├── docs/
 │   └── AI_DIGEST.md
 └── src/
-    ├── main.rs     # winit event loop, wgpu State struct, Camera, and CameraController
+    ├── main.rs     # winit loop, wgpu State, 3D Cube arrays, and Maya CameraController
     └── shader.wgsl # Vertex/fragment shader with Camera projection math
