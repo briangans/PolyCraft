@@ -1,9 +1,13 @@
+mod camera;
 mod mesh;
-use cgmath::{InnerSpace, SquareMatrix};
+mod ui;
+
+use camera::{Camera, CameraController};
+use cgmath::SquareMatrix;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::{
-    event::{DeviceEvent, ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{DeviceEvent, Event, WindowEvent},
     event_loop::EventLoop,
     keyboard::ModifiersState,
     window::{Window, WindowBuilder},
@@ -13,114 +17,19 @@ use winit::{
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
     position: [f32; 3],
+    normal: [f32; 3], // <-- New field
     color: [f32; 3],
 }
 
 impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+    // Add the 3rd attribute for the normal
+    const ATTRIBS: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
     fn desc() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &Self::ATTRIBS,
-        }
-    }
-}
-
-struct Camera {
-    target: cgmath::Point3<f32>,
-    distance: f32,
-    yaw: f32,
-    pitch: f32,
-}
-
-impl Camera {
-    fn build_view_projection_matrix(&self, aspect: f32) -> cgmath::Matrix4<f32> {
-        let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
-        let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
-
-        let eye = cgmath::Point3::new(
-            self.target.x + self.distance * cos_pitch * sin_yaw,
-            self.target.y + self.distance * sin_pitch,
-            self.target.z + self.distance * cos_pitch * cos_yaw,
-        );
-
-        let view = cgmath::Matrix4::look_at_rh(eye, self.target, cgmath::Vector3::unit_y());
-        let proj = cgmath::perspective(cgmath::Deg(45.0), aspect, 0.1, 100.0);
-        let wgpu_correction = cgmath::Matrix4::new(
-            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
-        );
-        wgpu_correction * proj * view
-    }
-}
-
-struct CameraController {
-    alt_pressed: bool,
-    is_left_clicked: bool,
-    is_middle_clicked: bool,
-    is_right_clicked: bool,
-    orbit_speed: f32,
-    pan_speed: f32,
-    zoom_speed: f32,
-}
-
-impl CameraController {
-    fn new() -> Self {
-        Self {
-            alt_pressed: false,
-            is_left_clicked: false,
-            is_middle_clicked: false,
-            is_right_clicked: false,
-            orbit_speed: 0.005,
-            pan_speed: 0.002,
-            zoom_speed: 0.01,
-        }
-    }
-
-    fn process_mouse_input(&mut self, state: ElementState, button: MouseButton) {
-        let is_pressed = state == ElementState::Pressed;
-        match button {
-            MouseButton::Left => self.is_left_clicked = is_pressed,
-            MouseButton::Middle => self.is_middle_clicked = is_pressed,
-            MouseButton::Right => self.is_right_clicked = is_pressed,
-            _ => {}
-        }
-    }
-
-    fn process_scroll(&mut self, delta: &MouseScrollDelta, camera: &mut Camera) {
-        let scroll_amount = match delta {
-            MouseScrollDelta::LineDelta(_, y) => *y * 0.5,
-            MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.01,
-        };
-        camera.distance -= scroll_amount * camera.distance * 0.2;
-        camera.distance = camera.distance.max(0.1);
-    }
-
-    fn process_mouse_motion(&mut self, dx: f64, dy: f64, camera: &mut Camera) {
-        if !self.alt_pressed {
-            return;
-        }
-
-        if self.is_left_clicked {
-            camera.yaw -= (dx as f32) * self.orbit_speed;
-            camera.pitch += (dy as f32) * self.orbit_speed;
-            let safe_angle = std::f32::consts::FRAC_PI_2 - 0.01;
-            camera.pitch = camera.pitch.clamp(-safe_angle, safe_angle);
-        } else if self.is_middle_clicked {
-            let (sin_pitch, cos_pitch) = camera.pitch.sin_cos();
-            let (sin_yaw, cos_yaw) = camera.yaw.sin_cos();
-
-            let forward = cgmath::Vector3::new(cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw)
-                .normalize();
-            let right = forward.cross(cgmath::Vector3::unit_y()).normalize();
-            let up = right.cross(forward).normalize();
-
-            camera.target += right * (dx as f32 * self.pan_speed * camera.distance)
-                + up * (dy as f32 * self.pan_speed * camera.distance);
-        } else if self.is_right_clicked {
-            camera.distance += (dx as f32 + dy as f32) * self.zoom_speed * camera.distance;
-            camera.distance = camera.distance.max(0.1);
         }
     }
 }
@@ -164,6 +73,7 @@ struct State<'a> {
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    ui_state: ui::UiState,
 }
 
 impl<'a> State<'a> {
@@ -306,12 +216,12 @@ impl<'a> State<'a> {
         let cube_mesh = mesh::HalfEdgeMesh::create_cube();
         let (raw_verts, raw_indices) = cube_mesh.generate_render_buffers();
 
-        // Map the raw positions to our wgpu Vertex struct, giving them a default gray color
         let wgpu_vertices: Vec<Vertex> = raw_verts
             .iter()
-            .map(|pos| Vertex {
+            .map(|(pos, norm)| Vertex {
                 position: *pos,
-                color: [0.6, 0.6, 0.6], // Base gray color for the geometry
+                normal: *norm, // <-- Pass the normal to the GPU
+                color: [0.6, 0.6, 0.6],
             })
             .collect();
 
@@ -338,6 +248,7 @@ impl<'a> State<'a> {
             None,
         );
         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1);
+        let ui_state = ui::UiState::new();
 
         Self {
             surface,
@@ -359,6 +270,7 @@ impl<'a> State<'a> {
             egui_ctx,
             egui_state,
             egui_renderer,
+            ui_state,
         }
     }
 
@@ -416,13 +328,8 @@ impl<'a> State<'a> {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         self.egui_ctx.begin_frame(raw_input);
 
-        // Immediate Mode UI definition
-        egui::Window::new("PolyCraft Tools").show(&self.egui_ctx, |ui| {
-            ui.label("Viewport Overlay Initialized.");
-            if ui.button("Test Tool Operation").clicked() {
-                println!("Operation fired from UI!");
-            }
-        });
+        // Run the extracted UI logic
+        self.ui_state.draw(&self.egui_ctx);
 
         // Tessellate UI geometry
         let full_output = self.egui_ctx.end_frame();

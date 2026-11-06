@@ -21,8 +21,11 @@ PolyCraft is a trimmed-down Maya clone written in Rust, built to leverage decade
 polycraft/
 ├── Cargo.toml      
 ├── docs/
-│   └── AI_DIGEST.md
+│   ├── AI_DIGEST.md
+│   └── ARCHITECTURE.md
 └── src/
-    ├── main.rs     # winit loop, wgpu State, CameraController, and UI hook
+    ├── main.rs     # winit loop, wgpu State
     ├── mesh.rs     # Half-Edge Mesh data structure and GPU buffer triangulation
-    └── shader.wgsl # Vertex/fragment shader
+    ├── camera.rs   # Orbit camera math and Maya-style navigation controls
+    ├── ui.rs       # Spacebar Pie Menu, absolute radial widget positioning
+    └── shader.wgsl # Vertex/fragment shader with flat shading lighting

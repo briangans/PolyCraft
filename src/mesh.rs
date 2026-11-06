@@ -1,4 +1,4 @@
-use cgmath::Point3;
+use cgmath::{InnerSpace, Point3}; // <-- Ensure InnerSpace is imported
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -133,35 +133,46 @@ impl HalfEdgeMesh {
     }
 
     /// Converts the Half-Edge mesh into flat buffers for wgpu rendering
-    pub fn generate_render_buffers(&self) -> (Vec<[f32; 3]>, Vec<u16>) {
+    pub fn generate_render_buffers(&self) -> (Vec<([f32; 3], [f32; 3])>, Vec<u16>) {
         let mut render_verts = Vec::new();
         let mut render_indices = Vec::new();
-
-        for v in &self.vertices {
-            render_verts.push([v.position.x, v.position.y, v.position.z]);
-        }
+        let mut current_vertex_index = 0;
 
         for face in &self.faces {
             if let Some(start_edge_id) = face.half_edge {
                 let mut current_edge_id = start_edge_id;
-                let mut face_vertex_indices = Vec::new();
+                let mut face_positions = Vec::new();
 
                 loop {
                     let edge = &self.half_edges[current_edge_id.0];
-                    face_vertex_indices.push(edge.origin.0 as u16);
+                    face_positions.push(self.vertices[edge.origin.0].position);
                     current_edge_id = edge.next.unwrap();
                     if current_edge_id == start_edge_id {
                         break;
                     }
                 }
 
-                // Triangle Fan: 0-1-2, 0-2-3
-                if face_vertex_indices.len() >= 3 {
-                    let v0 = face_vertex_indices[0];
-                    for i in 1..(face_vertex_indices.len() - 1) {
-                        render_indices.push(v0);
-                        render_indices.push(face_vertex_indices[i]);
-                        render_indices.push(face_vertex_indices[i + 1]);
+                if face_positions.len() >= 3 {
+                    // 1. Calculate Face Normal using the first three vertices
+                    let v0 = face_positions[0];
+                    let v1 = face_positions[1];
+                    let v2 = face_positions[2];
+
+                    let normal = (v1 - v0).cross(v2 - v0).normalize();
+                    let n_array = [normal.x, normal.y, normal.z];
+
+                    // 2. Un-weld vertices for flat shading
+                    let start_idx = current_vertex_index;
+                    for pos in &face_positions {
+                        render_verts.push(([pos.x, pos.y, pos.z], n_array));
+                        current_vertex_index += 1;
+                    }
+
+                    // 3. Triangle Fan
+                    for i in 1..(face_positions.len() - 1) as u16 {
+                        render_indices.push(start_idx);
+                        render_indices.push(start_idx + i);
+                        render_indices.push(start_idx + i + 1);
                     }
                 }
             }
