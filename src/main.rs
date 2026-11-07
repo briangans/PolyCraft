@@ -1,9 +1,11 @@
 mod camera;
 mod mesh;
+mod scene;
 mod ui;
 
 use camera::{Camera, CameraController};
 use cgmath::SquareMatrix;
+use scene::Scene;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -51,6 +53,38 @@ impl CameraUniform {
     }
 }
 
+/// Builds the GPU vertex/index buffers for a mesh. Used for the first upload and again
+/// whenever the mesh changes. Returns (vertex buffer, index buffer, index count).
+fn create_mesh_buffers(
+    device: &wgpu::Device,
+    mesh: &mesh::HalfEdgeMesh,
+) -> (wgpu::Buffer, wgpu::Buffer, u32) {
+    let (raw_verts, raw_indices) = mesh.generate_render_buffers();
+
+    let wgpu_vertices: Vec<Vertex> = raw_verts
+        .iter()
+        .map(|(pos, norm)| Vertex {
+            position: *pos,
+            normal: *norm, // <-- Pass the normal to the GPU
+            color: [0.6, 0.6, 0.6],
+        })
+        .collect();
+
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Vertex Buffer"),
+        contents: bytemuck::cast_slice(&wgpu_vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Index Buffer"),
+        contents: bytemuck::cast_slice(&raw_indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+
+    (vertex_buffer, index_buffer, raw_indices.len() as u32)
+}
+
 struct State<'a> {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
@@ -59,6 +93,9 @@ struct State<'a> {
     pub size: winit::dpi::PhysicalSize<u32>,
     window: Arc<Window>,
     render_pipeline: wgpu::RenderPipeline,
+    // Document state: the mesh being edited and the current edit mode
+    scene: Scene,
+    // GPU copies of scene.mesh(); rebuilt by upload_mesh() whenever the mesh changes
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
@@ -212,31 +249,9 @@ impl<'a> State<'a> {
             multiview: None,
         });
 
-        // Generate the Half-Edge Mesh
-        let cube_mesh = mesh::HalfEdgeMesh::create_cube();
-        let (raw_verts, raw_indices) = cube_mesh.generate_render_buffers();
-
-        let wgpu_vertices: Vec<Vertex> = raw_verts
-            .iter()
-            .map(|(pos, norm)| Vertex {
-                position: *pos,
-                normal: *norm, // <-- Pass the normal to the GPU
-                color: [0.6, 0.6, 0.6],
-            })
-            .collect();
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&wgpu_vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&raw_indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-        let num_indices = raw_indices.len() as u32;
+        // Build the scene (a cube, in Object mode) and upload its mesh to the GPU
+        let scene = Scene::new();
+        let (vertex_buffer, index_buffer, num_indices) = create_mesh_buffers(&device, scene.mesh());
 
         // Initialize Egui Data Structs
         let egui_ctx = egui::Context::default();
@@ -258,6 +273,7 @@ impl<'a> State<'a> {
             size,
             window,
             render_pipeline,
+            scene,
             vertex_buffer,
             index_buffer,
             num_indices,
@@ -313,7 +329,21 @@ impl<'a> State<'a> {
         );
     }
 
+    /// Rebuilds the GPU buffers from the scene's mesh.
+    fn upload_mesh(&mut self) {
+        let (vertex_buffer, index_buffer, num_indices) =
+            create_mesh_buffers(&self.device, self.scene.mesh());
+        self.vertex_buffer = vertex_buffer;
+        self.index_buffer = index_buffer;
+        self.num_indices = num_indices;
+    }
+
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // If anything edited the mesh since the last frame, re-upload it first
+        if self.scene.take_mesh_dirty() {
+            self.upload_mesh();
+        }
+
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -328,8 +358,10 @@ impl<'a> State<'a> {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         self.egui_ctx.begin_frame(raw_input);
 
-        // Run the extracted UI logic
-        self.ui_state.draw(&self.egui_ctx);
+        // Run the extracted UI logic; it reports user intent back instead of mutating state
+        if let Some(mode) = self.ui_state.draw(&self.egui_ctx, self.scene.mode) {
+            self.scene.mode = mode;
+        }
 
         // Tessellate UI geometry
         let full_output = self.egui_ctx.end_frame();
