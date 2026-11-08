@@ -1,6 +1,9 @@
 mod camera;
+pub mod edit_mode;
 mod mesh;
+pub mod picking;
 mod scene;
+pub mod selection;
 mod ui;
 
 use camera::{Camera, CameraController};
@@ -59,7 +62,9 @@ fn create_mesh_buffers(
     device: &wgpu::Device,
     mesh: &mesh::HalfEdgeMesh,
 ) -> (wgpu::Buffer, wgpu::Buffer, u32) {
-    let (raw_verts, raw_indices) = mesh.generate_render_buffers();
+    let render_data = mesh.generate_render_buffers();
+    let raw_verts = render_data.vertices;
+    let raw_indices = render_data.indices;
 
     let wgpu_vertices: Vec<Vertex> = raw_verts
         .iter()
@@ -340,7 +345,7 @@ impl<'a> State<'a> {
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         // If anything edited the mesh since the last frame, re-upload it first
-        if self.scene.take_mesh_dirty() {
+        if self.scene.take_dirty() {
             self.upload_mesh();
         }
 
@@ -359,8 +364,8 @@ impl<'a> State<'a> {
         self.egui_ctx.begin_frame(raw_input);
 
         // Run the extracted UI logic; it reports user intent back instead of mutating state
-        if let Some(mode) = self.ui_state.draw(&self.egui_ctx, self.scene.mode) {
-            self.scene.mode = mode;
+        if let Some(mode) = self.ui_state.draw(&self.egui_ctx, self.scene.mode()) {
+            self.scene.set_mode(mode);
         }
 
         // Tessellate UI geometry

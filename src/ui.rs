@@ -113,7 +113,7 @@ impl UiState {
                     if let Some(pos) = pointer {
                         ui.painter().line_segment(
                             [center, pos],
-                            egui::Stroke::new(2.0, Color32::from_white_alpha(100)),
+                            egui::Stroke::new(2.0_f32, Color32::from_white_alpha(100)),
                         );
                     }
                 });
