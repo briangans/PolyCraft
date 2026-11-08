@@ -68,9 +68,9 @@ fn create_mesh_buffers(
 
     let wgpu_vertices: Vec<Vertex> = raw_verts
         .iter()
-        .map(|(pos, norm)| Vertex {
-            position: *pos,
-            normal: *norm, // <-- Pass the normal to the GPU
+        .map(|render_vert| Vertex {
+            position: render_vert.position,
+            normal: render_vert.normal, // <-- Pass the normal to the GPU
             color: [0.6, 0.6, 0.6],
         })
         .collect();
