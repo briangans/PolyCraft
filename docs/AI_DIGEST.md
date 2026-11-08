@@ -40,8 +40,8 @@ polycraft/
 - `VertexId`, `HalfEdgeId`, `FaceId` are `usize` newtypes indexing the `Vec`s in `HalfEdgeMesh`.
 
 ## 6. Status (update at the end of every task)
-- **Working:** Flat-shaded cube from the half-edge mesh; Maya camera (Alt+LMB orbit, Alt+MMB pan, Alt+RMB/scroll zoom); Space pie menu UI.
-- **Implemented, not yet run-tested:** Pie menu: hold Space, flick toward a slot and release to set `EditMode` (Object/Vertex/Edge/Face); releasing in the center cancels, and clicking a slot also works. The mode is shown in the "PolyCraft Tools" window. `Scene` owns the mesh, with a GPU re-upload path.
+- **Working:** Flat-shaded cube from the half-edge mesh; Maya camera (Alt+LMB orbit, Alt+MMB pan, Alt+RMB/scroll zoom); Space pie menu: hold Space, flick toward a slot and release to set `EditMode` (Object/Vertex/Edge/Face), shown in the "PolyCraft Tools" window. Releasing in the center or after losing focus cancels; clicking a slot also works.
+- **Implemented, not yet exercised:** `Scene` dirty flag and the GPU re-upload (`upload_mesh`). Nothing edits the mesh yet.
 - **Not built yet:** Edge/vertex display, picking/selection, transforms, edit operations, undo, FBX export. `EditMode` is stored but does not change behavior yet, and nothing edits the mesh yet.
 - **Known limitations:** `u16` index buffer (about 16k quads max); face normals use the first three vertices (wrong for concave or degenerate faces); the graphics backend is chosen by `Instance::default()`, not forced to DX12; every `mesh_mut()` call recreates both GPU buffers, so before interactive vertex dragging, split the dirty flag into topology (recreate buffers) and positions (`queue.write_buffer`).
 - **Next (proposed):** Draw edges/vertices per `EditMode`, then picking/selection.

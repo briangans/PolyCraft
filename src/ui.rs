@@ -66,8 +66,9 @@ impl UiState {
             self.pie_menu_center = pointer_pos;
         } else if !space_down {
             // Releasing Space commits the slot the pointer was flicked toward (Maya-style).
-            // Releasing inside the dead zone, or with the pointer outside the window, cancels.
-            if self.pie_menu_active {
+            // Releasing inside the dead zone, with the pointer outside the window, or after the
+            // window lost focus (Alt-Tab makes winit synthesize a key release) cancels.
+            if self.pie_menu_active && ctx.input(|i| i.focused) {
                 picked_mode = pointer.and_then(|p| slot_toward(p - self.pie_menu_center));
             }
             self.pie_menu_active = false;
@@ -149,5 +150,92 @@ mod tests {
         // Diagonals go to whichever axis dominates.
         assert_eq!(slot_toward(Vec2::new(40.0, -60.0)), Some(EditMode::Edge));
         assert_eq!(slot_toward(Vec2::new(60.0, 40.0)), Some(EditMode::Object));
+    }
+
+    // Frame-level tests: drive `UiState::draw` through egui with synthetic input, no window needed.
+
+    fn space_event(pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: Some(egui::Key::Space),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Runs one egui frame with the given events and returns what `draw` reported.
+    fn run_frame(
+        ctx: &egui::Context,
+        ui_state: &mut UiState,
+        events: Vec<egui::Event>,
+        focused: bool,
+    ) -> Option<EditMode> {
+        let mut picked = None;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+            focused,
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            picked = ui_state.draw(ctx, EditMode::Object);
+        });
+        picked
+    }
+
+    /// Opens the menu at (300, 300), moves the pointer by `flick`, then releases Space.
+    fn flick_and_release(flick: Vec2, focused_on_release: bool) -> Option<EditMode> {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::new();
+        let center = Pos2::new(300.0, 300.0);
+
+        let open = vec![egui::Event::PointerMoved(center), space_event(true)];
+        assert_eq!(run_frame(&ctx, &mut ui_state, open, true), None);
+
+        let flick_to = vec![egui::Event::PointerMoved(center + flick)];
+        let flicked = run_frame(&ctx, &mut ui_state, flick_to, true);
+        assert_eq!(
+            flicked, None,
+            "nothing is committed until Space is released"
+        );
+
+        run_frame(
+            &ctx,
+            &mut ui_state,
+            vec![space_event(false)],
+            focused_on_release,
+        )
+    }
+
+    #[test]
+    fn releasing_space_after_a_flick_selects_the_slot() {
+        assert_eq!(
+            flick_and_release(Vec2::new(40.0, 0.0), true),
+            Some(EditMode::Object)
+        );
+        assert_eq!(
+            flick_and_release(Vec2::new(-40.0, 0.0), true),
+            Some(EditMode::Vertex)
+        );
+        assert_eq!(
+            flick_and_release(Vec2::new(0.0, -40.0), true),
+            Some(EditMode::Edge)
+        );
+        assert_eq!(
+            flick_and_release(Vec2::new(0.0, 40.0), true),
+            Some(EditMode::Face)
+        );
+    }
+
+    #[test]
+    fn releasing_space_in_the_dead_zone_cancels() {
+        assert_eq!(flick_and_release(Vec2::new(10.0, 0.0), true), None);
+    }
+
+    #[test]
+    fn losing_focus_with_the_menu_open_does_not_select() {
+        // Alt-Tab: winit synthesizes a key release and egui reports `focused == false`.
+        assert_eq!(flick_and_release(Vec2::new(40.0, 0.0), false), None);
     }
 }
