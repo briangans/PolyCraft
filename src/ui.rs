@@ -58,12 +58,14 @@ impl UiState {
 
         // 2. Get the exact screen coordinates of the mouse (None if it has left the window)
         let pointer = ctx.input(|i| i.pointer.latest_pos());
-        let pointer_pos = pointer.unwrap_or(Pos2::ZERO);
 
-        // 3. Lock the center position the moment Space is pressed
+        // 3. Lock the center position the moment Space is pressed. With no known pointer position
+        // there is nowhere to center the menu, so it stays closed until the pointer is back.
         if space_down && !self.pie_menu_active {
-            self.pie_menu_active = true;
-            self.pie_menu_center = pointer_pos;
+            if let Some(pos) = pointer {
+                self.pie_menu_active = true;
+                self.pie_menu_center = pos;
+            }
         } else if !space_down {
             // Releasing Space commits the slot the pointer was flicked toward (Maya-style).
             // Releasing inside the dead zone, with the pointer outside the window, or after the
@@ -106,11 +108,14 @@ impl UiState {
                         }
                     }
 
-                    // Draw a swipe-tracking line from the menu center to the current mouse position
-                    ui.painter().line_segment(
-                        [center, pointer_pos],
-                        egui::Stroke::new(2.0, Color32::from_white_alpha(100)),
-                    );
+                    // Draw a swipe-tracking line from the menu center to the current mouse position.
+                    // Hidden while the mouse is outside the window: there is no position to point at.
+                    if let Some(pos) = pointer {
+                        ui.painter().line_segment(
+                            [center, pos],
+                            egui::Stroke::new(2.0, Color32::from_white_alpha(100)),
+                        );
+                    }
                 });
         } else {
             // A persistent hint window when the menu is closed
@@ -164,13 +169,13 @@ mod tests {
         }
     }
 
-    /// Runs one egui frame with the given events and returns what `draw` reported.
-    fn run_frame(
+    /// Runs one egui frame; returns what `draw` reported and the shapes it painted.
+    fn run_frame_full(
         ctx: &egui::Context,
         ui_state: &mut UiState,
         events: Vec<egui::Event>,
         focused: bool,
-    ) -> Option<EditMode> {
+    ) -> (Option<EditMode>, Vec<egui::epaint::ClippedShape>) {
         let mut picked = None;
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
@@ -178,10 +183,39 @@ mod tests {
             events,
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| {
+        let output = ctx.run(input, |ctx| {
             picked = ui_state.draw(ctx, EditMode::Object);
         });
-        picked
+        (picked, output.shapes)
+    }
+
+    /// Runs one egui frame with the given events and returns what `draw` reported.
+    fn run_frame(
+        ctx: &egui::Context,
+        ui_state: &mut UiState,
+        events: Vec<egui::Event>,
+        focused: bool,
+    ) -> Option<EditMode> {
+        run_frame_full(ctx, ui_state, events, focused).0
+    }
+
+    /// Opens the menu with the pointer at `center`.
+    fn open_menu(ctx: &egui::Context, ui_state: &mut UiState, center: Pos2) {
+        let open = vec![egui::Event::PointerMoved(center), space_event(true)];
+        run_frame_full(ctx, ui_state, open, true);
+    }
+
+    /// Endpoints of the first line segment among the painted shapes, if any. The swipe-tracking
+    /// line is the only line segment the pie menu paints.
+    fn tracking_line(shapes: &[egui::epaint::ClippedShape]) -> Option<[Pos2; 2]> {
+        fn find(shape: &egui::epaint::Shape) -> Option<[Pos2; 2]> {
+            match shape {
+                egui::epaint::Shape::LineSegment { points, .. } => Some(*points),
+                egui::epaint::Shape::Vec(inner) => inner.iter().find_map(find),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|clipped| find(&clipped.shape))
     }
 
     /// Opens the menu at (300, 300), moves the pointer by `flick`, then releases Space.
@@ -237,5 +271,53 @@ mod tests {
     fn losing_focus_with_the_menu_open_does_not_select() {
         // Alt-Tab: winit synthesizes a key release and egui reports `focused == false`.
         assert_eq!(flick_and_release(Vec2::new(40.0, 0.0), false), None);
+    }
+
+    #[test]
+    fn tracking_line_follows_the_pointer() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::new();
+        let center = Pos2::new(300.0, 300.0);
+        open_menu(&ctx, &mut ui_state, center);
+
+        let pointer = Pos2::new(340.0, 300.0);
+        let moved = vec![egui::Event::PointerMoved(pointer)];
+        let (_, shapes) = run_frame_full(&ctx, &mut ui_state, moved, true);
+        assert_eq!(tracking_line(&shapes), Some([center, pointer]));
+    }
+
+    #[test]
+    fn tracking_line_is_hidden_when_the_pointer_leaves_the_window() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::new();
+        open_menu(&ctx, &mut ui_state, Pos2::new(300.0, 300.0));
+
+        let gone = vec![egui::Event::PointerGone];
+        let (_, shapes) = run_frame_full(&ctx, &mut ui_state, gone, true);
+        assert_eq!(tracking_line(&shapes), None);
+    }
+
+    #[test]
+    fn menu_stays_closed_while_the_pointer_position_is_unknown() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::new();
+        run_frame_full(&ctx, &mut ui_state, vec![space_event(true)], true);
+        assert!(!ui_state.pie_menu_active);
+    }
+
+    #[test]
+    fn releasing_space_with_the_pointer_outside_the_window_cancels() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::new();
+        let center = Pos2::new(300.0, 300.0);
+        open_menu(&ctx, &mut ui_state, center);
+
+        let flick = vec![egui::Event::PointerMoved(center + Vec2::new(40.0, 0.0))];
+        run_frame(&ctx, &mut ui_state, flick, true);
+
+        // The pointer leaves the window while Space is still held, then Space is released.
+        run_frame(&ctx, &mut ui_state, vec![egui::Event::PointerGone], true);
+        let released = run_frame(&ctx, &mut ui_state, vec![space_event(false)], true);
+        assert_eq!(released, None);
     }
 }
