@@ -41,3 +41,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     return vec4<f32>(final_color, 1.0);
 }
+
+@vertex
+fn vs_overlay(model: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    out.clip_position = camera.view_proj * vec4<f32>(model.position, 1.0);
+    out.color = model.color;
+    out.normal = model.normal;
+    return out;
+}
+
+@fragment
+fn fs_overlay(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color, 1.0);
+}

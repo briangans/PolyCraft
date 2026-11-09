@@ -1,6 +1,7 @@
 mod camera;
 pub mod edit_mode;
 mod mesh;
+mod overlay;
 pub mod picking;
 mod scene;
 pub mod selection;
@@ -56,22 +57,40 @@ impl CameraUniform {
     }
 }
 
-/// Builds the GPU vertex/index buffers for a mesh. Used for the first upload and again
-/// whenever the mesh changes. Returns (vertex buffer, index buffer, index count).
-fn create_mesh_buffers(
-    device: &wgpu::Device,
-    mesh: &mesh::HalfEdgeMesh,
-) -> (wgpu::Buffer, wgpu::Buffer, u32) {
-    let render_data = mesh.generate_render_buffers();
+/// Builds the GPU vertex/index buffers for a mesh, with face and object selection highlights.
+/// Used for the first upload and again whenever the mesh or selection changes. Returns (vertex buffer, index buffer, index count).
+fn create_mesh_buffers(device: &wgpu::Device, scene: &Scene) -> (wgpu::Buffer, wgpu::Buffer, u32) {
+    let render_data = scene.mesh().generate_render_buffers();
     let raw_verts = render_data.vertices;
     let raw_indices = render_data.indices;
+    let selection = scene.selection();
+    let mode = scene.mode();
 
     let wgpu_vertices: Vec<Vertex> = raw_verts
         .iter()
-        .map(|render_vert| Vertex {
-            position: render_vert.position,
-            normal: render_vert.normal, // <-- Pass the normal to the GPU
-            color: [0.6, 0.6, 0.6],
+        .enumerate()
+        .map(|(i, render_vert)| {
+            let face_id = render_data.vertex_faces[i];
+            let is_selected = match mode {
+                edit_mode::EditMode::Object => selection.is_object_selected(),
+                edit_mode::EditMode::Face => selection.is_face_selected(face_id),
+                _ => false,
+            };
+            let color = if is_selected {
+                if mode == edit_mode::EditMode::Object {
+                    [0.32, 0.65, 0.40] // Maya lead green for selected object
+                } else {
+                    [0.88, 0.48, 0.18] // Maya warm orange for selected face
+                }
+            } else {
+                [0.6, 0.6, 0.6] // Default surface grey
+            };
+
+            Vertex {
+                position: render_vert.position,
+                normal: render_vert.normal,
+                color,
+            }
         })
         .collect();
 
@@ -90,6 +109,18 @@ fn create_mesh_buffers(
     (vertex_buffer, index_buffer, raw_indices.len() as u32)
 }
 
+/// Builds the GPU line vertex buffer for wireframe edges and component handles.
+fn create_overlay_buffer(device: &wgpu::Device, scene: &Scene) -> (wgpu::Buffer, u32) {
+    let overlay_verts =
+        overlay::build_overlay_vertices(scene.mesh(), scene.mode(), scene.selection());
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Overlay Vertex Buffer"),
+        contents: bytemuck::cast_slice(&overlay_verts),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    (buffer, overlay_verts.len() as u32)
+}
+
 struct State<'a> {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
@@ -98,12 +129,15 @@ struct State<'a> {
     pub size: winit::dpi::PhysicalSize<u32>,
     window: Arc<Window>,
     render_pipeline: wgpu::RenderPipeline,
+    overlay_pipeline: wgpu::RenderPipeline,
     // Document state: the mesh being edited and the current edit mode
     scene: Scene,
     // GPU copies of scene.mesh(); rebuilt by upload_mesh() whenever the mesh changes
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
+    overlay_buffer: wgpu::Buffer,
+    num_overlay_vertices: u32,
     depth_texture_view: wgpu::TextureView,
     camera: Camera,
     camera_controller: CameraController,
@@ -116,6 +150,10 @@ struct State<'a> {
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     ui_state: ui::UiState,
+
+    // Input state for picking and selection
+    cursor_pos: winit::dpi::PhysicalPosition<f64>,
+    shift_pressed: bool,
 }
 
 impl<'a> State<'a> {
@@ -254,9 +292,57 @@ impl<'a> State<'a> {
             multiview: None,
         });
 
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Overlay Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_overlay",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[Vertex::desc()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_overlay",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: -2,
+                    slope_scale: -2.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
         // Build the scene (a cube, in Object mode) and upload its mesh to the GPU
         let scene = Scene::new();
-        let (vertex_buffer, index_buffer, num_indices) = create_mesh_buffers(&device, scene.mesh());
+        let (vertex_buffer, index_buffer, num_indices) = create_mesh_buffers(&device, &scene);
+        let (overlay_buffer, num_overlay_vertices) = create_overlay_buffer(&device, &scene);
 
         // Initialize Egui Data Structs
         let egui_ctx = egui::Context::default();
@@ -278,10 +364,13 @@ impl<'a> State<'a> {
             size,
             window,
             render_pipeline,
+            overlay_pipeline,
             scene,
             vertex_buffer,
             index_buffer,
             num_indices,
+            overlay_buffer,
+            num_overlay_vertices,
             depth_texture_view,
             camera,
             camera_controller,
@@ -292,6 +381,8 @@ impl<'a> State<'a> {
             egui_state,
             egui_renderer,
             ui_state,
+            cursor_pos: winit::dpi::PhysicalPosition::new(0.0, 0.0),
+            shift_pressed: false,
         }
     }
 
@@ -337,18 +428,17 @@ impl<'a> State<'a> {
     /// Rebuilds the GPU buffers from the scene's mesh.
     fn upload_mesh(&mut self) {
         let (vertex_buffer, index_buffer, num_indices) =
-            create_mesh_buffers(&self.device, self.scene.mesh());
+            create_mesh_buffers(&self.device, &self.scene);
+        let (overlay_buffer, num_overlay_vertices) =
+            create_overlay_buffer(&self.device, &self.scene);
         self.vertex_buffer = vertex_buffer;
         self.index_buffer = index_buffer;
         self.num_indices = num_indices;
+        self.overlay_buffer = overlay_buffer;
+        self.num_overlay_vertices = num_overlay_vertices;
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        // If anything edited the mesh since the last frame, re-upload it first
-        if self.scene.take_dirty() {
-            self.upload_mesh();
-        }
-
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -364,8 +454,17 @@ impl<'a> State<'a> {
         self.egui_ctx.begin_frame(raw_input);
 
         // Run the extracted UI logic; it reports user intent back instead of mutating state
-        if let Some(mode) = self.ui_state.draw(&self.egui_ctx, self.scene.mode()) {
+        if let Some(mode) = self.ui_state.draw(
+            &self.egui_ctx,
+            self.scene.mode(),
+            self.scene.selected_count(),
+        ) {
             self.scene.set_mode(mode);
+        }
+
+        // If anything edited the mesh or selection, re-upload GPU buffers before rendering
+        if self.scene.take_dirty() {
+            self.upload_mesh();
         }
 
         // Tessellate UI geometry
@@ -425,6 +524,14 @@ impl<'a> State<'a> {
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+
+            // Draw wireframe and component handles on top of the shaded surface
+            if self.num_overlay_vertices > 0 {
+                render_pass.set_pipeline(&self.overlay_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.overlay_buffer.slice(..));
+                render_pass.draw(0..self.num_overlay_vertices, 0..1);
+            }
         }
 
         // --- 3. RENDER UI PASS ON TOP ---
@@ -503,9 +610,13 @@ async fn run() {
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(physical_size) => state.resize(*physical_size),
+                    WindowEvent::CursorMoved { position, .. } => {
+                        state.cursor_pos = *position;
+                    }
                     WindowEvent::ModifiersChanged(modifiers) => {
                         state.camera_controller.alt_pressed =
                             modifiers.state().contains(ModifiersState::ALT);
+                        state.shift_pressed = modifiers.state().contains(ModifiersState::SHIFT);
                     }
                     WindowEvent::MouseInput {
                         state: button_state,
@@ -517,6 +628,29 @@ async fn run() {
                             state
                                 .camera_controller
                                 .process_mouse_input(*button_state, *button);
+
+                            // Viewport click-to-select (Maya style: LMB without Alt, outside UI)
+                            if *button_state == winit::event::ElementState::Pressed
+                                && *button == winit::event::MouseButton::Left
+                                && !state.camera_controller.alt_pressed
+                                && !state.ui_state.pie_menu_active
+                                && !state.egui_ctx.wants_pointer_input()
+                            {
+                                let width = state.size.width as f32;
+                                let height = state.size.height as f32;
+                                if width > 0.0 && height > 0.0 {
+                                    let ndc_x = (state.cursor_pos.x as f32 / width) * 2.0 - 1.0;
+                                    let ndc_y = 1.0 - (state.cursor_pos.y as f32 / height) * 2.0;
+                                    let aspect = width / height;
+                                    let ray = picking::Ray::through_ndc(
+                                        &state.camera,
+                                        ndc_x,
+                                        ndc_y,
+                                        aspect,
+                                    );
+                                    state.scene.select_at(&ray, state.shift_pressed, height);
+                                }
+                            }
                         }
                     }
                     WindowEvent::MouseWheel { delta, .. } => {

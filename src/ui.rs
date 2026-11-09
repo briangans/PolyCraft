@@ -50,7 +50,12 @@ impl UiState {
     }
 
     /// Draws the UI for this frame. Returns the new edit mode if the user picked one.
-    pub fn draw(&mut self, ctx: &egui::Context, current_mode: EditMode) -> Option<EditMode> {
+    pub fn draw(
+        &mut self,
+        ctx: &egui::Context,
+        current_mode: EditMode,
+        selected_count: usize,
+    ) -> Option<EditMode> {
         let mut picked_mode = None;
 
         // 1. Check if Spacebar is held
@@ -121,6 +126,20 @@ impl UiState {
             // A persistent hint window when the menu is closed
             egui::Window::new("PolyCraft Tools").show(ctx, |ui| {
                 ui.label(format!("Mode: {}", current_mode.label()));
+                let count_str = match current_mode {
+                    EditMode::Object => {
+                        if selected_count > 0 {
+                            "Selected: 1 object"
+                        } else {
+                            "Selected: None"
+                        }
+                    }
+                    EditMode::Vertex => &format!("Selected: {} vertices", selected_count),
+                    EditMode::Edge => &format!("Selected: {} edges", selected_count),
+                    EditMode::Face => &format!("Selected: {} faces", selected_count),
+                };
+                ui.label(count_str);
+                ui.separator();
                 ui.label("Hold SPACE to open the Pie Menu.");
             });
         }
@@ -184,7 +203,7 @@ mod tests {
             ..Default::default()
         };
         let output = ctx.run(input, |ctx| {
-            picked = ui_state.draw(ctx, EditMode::Object);
+            picked = ui_state.draw(ctx, EditMode::Object, 0);
         });
         (picked, output.shapes)
     }

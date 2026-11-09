@@ -68,6 +68,12 @@ pub struct HalfEdgeMesh {
     pub faces: Vec<Face>,
 }
 
+impl Default for HalfEdgeMesh {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HalfEdgeMesh {
     pub fn new() -> Self {
         Self {

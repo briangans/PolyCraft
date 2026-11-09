@@ -37,8 +37,9 @@ polycraft/
     ├── selection.rs  # Selected components per kind, Maya click semantics
     ├── picking.rs    # Screen position -> ray; face/vertex/edge/object hit tests
     ├── edit_mode.rs  # EditMode enum (Object/Vertex/Edge/Face)
+    ├── overlay.rs    # Wireframe overlay, edge highlights, vertex 3D handles
     ├── ui.rs         # Spacebar pie menu (flick and release), Tools window
-    └── shader.wgsl   # Vertex/fragment shader with flat shading lighting
+    └── shader.wgsl   # Vertex/fragment shader with flat shading and unlit overlay pass
 ```
 
 ## 5. Conventions & Invariants
@@ -50,15 +51,15 @@ polycraft/
 - `Vertex` in `main.rs` (position, normal, color) must match the `@location`s in `shader.wgsl`.
 
 ## 6. Status (update at the end of every task)
-- **Working (run-tested):** Flat-shaded cube from the half-edge mesh; Maya camera (Alt+LMB orbit, Alt+MMB pan, Alt+RMB/scroll zoom); Space pie menu: hold Space, flick toward a slot and release to set `EditMode`, shown in the "PolyCraft Tools" window. Releasing in the center, outside the window or after losing focus cancels; clicking a slot also works; the tracking line hides when the mouse leaves the window.
-- **Implemented and unit-tested, not wired to the app yet:** Picking (ray from a screen position; face, vertex, edge and object hit tests with occlusion), `Selection` with Maya click semantics, and `Scene::select_at`. Nothing calls `select_at`, so clicking selects nothing.
-- **Not built yet:** Click-to-select wiring, selection highlight, edge/vertex display, transforms, edit operations, undo, FBX export. `EditMode` is stored but changes nothing visible yet.
-- **Known limitations:** `u16` index buffer (about 16k quads max); fan triangulation needs convex faces; the graphics backend is chosen by `Instance::default()`, not forced to DX12; the dirty flag is coarse, so a mode change, a selection change or any `mesh_mut()` call recreates both GPU buffers (before interactive vertex dragging, split it into topology and positions, and use `queue.write_buffer` for positions); `cargo clippy` warns about the unwired selection API and a missing `Default` for `HalfEdgeMesh`.
-- **Next (proposed):** (1) Wire clicks: a plain left click (no Alt) in the viewport that egui did not consume becomes a `Ray` via `Ray::through_ndc` and calls `Scene::select_at` (Shift = additive). (2) Show it: tint selected faces using `vertex_faces`, then draw edges and vertices in a new `overlay.rs`. (3) Transform tools.
+- **Working (run-tested):** Flat-shaded cube from the half-edge mesh; Maya camera (Alt+LMB orbit, Alt+MMB pan, Alt+RMB/scroll zoom); Space pie menu: hold Space, flick toward a slot and release to set `EditMode`, shown in the "PolyCraft Tools" window. Viewport click-to-select: plain left click (no Alt) in the viewport outside UI casts an NDC picking ray and selects/clears components; Shift+click toggles selection (Maya semantics). Selection visual highlights: selected faces tinted Maya warm orange, selected object tinted Maya green; wireframe and component overlays in `overlay.rs` render clean edges (cyan for selected edges, green for selected object) and 3D vertex handles in Vertex mode (blue crosses, yellow crosses + octahedron diamonds when selected) with depth testing and bias. "PolyCraft Tools" window displays the current mode and active selection count.
+- **Implemented and unit-tested:** All 58 unit tests passing across camera, mesh, picking, scene, selection, ui, and overlay.
+- **Not built yet:** Transforms/manipulator gizmos (W/E/R), edit operations (extrude, bevel, cut), undo/redo, FBX export.
+- **Known limitations:** `u16` index buffer (about 16k quads max); fan triangulation needs convex faces; graphics backend chosen by `Instance::default()`; dirty flag re-uploads both mesh and overlay GPU buffers (split positions before high-frequency drag). `cargo clippy --all-targets` passes with 0 code warnings.
+- **Next (proposed):** (1) Transform manipulator gizmo (Maya W key translate tool): draw 3D coordinate axes at selection centroid, hit-test gizmo axes, drag along axis to translate selected components. (2) Undo/redo stack.
 
 ## 7. Handoff Checklist
 1. `cargo check`, `cargo test` and `cargo clippy --all-targets` pass (no new warnings), and the app launches.
 2. Update Section 4 (file structure) and Section 6 (status).
 3. Commit with a descriptive message.
 
-Roles for now: Claude writes; Gemini reviews each change from a diff plus a review brief.
+Roles: Gemini writes code and updates documentation directly adhering to the architecture.

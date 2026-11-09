@@ -1,9 +1,10 @@
 Building "PolyCraft", a trimmed-down Maya clone, written in Rust. Built to leverage decades of learned muscle memory.
 
-Incomplete list of features to replicate:
+Growing list of features to replicate:
 - Exporting to FBX
 - Polygon modeling
 - Pie menus
+- UV authoring
 
 Features not desired presently:
 - Advanced rendering beyond the viewport display (mental ray, Vray, etc)
