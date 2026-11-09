@@ -58,21 +58,24 @@ impl UiState {
     ) -> Option<EditMode> {
         let mut picked_mode = None;
 
-        // 1. Check if Spacebar is held
+        // 1. Check if Right Mouse Button (without Alt, Maya-style) or Spacebar is held
+        let rmb_down = ctx
+            .input(|i| i.pointer.button_down(egui::PointerButton::Secondary) && !i.modifiers.alt);
         let space_down = ctx.input(|i| i.key_down(egui::Key::Space));
+        let menu_down = rmb_down || space_down;
 
         // 2. Get the exact screen coordinates of the mouse (None if it has left the window)
         let pointer = ctx.input(|i| i.pointer.latest_pos());
 
-        // 3. Lock the center position the moment Space is pressed. With no known pointer position
+        // 3. Lock the center position the moment RMB or Space is pressed. With no known pointer position
         // there is nowhere to center the menu, so it stays closed until the pointer is back.
-        if space_down && !self.pie_menu_active {
+        if menu_down && !self.pie_menu_active {
             if let Some(pos) = pointer {
                 self.pie_menu_active = true;
                 self.pie_menu_center = pos;
             }
-        } else if !space_down {
-            // Releasing Space commits the slot the pointer was flicked toward (Maya-style).
+        } else if !menu_down {
+            // Releasing RMB or Space commits the slot the pointer was flicked toward (Maya-style).
             // Releasing inside the dead zone, with the pointer outside the window, or after the
             // window lost focus (Alt-Tab makes winit synthesize a key release) cancels.
             if self.pie_menu_active && ctx.input(|i| i.focused) {
@@ -140,7 +143,7 @@ impl UiState {
                 };
                 ui.label(count_str);
                 ui.separator();
-                ui.label("Hold SPACE to open the Pie Menu.");
+                ui.label("Hold RMB or SPACE to open the Pie Menu.");
             });
         }
 
@@ -196,10 +199,21 @@ mod tests {
         focused: bool,
     ) -> (Option<EditMode>, Vec<egui::epaint::ClippedShape>) {
         let mut picked = None;
+        let mut modifiers = egui::Modifiers::NONE;
+        for ev in &events {
+            match ev {
+                egui::Event::PointerButton { modifiers: m, .. }
+                | egui::Event::Key { modifiers: m, .. } => {
+                    modifiers = *m;
+                }
+                _ => {}
+            }
+        }
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
             focused,
             events,
+            modifiers,
             ..Default::default()
         };
         let output = ctx.run(input, |ctx| {
@@ -338,5 +352,56 @@ mod tests {
         run_frame(&ctx, &mut ui_state, vec![egui::Event::PointerGone], true);
         let released = run_frame(&ctx, &mut ui_state, vec![space_event(false)], true);
         assert_eq!(released, None);
+    }
+
+    fn rmb_event(pos: Pos2, pressed: bool, alt: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: if alt {
+                egui::Modifiers::ALT
+            } else {
+                egui::Modifiers::NONE
+            },
+        }
+    }
+
+    #[test]
+    fn rmb_flick_and_release_selects_slot() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::new();
+        let center = Pos2::new(300.0, 300.0);
+
+        // Press RMB at center
+        let press = vec![rmb_event(center, true, false)];
+        assert_eq!(run_frame(&ctx, &mut ui_state, press, true), None);
+        assert!(ui_state.pie_menu_active);
+
+        // Move to the right (+X is Object mode)
+        let flick_pos = center + Vec2::new(40.0, 0.0);
+        let flick = vec![egui::Event::PointerMoved(flick_pos)];
+        assert_eq!(run_frame(&ctx, &mut ui_state, flick, true), None);
+
+        // Release RMB
+        let release = vec![rmb_event(flick_pos, false, false)];
+        let picked = run_frame(&ctx, &mut ui_state, release, true);
+        assert_eq!(picked, Some(EditMode::Object));
+        assert!(!ui_state.pie_menu_active);
+    }
+
+    #[test]
+    fn alt_rmb_does_not_open_pie_menu() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::new();
+        let center = Pos2::new(300.0, 300.0);
+
+        // Press RMB with Alt held (camera navigation)
+        let press = vec![rmb_event(center, true, true)];
+        assert_eq!(run_frame(&ctx, &mut ui_state, press, true), None);
+        assert!(
+            !ui_state.pie_menu_active,
+            "Alt+RMB is camera zoom, must not open pie menu"
+        );
     }
 }

@@ -44,16 +44,21 @@ impl Vertex {
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+    viewport_size: [f32; 2],
+    _padding: [f32; 2],
 }
 
 impl CameraUniform {
     fn new() -> Self {
         Self {
             view_proj: cgmath::Matrix4::identity().into(),
+            viewport_size: [800.0, 600.0],
+            _padding: [0.0, 0.0],
         }
     }
-    fn update_view_proj(&mut self, camera: &Camera, aspect: f32) {
+    fn update_view_proj(&mut self, camera: &Camera, aspect: f32, width: f32, height: f32) {
         self.view_proj = camera.build_view_projection_matrix(aspect).into();
+        self.viewport_size = [width.max(1.0), height.max(1.0)];
     }
 }
 
@@ -109,16 +114,47 @@ fn create_mesh_buffers(device: &wgpu::Device, scene: &Scene) -> (wgpu::Buffer, w
     (vertex_buffer, index_buffer, raw_indices.len() as u32)
 }
 
-/// Builds the GPU line vertex buffer for wireframe edges and component handles.
-fn create_overlay_buffer(device: &wgpu::Device, scene: &Scene) -> (wgpu::Buffer, u32) {
-    let overlay_verts =
-        overlay::build_overlay_vertices(scene.mesh(), scene.mode(), scene.selection());
-    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Overlay Vertex Buffer"),
-        contents: bytemuck::cast_slice(&overlay_verts),
+/// Builds the GPU line vertex buffer for wireframe edges and triangle buffer for square vertex dots.
+fn create_overlay_buffers(
+    device: &wgpu::Device,
+    scene: &Scene,
+) -> (wgpu::Buffer, u32, wgpu::Buffer, u32) {
+    let buffers = overlay::build_overlay_buffers(scene.mesh(), scene.mode(), scene.selection());
+
+    let line_slice: &[overlay::OverlayVertex] = if buffers.lines.is_empty() {
+        &[overlay::OverlayVertex::new(
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        )]
+    } else {
+        &buffers.lines
+    };
+    let line_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Overlay Line Buffer"),
+        contents: bytemuck::cast_slice(line_slice),
         usage: wgpu::BufferUsages::VERTEX,
     });
-    (buffer, overlay_verts.len() as u32)
+
+    let dot_slice: &[overlay::OverlayVertex] = if buffers.dots.is_empty() {
+        &[overlay::OverlayVertex::new(
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        )]
+    } else {
+        &buffers.dots
+    };
+    let dot_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Overlay Dot Buffer"),
+        contents: bytemuck::cast_slice(dot_slice),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    (
+        line_buffer,
+        buffers.lines.len() as u32,
+        dot_buffer,
+        buffers.dots.len() as u32,
+    )
 }
 
 struct State<'a> {
@@ -129,15 +165,18 @@ struct State<'a> {
     pub size: winit::dpi::PhysicalSize<u32>,
     window: Arc<Window>,
     render_pipeline: wgpu::RenderPipeline,
-    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_line_pipeline: wgpu::RenderPipeline,
+    overlay_dot_pipeline: wgpu::RenderPipeline,
     // Document state: the mesh being edited and the current edit mode
     scene: Scene,
     // GPU copies of scene.mesh(); rebuilt by upload_mesh() whenever the mesh changes
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
-    overlay_buffer: wgpu::Buffer,
-    num_overlay_vertices: u32,
+    overlay_line_buffer: wgpu::Buffer,
+    num_line_vertices: u32,
+    overlay_dot_buffer: wgpu::Buffer,
+    num_dot_vertices: u32,
     depth_texture_view: wgpu::TextureView,
     camera: Camera,
     camera_controller: CameraController,
@@ -194,7 +233,12 @@ impl<'a> State<'a> {
 
         let aspect_ratio = config.width as f32 / config.height as f32;
         let mut camera_uniform = CameraUniform::new();
-        camera_uniform.update_view_proj(&camera, aspect_ratio);
+        camera_uniform.update_view_proj(
+            &camera,
+            aspect_ratio,
+            config.width as f32,
+            config.height as f32,
+        );
 
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera Buffer"),
@@ -292,12 +336,60 @@ impl<'a> State<'a> {
             multiview: None,
         });
 
-        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Overlay Render Pipeline"),
+        let overlay_line_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Overlay Line Pipeline"),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_overlay",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[Vertex::desc()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_overlay",
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::LineList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: -2,
+                        slope_scale: -2.0,
+                        clamp: 0.0,
+                    },
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+            });
+
+        let overlay_dot_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Overlay Dot Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vs_overlay",
+                entry_point: "vs_dot",
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[Vertex::desc()],
             },
@@ -312,7 +404,7 @@ impl<'a> State<'a> {
                 })],
             }),
             primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
@@ -326,7 +418,7 @@ impl<'a> State<'a> {
                 depth_compare: wgpu::CompareFunction::LessEqual,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState {
-                    constant: -2,
+                    constant: -3,
                     slope_scale: -2.0,
                     clamp: 0.0,
                 },
@@ -342,7 +434,8 @@ impl<'a> State<'a> {
         // Build the scene (a cube, in Object mode) and upload its mesh to the GPU
         let scene = Scene::new();
         let (vertex_buffer, index_buffer, num_indices) = create_mesh_buffers(&device, &scene);
-        let (overlay_buffer, num_overlay_vertices) = create_overlay_buffer(&device, &scene);
+        let (overlay_line_buffer, num_line_vertices, overlay_dot_buffer, num_dot_vertices) =
+            create_overlay_buffers(&device, &scene);
 
         // Initialize Egui Data Structs
         let egui_ctx = egui::Context::default();
@@ -364,13 +457,16 @@ impl<'a> State<'a> {
             size,
             window,
             render_pipeline,
-            overlay_pipeline,
+            overlay_line_pipeline,
+            overlay_dot_pipeline,
             scene,
             vertex_buffer,
             index_buffer,
             num_indices,
-            overlay_buffer,
-            num_overlay_vertices,
+            overlay_line_buffer,
+            num_line_vertices,
+            overlay_dot_buffer,
+            num_dot_vertices,
             depth_texture_view,
             camera,
             camera_controller,
@@ -416,8 +512,11 @@ impl<'a> State<'a> {
     }
 
     fn update_camera_matrix(&mut self) {
-        let aspect = self.config.width as f32 / self.config.height as f32;
-        self.camera_uniform.update_view_proj(&self.camera, aspect);
+        let width = self.config.width as f32;
+        let height = self.config.height as f32;
+        let aspect = width / height;
+        self.camera_uniform
+            .update_view_proj(&self.camera, aspect, width, height);
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -429,13 +528,15 @@ impl<'a> State<'a> {
     fn upload_mesh(&mut self) {
         let (vertex_buffer, index_buffer, num_indices) =
             create_mesh_buffers(&self.device, &self.scene);
-        let (overlay_buffer, num_overlay_vertices) =
-            create_overlay_buffer(&self.device, &self.scene);
+        let (overlay_line_buffer, num_line_vertices, overlay_dot_buffer, num_dot_vertices) =
+            create_overlay_buffers(&self.device, &self.scene);
         self.vertex_buffer = vertex_buffer;
         self.index_buffer = index_buffer;
         self.num_indices = num_indices;
-        self.overlay_buffer = overlay_buffer;
-        self.num_overlay_vertices = num_overlay_vertices;
+        self.overlay_line_buffer = overlay_line_buffer;
+        self.num_line_vertices = num_line_vertices;
+        self.overlay_dot_buffer = overlay_dot_buffer;
+        self.num_dot_vertices = num_dot_vertices;
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -525,12 +626,20 @@ impl<'a> State<'a> {
             render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
             render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
 
-            // Draw wireframe and component handles on top of the shaded surface
-            if self.num_overlay_vertices > 0 {
-                render_pass.set_pipeline(&self.overlay_pipeline);
+            // Draw wireframe edges
+            if self.num_line_vertices > 0 {
+                render_pass.set_pipeline(&self.overlay_line_pipeline);
                 render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, self.overlay_buffer.slice(..));
-                render_pass.draw(0..self.num_overlay_vertices, 0..1);
+                render_pass.set_vertex_buffer(0, self.overlay_line_buffer.slice(..));
+                render_pass.draw(0..self.num_line_vertices, 0..1);
+            }
+
+            // Draw square vertex dots
+            if self.num_dot_vertices > 0 {
+                render_pass.set_pipeline(&self.overlay_dot_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.overlay_dot_buffer.slice(..));
+                render_pass.draw(0..self.num_dot_vertices, 0..1);
             }
         }
 

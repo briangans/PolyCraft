@@ -1,5 +1,7 @@
 struct CameraUniform {
     view_proj: mat4x4<f32>,
+    viewport_size: vec2<f32>,
+    _padding: vec2<f32>,
 };
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
@@ -48,6 +50,22 @@ fn vs_overlay(model: VertexInput) -> VertexOutput {
     out.clip_position = camera.view_proj * vec4<f32>(model.position, 1.0);
     out.color = model.color;
     out.normal = model.normal;
+    return out;
+}
+
+@vertex
+fn vs_dot(model: VertexInput) -> VertexOutput {
+    var out: VertexOutput;
+    var clip = camera.view_proj * vec4<f32>(model.position, 1.0);
+    
+    // model.normal.xy holds the screen-pixel offset (-half_size to +half_size)
+    let offset_ndc = (model.normal.xy / camera.viewport_size) * (2.0 * clip.w);
+    clip.x += offset_ndc.x;
+    clip.y += offset_ndc.y;
+    
+    out.clip_position = clip;
+    out.color = model.color;
+    out.normal = vec3<f32>(0.0, 0.0, 1.0);
     return out;
 }
 
