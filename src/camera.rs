@@ -109,7 +109,7 @@ impl CameraController {
             let right = camera.right();
             let up = right.cross(forward).normalize();
 
-            camera.target += right * (dx as f32 * self.pan_speed * camera.distance)
+            camera.target += right * (-dx as f32 * self.pan_speed * camera.distance)
                 + up * (dy as f32 * self.pan_speed * camera.distance);
         } else if self.is_right_clicked {
             camera.distance += (dx as f32 + dy as f32) * self.zoom_speed * camera.distance;
@@ -174,5 +174,32 @@ mod tests {
         };
         let forward = camera.forward();
         assert!((forward.z + 1.0).abs() < 1e-5, "expected forward = -Z");
+    }
+
+    #[test]
+    fn pan_motion_directions() {
+        let mut camera = Camera {
+            target: Point3::new(0.0, 0.0, 0.0),
+            distance: 3.0,
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        let mut controller = CameraController::new();
+        controller.alt_pressed = true;
+        controller.is_middle_clicked = true;
+
+        // dx > 0 (drag right) must shift target left (-X in view space when facing -Z)
+        controller.process_mouse_motion(10.0, 0.0, &mut camera);
+        assert!(
+            camera.target.x < 0.0,
+            "pan right mouse motion must shift target in -right direction"
+        );
+
+        // dy > 0 (drag down) must shift target up (+Y in view space)
+        controller.process_mouse_motion(0.0, 10.0, &mut camera);
+        assert!(
+            camera.target.y > 0.0,
+            "pan down mouse motion must shift target in +up direction"
+        );
     }
 }
