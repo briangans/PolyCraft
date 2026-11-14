@@ -37,6 +37,7 @@ polycraft/
     ├── selection.rs  # Selected components per kind, Maya click semantics
     ├── picking.rs    # Screen position -> ray; face/vertex/edge/object hit tests
     ├── edit_mode.rs  # EditMode enum (Object/Vertex/Edge/Face)
+    ├── gizmo.rs      # Transform gizmo math (pure): selection pivot, axis colours, constant-pixel arm length
     ├── overlay.rs    # Wireframe overlay, edge highlights, vertex 3D handles
     ├── ui.rs         # Spacebar pie menu (flick and release), Tools window
     └── shader.wgsl   # Vertex/fragment shader with flat shading and unlit overlay pass
@@ -52,14 +53,14 @@ polycraft/
 
 ## 6. Status (update at the end of every task)
 - **Working (run-tested):** Flat-shaded cube from the half-edge mesh; Maya camera (Alt+LMB orbit, Alt+MMB pan, Alt+RMB/scroll zoom); Marking menu: hold RMB (without Alt, true Maya style) or Space, flick toward a slot and release to switch `EditMode` (Edge=Up, Face=Down, Vertex=Left, Object=Right). Viewport click-to-select: plain left click (no Alt) in viewport outside UI casts an NDC picking ray and selects/clears components; Shift+click toggles selection (Maya semantics). Selection visual highlights: selected faces tinted Maya warm orange, selected object tinted Maya green; wireframe and component overlays in `overlay.rs` render clean edges (cyan for selected edges, green for selected object) and screen-aligned flat square vertex dots in Vertex mode (6x6 blue/purple dots for unselected, 9x9 bright yellow dots for selected) with depth testing and bias. "PolyCraft Tools" window displays the current mode, active selection count, and RMB/Space menu hint.
-- **Implemented and unit-tested:** All 60 unit tests passing across camera, mesh, picking, scene, selection, ui, and overlay.
-- **Not built yet:** Transforms/manipulator gizmos (W/E/R), edit operations (extrude, bevel, cut), undo/redo, FBX export.
+- **Implemented and unit-tested:** All 69 unit tests passing across camera, mesh, picking, scene, selection, ui, overlay, and gizmo. `gizmo.rs` (Iteration 1) provides the pure translate-gizmo math: `pivot()` (selection centroid per mode), `axis_world_length()` (constant on-screen arm derived from a pixel length via the shared `picking::world_per_pixel`), the `AXES` table with Maya axis colours, and `AXIS_LENGTH_PIXELS`. Not yet wired to input, drawing, or dragging.
+- **Not built yet:** Transforms/manipulator gizmos (W/E/R) are started (pure math done; no drawing/drag/activation yet), edit operations (extrude, bevel, cut), undo/redo, FBX export.
 - **Known limitations:** `u16` index buffer (about 16k quads max); fan triangulation needs convex faces; graphics backend chosen by `Instance::default()`; dirty flag re-uploads both mesh and overlay GPU buffers (split positions before high-frequency drag). `cargo clippy --all-targets` passes with 0 code warnings.
-- **Next (proposed):** (1) Transform manipulator gizmo (Maya W key translate tool): draw 3D coordinate axes at selection centroid, hit-test gizmo axes, drag along axis to translate selected components. (2) Undo/redo stack.
+- **Next (gizmo plan, Iteration 1 DONE):** Transform gizmo is being built in small testable steps. LOCKED DECISIONS: (a) the active tool (Move/Rotate/Scale, bound to W/E/R) is a SEPARATE concept from `EditMode` — a tool like `Scene::tool` set alongside selection mode; (b) the gizmo is CONSTANT SCREEN SIZE (its world arm is derived from `AXIS_LENGTH_PIXELS`, hence the `world_per_pixel` dependency). Iteration 1 (this commit): `gizmo.rs` pure math + tests. Iteration 2 (next): DRAW the three coloured axes at `gizmo::pivot` when something is selected, reusing the overlay line pipeline; because the gizmo is constant-screen-size, this likely needs a small `shader.wgsl` change so lines can take a pixel offset like the vertex-dot `vs_dot` pass. Iteration 3: activate with W and drag to translate selected vertices along the hit axis (drag math stays in `gizmo.rs`; needs a `KeyboardInput` handler in `main.rs`, which does not exist yet). Then undo/redo stack.
 
 ## 7. Handoff Checklist
 1. `cargo check`, `cargo test` and `cargo clippy --all-targets` pass (no new warnings), and the app launches.
 2. Update Section 4 (file structure) and Section 6 (status).
 3. Commit with a descriptive message.
 
-Roles: Gemini writes code and updates documentation directly adhering to the architecture.
+Roles: Gemini audits code occasionally, and updates documentation if needed, directly adhering to the architecture. Other AI models also author code.

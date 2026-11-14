@@ -72,8 +72,10 @@ pub struct EdgeHit {
     pub distance: f32,
 }
 
-/// World-space size of one pixel at `distance` from the camera.
-fn world_per_pixel(distance: f32, viewport_height: f32) -> f32 {
+/// World-space size of one pixel at `distance` from the camera. Also used by the transform
+/// gizmo, which scales a constant-on-screen handle by it, so both pick and draw agree on what a
+/// "pixel" means. `pub(crate)` rather than duplicated so the projection math has one home.
+pub(crate) fn world_per_pixel(distance: f32, viewport_height: f32) -> f32 {
     let tan_half_fov = (FOV_Y_DEGREES.to_radians() * 0.5).tan();
     (2.0 * tan_half_fov * distance) / viewport_height.max(1.0)
 }

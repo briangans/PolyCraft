@@ -1,5 +1,6 @@
 mod camera;
 pub mod edit_mode;
+mod gizmo;
 mod mesh;
 mod overlay;
 pub mod picking;
@@ -114,6 +115,62 @@ fn create_mesh_buffers(device: &wgpu::Device, scene: &Scene) -> (wgpu::Buffer, w
     (vertex_buffer, index_buffer, raw_indices.len() as u32)
 }
 
+/// Two gizmo line vertices per axis, three axes. A fixed count, so the gizmo's GPU buffer is
+/// allocated once and rewritten in place every frame instead of being recreated.
+const GIZMO_VERTEX_COUNT: usize = gizmo::AXES.len() * 2;
+
+/// Builds one of the unlit `LineList` passes (wireframe overlay, transform gizmo).
+///
+/// They are identical apart from depth behaviour, which is left to the caller: the wireframe needs
+/// depth bias so its lines track the surface they belong to, while the gizmo depth-tests with
+/// `Always` so the manipulator stays visible through the mesh, as Maya's does. Both still carry
+/// the pass's depth format, which wgpu requires of any pipeline drawn into a depth-attached pass.
+fn create_line_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    label: &str,
+    depth_stencil: Option<wgpu::DepthStencilState>,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: "vs_overlay",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Vertex::desc()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: "fs_overlay",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil,
+        multisample: wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+    })
+}
+
 /// Builds the GPU line vertex buffer for wireframe edges and triangle buffer for square vertex dots.
 fn create_overlay_buffers(
     device: &wgpu::Device,
@@ -167,6 +224,7 @@ struct State<'a> {
     render_pipeline: wgpu::RenderPipeline,
     overlay_line_pipeline: wgpu::RenderPipeline,
     overlay_dot_pipeline: wgpu::RenderPipeline,
+    gizmo_pipeline: wgpu::RenderPipeline,
     // Document state: the mesh being edited and the current edit mode
     scene: Scene,
     // GPU copies of scene.mesh(); rebuilt by upload_mesh() whenever the mesh changes
@@ -177,6 +235,11 @@ struct State<'a> {
     num_line_vertices: u32,
     overlay_dot_buffer: wgpu::Buffer,
     num_dot_vertices: u32,
+    /// Transform gizmo arms. Allocated once at a fixed size (two vertices per arm) and rewritten
+    /// in place every frame: a constant-screen-size gizmo changes with camera distance and orbit,
+    /// not just when the document is edited, so it cannot ride the dirty-flag upload path.
+    gizmo_buffer: wgpu::Buffer,
+    num_gizmo_vertices: u32,
     depth_texture_view: wgpu::TextureView,
     camera: Camera,
     camera_controller: CameraController,
@@ -336,53 +399,48 @@ impl<'a> State<'a> {
             multiview: None,
         });
 
-        let overlay_line_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Overlay Line Pipeline"),
-                layout: Some(&render_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: "vs_overlay",
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Vertex::desc()],
+        // Wireframe edges: depth-tested with a bias, so each line tracks the surface it belongs to
+        // instead of floating in front of it or disappearing into it.
+        let overlay_line_pipeline = create_line_pipeline(
+            &device,
+            &shader,
+            &render_pipeline_layout,
+            config.format,
+            "Overlay Line Pipeline",
+            Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState {
+                    constant: -2,
+                    slope_scale: -2.0,
+                    clamp: 0.0,
                 },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: "fs_overlay",
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::LineList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState {
-                        constant: -2,
-                        slope_scale: -2.0,
-                        clamp: 0.0,
-                    },
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview: None,
-            });
+            }),
+        );
+
+        // Transform gizmo: a world-space line pass drawn into the 3D pass. Its depth test is set
+        // to `Always` with no depth write, so the manipulator reads through the very faces the
+        // user is trying to move (the pivot sits at the selection's centre, i.e. inside the mesh),
+        // exactly as Maya's does. The format is still declared `Depth32Float` even though the
+        // test is disabled: a pipeline drawn into a pass that carries a depth attachment MUST
+        // specify a matching depth format, or wgpu rejects the draw. So "ignore depth" here is
+        // expressed as Always-pass, not as no depth state.
+        let gizmo_pipeline = create_line_pipeline(
+            &device,
+            &shader,
+            &render_pipeline_layout,
+            config.format,
+            "Gizmo Line Pipeline",
+            Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+        );
 
         let overlay_dot_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Overlay Dot Pipeline"),
@@ -437,6 +495,16 @@ impl<'a> State<'a> {
         let (overlay_line_buffer, num_line_vertices, overlay_dot_buffer, num_dot_vertices) =
             create_overlay_buffers(&device, &scene);
 
+        // The gizmo buffer is allocated at its fixed maximum size (two vertices per axis) and
+        // zero-filled; the arms are written into it every frame. Starting empty means no gizmo
+        // until the first selection arrives.
+        let gizmo_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Gizmo Line Buffer"),
+            size: (GIZMO_VERTEX_COUNT * std::mem::size_of::<overlay::OverlayVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Initialize Egui Data Structs
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
@@ -459,6 +527,7 @@ impl<'a> State<'a> {
             render_pipeline,
             overlay_line_pipeline,
             overlay_dot_pipeline,
+            gizmo_pipeline,
             scene,
             vertex_buffer,
             index_buffer,
@@ -467,6 +536,8 @@ impl<'a> State<'a> {
             num_line_vertices,
             overlay_dot_buffer,
             num_dot_vertices,
+            gizmo_buffer,
+            num_gizmo_vertices: 0,
             depth_texture_view,
             camera,
             camera_controller,
@@ -539,6 +610,28 @@ impl<'a> State<'a> {
         self.num_dot_vertices = num_dot_vertices;
     }
 
+    /// Rewrites the transform gizmo's arm vertices for the current selection and camera.
+    ///
+    /// Called every frame rather than on the dirty flag: the gizmo is a fixed pixel size on
+    /// screen, so its arms stretch and rotate as the camera orbits or zooms even when nothing in
+    /// the document changed. The vertex count is constant, so this is a single small
+    /// `write_buffer` rather than a buffer rebuild.
+    fn upload_gizmo(&mut self) {
+        let arms = gizmo::translate_arms(
+            self.scene.mesh(),
+            self.scene.mode(),
+            self.scene.selection(),
+            self.camera.eye(),
+            self.config.height as f32,
+        );
+        let vertices = overlay::gizmo_line_vertices(&arms);
+        self.num_gizmo_vertices = vertices.len() as u32;
+        if self.num_gizmo_vertices > 0 {
+            self.queue
+                .write_buffer(&self.gizmo_buffer, 0, bytemuck::cast_slice(&vertices));
+        }
+    }
+
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -567,6 +660,10 @@ impl<'a> State<'a> {
         if self.scene.take_dirty() {
             self.upload_mesh();
         }
+
+        // The gizmo scales and rotates with the camera, not just the document, so it is
+        // rewritten every frame rather than riding the dirty-flag path (see `upload_gizmo`).
+        self.upload_gizmo();
 
         // Tessellate UI geometry
         let full_output = self.egui_ctx.end_frame();
@@ -640,6 +737,16 @@ impl<'a> State<'a> {
                 render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, self.overlay_dot_buffer.slice(..));
                 render_pass.draw(0..self.num_dot_vertices, 0..1);
+            }
+
+            // Draw the transform gizmo last so its axes read on top of the mesh, edges and
+            // vertex dots. Nothing is drawn until `upload_gizmo` has produced arms (i.e. until
+            // there is a selection), which is why `num_gizmo_vertices` starts at zero.
+            if self.num_gizmo_vertices > 0 {
+                render_pass.set_pipeline(&self.gizmo_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.gizmo_buffer.slice(..));
+                render_pass.draw(0..self.num_gizmo_vertices, 0..1);
             }
         }
 

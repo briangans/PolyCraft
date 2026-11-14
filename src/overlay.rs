@@ -117,6 +117,27 @@ pub fn build_overlay_buffers(
     OverlayBuffers { lines, dots }
 }
 
+/// Converts transform-gizmo arms into line-list vertices, two per arm, each pair sharing its
+/// axis colour.
+///
+/// The gizmo keeps its own GPU buffer rather than joining the wireframe one: arm length depends on
+/// camera distance, so it is rewritten every frame, while the wireframe is rebuilt only when the
+/// mesh or selection changes. Reusing `OverlayVertex` means the gizmo needs no new vertex layout.
+pub fn gizmo_line_vertices(arms: &[crate::gizmo::Arm]) -> Vec<OverlayVertex> {
+    let mut lines = Vec::with_capacity(arms.len() * 2);
+    for arm in arms {
+        lines.push(OverlayVertex::new(
+            [arm.start.x, arm.start.y, arm.start.z],
+            arm.color,
+        ));
+        lines.push(OverlayVertex::new(
+            [arm.end.x, arm.end.y, arm.end.z],
+            arm.color,
+        ));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

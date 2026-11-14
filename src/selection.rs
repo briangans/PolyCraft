@@ -129,12 +129,24 @@ impl Selection {
         }
     }
 
+    pub fn vertices(&self) -> &HashSet<VertexId> {
+        &self.vertices
+    }
+
     pub fn vertices_mut(&mut self) -> &mut HashSet<VertexId> {
         &mut self.vertices
     }
 
+    pub fn edges(&self) -> &HashSet<EdgeId> {
+        &self.edges
+    }
+
     pub fn edges_mut(&mut self) -> &mut HashSet<EdgeId> {
         &mut self.edges
+    }
+
+    pub fn faces(&self) -> &HashSet<FaceId> {
+        &self.faces
     }
 
     pub fn faces_mut(&mut self) -> &mut HashSet<FaceId> {
