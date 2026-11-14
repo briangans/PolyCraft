@@ -185,7 +185,7 @@ pub fn pick_vertex(
 }
 
 /// Closest approach between a ray and a line segment: `(distance, distance along the ray)`.
-fn ray_segment(ray: &Ray, a: Point3<f32>, b: Point3<f32>) -> Option<(f32, f32)> {
+pub fn ray_segment(ray: &Ray, a: Point3<f32>, b: Point3<f32>) -> Option<(f32, f32)> {
     let direction = ray.direction;
     let segment = b - a;
     let to_origin = ray.origin - a;

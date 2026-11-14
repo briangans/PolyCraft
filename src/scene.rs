@@ -78,6 +78,29 @@ impl Scene {
         self.selection.count(self.mode)
     }
 
+    /// Returns the unique set of vertices affected by the current selection in the active mode.
+    pub fn selected_vertices(&self) -> Vec<crate::mesh::VertexId> {
+        crate::gizmo::selected_vertices(&self.mesh, self.mode, &self.selection)
+    }
+
+    /// Moves the specified vertices to `initial_position + delta`. Flags the document dirty so
+    /// GPU vertex and overlay buffers re-upload next frame.
+    pub fn translate_vertices(
+        &mut self,
+        vertices: &[(crate::mesh::VertexId, cgmath::Point3<f32>)],
+        delta: cgmath::Vector3<f32>,
+    ) {
+        if vertices.is_empty() {
+            return;
+        }
+        for &(v_id, initial_pos) in vertices {
+            if v_id.0 < self.mesh.vertices.len() {
+                self.mesh.vertices[v_id.0].position = initial_pos + delta;
+            }
+        }
+        self.dirty = true;
+    }
+
     /// Selects whatever the ray hits, in the current mode. `additive` keeps what was already
     /// selected and toggles the clicked component (Shift+click in Maya).
     pub fn select_at(&mut self, ray: &Ray, additive: bool, viewport_height: f32) {
@@ -252,5 +275,20 @@ mod tests {
         // Mode changes preserve active tool
         scene.set_mode(EditMode::Vertex);
         assert_eq!(scene.tool(), Tool::Translate);
+    }
+
+    #[test]
+    fn translate_vertices_moves_positions_and_dirties_document() {
+        let mut scene = Scene::new();
+        let v0 = crate::mesh::VertexId(0);
+        let initial_pos = scene.mesh().vertex_position(v0);
+        assert!(!scene.take_dirty());
+
+        let delta = cgmath::Vector3::new(1.0, 2.0, 3.0);
+        scene.translate_vertices(&[(v0, initial_pos)], delta);
+
+        assert!(scene.take_dirty(), "translating vertices must flag dirty");
+        let new_pos = scene.mesh().vertex_position(v0);
+        assert_eq!(new_pos, initial_pos + delta);
     }
 }

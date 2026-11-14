@@ -254,9 +254,18 @@ struct State<'a> {
     egui_renderer: egui_wgpu::Renderer,
     ui_state: ui::UiState,
 
-    // Input state for picking and selection
+    // Input state for picking, selection, and transform manipulation
     cursor_pos: winit::dpi::PhysicalPosition<f64>,
     shift_pressed: bool,
+    drag_state: Option<DragState>,
+    hovered_axis: Option<gizmo::GizmoAxis>,
+}
+
+struct DragState {
+    axis: gizmo::GizmoAxis,
+    pivot: cgmath::Point3<f32>,
+    initial_param: f32,
+    initial_positions: Vec<(mesh::VertexId, cgmath::Point3<f32>)>,
 }
 
 impl<'a> State<'a> {
@@ -551,6 +560,8 @@ impl<'a> State<'a> {
             ui_state,
             cursor_pos: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             shift_pressed: false,
+            drag_state: None,
+            hovered_axis: None,
         }
     }
 
@@ -624,12 +635,19 @@ impl<'a> State<'a> {
             return;
         }
 
+        let active_axis = self
+            .drag_state
+            .as_ref()
+            .map(|d| d.axis)
+            .or(self.hovered_axis);
+
         let arms = gizmo::translate_arms(
             self.scene.mesh(),
             self.scene.mode(),
             self.scene.selection(),
             self.camera.eye(),
             self.config.height as f32,
+            active_axis,
         );
         let vertices = overlay::gizmo_line_vertices(&arms);
         self.num_gizmo_vertices = vertices.len() as u32;
@@ -840,6 +858,51 @@ async fn run() {
                     WindowEvent::Resized(physical_size) => state.resize(*physical_size),
                     WindowEvent::CursorMoved { position, .. } => {
                         state.cursor_pos = *position;
+
+                        let width = state.size.width as f32;
+                        let height = state.size.height as f32;
+                        if width > 0.0 && height > 0.0 {
+                            let ndc_x = (state.cursor_pos.x as f32 / width) * 2.0 - 1.0;
+                            let ndc_y = 1.0 - (state.cursor_pos.y as f32 / height) * 2.0;
+                            let aspect = width / height;
+                            let ray =
+                                picking::Ray::through_ndc(&state.camera, ndc_x, ndc_y, aspect);
+
+                            if let Some(ref drag) = state.drag_state {
+                                let axis_dir = drag.axis.unit_vector();
+                                if let Some(current_param) =
+                                    gizmo::project_ray_onto_axis(drag.pivot, axis_dir, &ray)
+                                {
+                                    let delta_t = current_param - drag.initial_param;
+                                    let delta_vec = axis_dir * delta_t;
+                                    state
+                                        .scene
+                                        .translate_vertices(&drag.initial_positions, delta_vec);
+                                }
+                            } else if state.scene.tool() == tool::Tool::Translate
+                                && !state.camera_controller.alt_pressed
+                                && !state.ui_state.pie_menu_active
+                                && !state.egui_ctx.wants_pointer_input()
+                            {
+                                if let Some(pivot) = gizmo::pivot(
+                                    state.scene.mesh(),
+                                    state.scene.mode(),
+                                    state.scene.selection(),
+                                ) {
+                                    state.hovered_axis = gizmo::pick_gizmo_axis(
+                                        pivot,
+                                        state.camera.eye(),
+                                        height,
+                                        &ray,
+                                        gizmo::GIZMO_PICK_TOLERANCE_PIXELS,
+                                    );
+                                } else {
+                                    state.hovered_axis = None;
+                                }
+                            } else {
+                                state.hovered_axis = None;
+                            }
+                        }
                     }
                     WindowEvent::ModifiersChanged(modifiers) => {
                         state.camera_controller.alt_pressed =
@@ -856,7 +919,7 @@ async fn run() {
                             },
                         ..
                     } => {
-                        // Maya hotkeys: Q = Select, W = Move, E = Rotate, R = Scale.
+                        // Maya hotkeys: Q = Select, W = Move, E = Rotate, R = Scale, Esc = Cancel drag.
                         // Only trigger when egui is not consuming keyboard input.
                         if !response.consumed && !state.egui_ctx.wants_keyboard_input() {
                             match key_code {
@@ -871,6 +934,14 @@ async fn run() {
                                 }
                                 KeyCode::KeyR => {
                                     state.scene.set_tool(tool::Tool::Scale);
+                                }
+                                KeyCode::Escape => {
+                                    if let Some(drag) = state.drag_state.take() {
+                                        state.scene.translate_vertices(
+                                            &drag.initial_positions,
+                                            cgmath::Vector3::new(0.0, 0.0, 0.0),
+                                        );
+                                    }
                                 }
                                 _ => {}
                             }
@@ -887,26 +958,92 @@ async fn run() {
                                 .camera_controller
                                 .process_mouse_input(*button_state, *button);
 
-                            // Viewport click-to-select (Maya style: LMB without Alt, outside UI)
-                            if *button_state == winit::event::ElementState::Pressed
-                                && *button == winit::event::MouseButton::Left
-                                && !state.camera_controller.alt_pressed
-                                && !state.ui_state.pie_menu_active
-                                && !state.egui_ctx.wants_pointer_input()
-                            {
-                                let width = state.size.width as f32;
-                                let height = state.size.height as f32;
-                                if width > 0.0 && height > 0.0 {
-                                    let ndc_x = (state.cursor_pos.x as f32 / width) * 2.0 - 1.0;
-                                    let ndc_y = 1.0 - (state.cursor_pos.y as f32 / height) * 2.0;
-                                    let aspect = width / height;
-                                    let ray = picking::Ray::through_ndc(
-                                        &state.camera,
-                                        ndc_x,
-                                        ndc_y,
-                                        aspect,
-                                    );
-                                    state.scene.select_at(&ray, state.shift_pressed, height);
+                            if *button == winit::event::MouseButton::Left {
+                                if *button_state == winit::event::ElementState::Pressed {
+                                    // Viewport click: LMB without Alt, outside UI
+                                    if !state.camera_controller.alt_pressed
+                                        && !state.ui_state.pie_menu_active
+                                        && !state.egui_ctx.wants_pointer_input()
+                                    {
+                                        let width = state.size.width as f32;
+                                        let height = state.size.height as f32;
+                                        if width > 0.0 && height > 0.0 {
+                                            let ndc_x =
+                                                (state.cursor_pos.x as f32 / width) * 2.0 - 1.0;
+                                            let ndc_y =
+                                                1.0 - (state.cursor_pos.y as f32 / height) * 2.0;
+                                            let aspect = width / height;
+                                            let ray = picking::Ray::through_ndc(
+                                                &state.camera,
+                                                ndc_x,
+                                                ndc_y,
+                                                aspect,
+                                            );
+
+                                            // Check gizmo hit first if Move tool is active and selection exists
+                                            let hit_axis =
+                                                if state.scene.tool() == tool::Tool::Translate {
+                                                    gizmo::pivot(
+                                                        state.scene.mesh(),
+                                                        state.scene.mode(),
+                                                        state.scene.selection(),
+                                                    )
+                                                    .and_then(|pivot| {
+                                                        gizmo::pick_gizmo_axis(
+                                                            pivot,
+                                                            state.camera.eye(),
+                                                            height,
+                                                            &ray,
+                                                            gizmo::GIZMO_PICK_TOLERANCE_PIXELS,
+                                                        )
+                                                    })
+                                                } else {
+                                                    None
+                                                };
+
+                                            if let Some(axis) = hit_axis {
+                                                let pivot = gizmo::pivot(
+                                                    state.scene.mesh(),
+                                                    state.scene.mode(),
+                                                    state.scene.selection(),
+                                                )
+                                                .unwrap();
+                                                let initial_param = gizmo::project_ray_onto_axis(
+                                                    pivot,
+                                                    axis.unit_vector(),
+                                                    &ray,
+                                                )
+                                                .unwrap_or(0.0);
+                                                let initial_positions: Vec<(
+                                                    mesh::VertexId,
+                                                    cgmath::Point3<f32>,
+                                                )> = state
+                                                    .scene
+                                                    .selected_vertices()
+                                                    .into_iter()
+                                                    .map(|v| {
+                                                        (v, state.scene.mesh().vertex_position(v))
+                                                    })
+                                                    .collect();
+
+                                                state.drag_state = Some(DragState {
+                                                    axis,
+                                                    pivot,
+                                                    initial_param,
+                                                    initial_positions,
+                                                });
+                                            } else {
+                                                // Not clicking gizmo axis: normal component selection
+                                                state.scene.select_at(
+                                                    &ray,
+                                                    state.shift_pressed,
+                                                    height,
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else if *button_state == winit::event::ElementState::Released {
+                                    state.drag_state = None;
                                 }
                             }
                         }
