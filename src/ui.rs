@@ -2,7 +2,18 @@
 //! the user asked for (for example a new `EditMode`) and the caller applies it.
 
 use crate::scene::EditMode;
+use crate::tool::Tool;
 use egui::{Color32, Pos2, Rect, Vec2};
+
+/// The user intents returned by `UiState::draw`.
+///
+/// Following the project architecture, `ui.rs` never mutates application state directly; it returns
+/// the user's intent to `main.rs`, which applies it to `Scene`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UiResponse {
+    pub mode: Option<EditMode>,
+    pub tool: Option<Tool>,
+}
 
 const PIE_RADIUS: f32 = 70.0;
 
@@ -49,14 +60,15 @@ impl UiState {
         }
     }
 
-    /// Draws the UI for this frame. Returns the new edit mode if the user picked one.
+    /// Draws the UI for this frame. Returns the requested intents (mode/tool change) if any.
     pub fn draw(
         &mut self,
         ctx: &egui::Context,
         current_mode: EditMode,
+        current_tool: Tool,
         selected_count: usize,
-    ) -> Option<EditMode> {
-        let mut picked_mode = None;
+    ) -> UiResponse {
+        let mut response = UiResponse::default();
 
         // 1. Check if Right Mouse Button (without Alt, Maya-style) or Spacebar is held
         let rmb_down = ctx
@@ -79,7 +91,7 @@ impl UiState {
             // Releasing inside the dead zone, with the pointer outside the window, or after the
             // window lost focus (Alt-Tab makes winit synthesize a key release) cancels.
             if self.pie_menu_active && ctx.input(|i| i.focused) {
-                picked_mode = pointer.and_then(|p| slot_toward(p - self.pie_menu_center));
+                response.mode = pointer.and_then(|p| slot_toward(p - self.pie_menu_center));
             }
             self.pie_menu_active = false;
         }
@@ -112,7 +124,7 @@ impl UiState {
                         // Force the button to render at the exact mathematical coordinate
                         let button = egui::Button::new(mode.label()).selected(mode == highlighted);
                         if ui.put(btn_rect, button).clicked() {
-                            picked_mode = Some(mode);
+                            response.mode = Some(mode);
                         }
                     }
 
@@ -128,6 +140,34 @@ impl UiState {
         } else {
             // A persistent hint window when the menu is closed
             egui::Window::new("PolyCraft Tools").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Tool:");
+                    if ui
+                        .selectable_label(current_tool == Tool::Select, "Select (Q)")
+                        .clicked()
+                    {
+                        response.tool = Some(Tool::Select);
+                    }
+                    if ui
+                        .selectable_label(current_tool == Tool::Translate, "Move (W)")
+                        .clicked()
+                    {
+                        response.tool = Some(Tool::Translate);
+                    }
+                    if ui
+                        .selectable_label(current_tool == Tool::Rotate, "Rotate (E)")
+                        .clicked()
+                    {
+                        response.tool = Some(Tool::Rotate);
+                    }
+                    if ui
+                        .selectable_label(current_tool == Tool::Scale, "Scale (R)")
+                        .clicked()
+                    {
+                        response.tool = Some(Tool::Scale);
+                    }
+                });
+                ui.separator();
                 ui.label(format!("Mode: {}", current_mode.label()));
                 let count_str = match current_mode {
                     EditMode::Object => {
@@ -144,10 +184,11 @@ impl UiState {
                 ui.label(count_str);
                 ui.separator();
                 ui.label("Hold RMB or SPACE to open the Pie Menu.");
+                ui.label("Hotkeys: Q: Select | W: Move | E: Rotate | R: Scale");
             });
         }
 
-        picked_mode
+        response
     }
 }
 
@@ -198,7 +239,7 @@ mod tests {
         events: Vec<egui::Event>,
         focused: bool,
     ) -> (Option<EditMode>, Vec<egui::epaint::ClippedShape>) {
-        let mut picked = None;
+        let mut picked = UiResponse::default();
         let mut modifiers = egui::Modifiers::NONE;
         for ev in &events {
             match ev {
@@ -217,9 +258,9 @@ mod tests {
             ..Default::default()
         };
         let output = ctx.run(input, |ctx| {
-            picked = ui_state.draw(ctx, EditMode::Object, 0);
+            picked = ui_state.draw(ctx, EditMode::Object, Tool::Translate, 0);
         });
-        (picked, output.shapes)
+        (picked.mode, output.shapes)
     }
 
     /// Runs one egui frame with the given events and returns what `draw` reported.
@@ -403,5 +444,26 @@ mod tests {
             !ui_state.pie_menu_active,
             "Alt+RMB is camera zoom, must not open pie menu"
         );
+    }
+
+    #[test]
+    fn tools_window_displays_and_returns_tool_choice() {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::new();
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+            focused: true,
+            ..Default::default()
+        };
+
+        let mut response = UiResponse::default();
+        let _ = ctx.run(input, |ctx| {
+            response = ui_state.draw(ctx, EditMode::Object, Tool::Translate, 0);
+        });
+
+        // When not clicked, returns None for mode and tool
+        assert_eq!(response.mode, None);
+        assert_eq!(response.tool, None);
     }
 }

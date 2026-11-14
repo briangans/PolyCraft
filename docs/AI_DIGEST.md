@@ -30,15 +30,16 @@ polycraft/
 │   ├── AI_DIGEST.md
 │   └── ARCHITECTURE.md    # Scope: what is in and out
 └── src/
-    ├── main.rs       # winit loop, wgpu State, GPU Vertex layout, mesh buffer upload
+    ├── main.rs       # winit loop, wgpu State, GPU Vertex layout, mesh buffer upload, hotkey routing
     ├── mesh.rs       # Half-Edge mesh, component ids, topology queries, triangulation for rendering
     ├── camera.rs     # Orbit camera, Maya-style navigation, view basis for picking
-    ├── scene.rs      # Editable document: mesh + EditMode + Selection, dirty flag
+    ├── scene.rs      # Editable document: mesh + EditMode + Selection + Tool, dirty flag
     ├── selection.rs  # Selected components per kind, Maya click semantics
     ├── picking.rs    # Screen position -> ray; face/vertex/edge/object hit tests
     ├── edit_mode.rs  # EditMode enum (Object/Vertex/Edge/Face)
+    ├── tool.rs       # Tool enum (Select/Translate/Rotate/Scale), Maya Q/W/E/R shortcuts
     ├── gizmo.rs      # Transform gizmo math (pure): selection pivot, axis colours, constant-pixel arm length
-    ├── overlay.rs    # Wireframe overlay, edge highlights, vertex 3D handles
+    ├── overlay.rs    # Wireframe overlay, edge highlights, vertex 3D handles, gizmo line vertices
     ├── ui.rs         # Spacebar pie menu (flick and release), Tools window
     └── shader.wgsl   # Vertex/fragment shader with flat shading and unlit overlay pass
 ```
@@ -52,11 +53,19 @@ polycraft/
 - `Vertex` in `main.rs` (position, normal, color) must match the `@location`s in `shader.wgsl`.
 
 ## 6. Status (update at the end of every task)
-- **Working (run-tested):** Flat-shaded cube from the half-edge mesh; Maya camera (Alt+LMB orbit, Alt+MMB pan, Alt+RMB/scroll zoom); Marking menu: hold RMB (without Alt, true Maya style) or Space, flick toward a slot and release to switch `EditMode` (Edge=Up, Face=Down, Vertex=Left, Object=Right). Viewport click-to-select: plain left click (no Alt) in viewport outside UI casts an NDC picking ray and selects/clears components; Shift+click toggles selection (Maya semantics). Selection visual highlights: selected faces tinted Maya warm orange, selected object tinted Maya green; wireframe and component overlays in `overlay.rs` render clean edges (cyan for selected edges, green for selected object) and screen-aligned flat square vertex dots in Vertex mode (6x6 blue/purple dots for unselected, 9x9 bright yellow dots for selected) with depth testing and bias. "PolyCraft Tools" window displays the current mode, active selection count, and RMB/Space menu hint.
-- **Implemented and unit-tested:** All 69 unit tests passing across camera, mesh, picking, scene, selection, ui, overlay, and gizmo. `gizmo.rs` (Iteration 1) provides the pure translate-gizmo math: `pivot()` (selection centroid per mode), `axis_world_length()` (constant on-screen arm derived from a pixel length via the shared `picking::world_per_pixel`), the `AXES` table with Maya axis colours, and `AXIS_LENGTH_PIXELS`. Not yet wired to input, drawing, or dragging.
-- **Not built yet:** Transforms/manipulator gizmos (W/E/R) are started (pure math done; no drawing/drag/activation yet), edit operations (extrude, bevel, cut), undo/redo, FBX export.
+- **Working (run-tested):** Flat-shaded cube from the half-edge mesh; Maya camera (Alt+LMB orbit, Alt+MMB pan, Alt+RMB/scroll zoom); Marking menu: hold RMB (without Alt, true Maya style) or Space, flick toward a slot and release to switch `EditMode` (Edge=Up, Face=Down, Vertex=Left, Object=Right). Viewport click-to-select: plain left click (no Alt) in viewport outside UI casts an NDC picking ray and selects/clears components; Shift+click toggles selection (Maya semantics). Selection visual highlights: selected faces tinted Maya warm orange, selected object tinted Maya green; wireframe and component overlays in `overlay.rs` render clean edges (cyan for selected edges, green for selected object) and screen-aligned flat square vertex dots in Vertex mode (6x6 blue/purple dots for unselected, 9x9 bright yellow dots for selected) with depth testing and bias. "PolyCraft Tools" window displays current mode, active tool, selection count, and hotkey hints.
+- **Implemented and unit-tested:** All 76 unit tests passing across camera, mesh, picking, scene, selection, tool, ui, overlay, and gizmo.
+  - `gizmo.rs` (Iteration 1) provides pure translate-gizmo math: `pivot()` (selection centroid per mode), `axis_world_length()` (constant on-screen arm derived from a pixel length via `world_per_pixel`), the `AXES` table with Maya axis colours (X=Red, Y=Green, Z=Blue), and `translate_arms()`.
+  - `tool.rs` and `scene.rs` (Iteration 2): `Tool` enum (`Select`, `Translate`, `Rotate`, `Scale`) decoupled from `EditMode`. Hotkeys `Q` (Select), `W` (Move), `E` (Rotate), and `R` (Scale) wired in `main.rs` via `WindowEvent::KeyboardInput` (safe from UI focus).
+  - Overlay & Gizmo rendering (Iteration 2): `gizmo_pipeline` renders constant-pixel-size 3D coordinate axes at `gizmo::pivot` whenever `tool == Tool::Translate` and there is an active selection. Always depth test ensures axes are visible through front faces as Maya does. Axes disappear cleanly in Select mode (`Q`) or when selection is cleared.
+- **Not built yet:** Transforms/manipulator dragging (Iteration 3), edit operations (extrude, bevel, cut), undo/redo, FBX export.
 - **Known limitations:** `u16` index buffer (about 16k quads max); fan triangulation needs convex faces; graphics backend chosen by `Instance::default()`; dirty flag re-uploads both mesh and overlay GPU buffers (split positions before high-frequency drag). `cargo clippy --all-targets` passes with 0 code warnings.
-- **Next (gizmo plan, Iteration 1 DONE):** Transform gizmo is being built in small testable steps. LOCKED DECISIONS: (a) the active tool (Move/Rotate/Scale, bound to W/E/R) is a SEPARATE concept from `EditMode` — a tool like `Scene::tool` set alongside selection mode; (b) the gizmo is CONSTANT SCREEN SIZE (its world arm is derived from `AXIS_LENGTH_PIXELS`, hence the `world_per_pixel` dependency). Iteration 1 (this commit): `gizmo.rs` pure math + tests. Iteration 2 (next): DRAW the three coloured axes at `gizmo::pivot` when something is selected, reusing the overlay line pipeline; because the gizmo is constant-screen-size, this likely needs a small `shader.wgsl` change so lines can take a pixel offset like the vertex-dot `vs_dot` pass. Iteration 3: activate with W and drag to translate selected vertices along the hit axis (drag math stays in `gizmo.rs`; needs a `KeyboardInput` handler in `main.rs`, which does not exist yet). Then undo/redo stack.
+- **Next (gizmo plan, Iterations 1 & 2 DONE):**
+  - **Iteration 3 (next):** Hit-test gizmo axes and drag to translate selected components along the chosen axis.
+    1. Pure picking math in `gizmo.rs`: `pick_gizmo_axis(pivot, length, ray, tolerance_pixels, viewport_height) -> Option<usize>` using `picking::ray_segment` (depth test disabled).
+    2. Pure drag math in `gizmo.rs`: project ray offset onto chosen axis $\vec{u}$ to produce world-space translation displacement $\Delta \vec{p}$.
+    3. Input handling in `main.rs`: on LMB press over an axis, enter active drag state; on mouse move, apply displacement to selected vertices in `mesh_mut()`; on LMB release, complete translation.
+  - Then undo/redo stack.
 
 ## 7. Handoff Checklist
 1. `cargo check`, `cargo test` and `cargo clippy --all-targets` pass (no new warnings), and the app launches.

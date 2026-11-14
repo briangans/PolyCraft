@@ -6,6 +6,7 @@ mod overlay;
 pub mod picking;
 mod scene;
 pub mod selection;
+pub mod tool;
 mod ui;
 
 use camera::{Camera, CameraController};
@@ -16,7 +17,7 @@ use wgpu::util::DeviceExt;
 use winit::{
     event::{DeviceEvent, Event, WindowEvent},
     event_loop::EventLoop,
-    keyboard::ModifiersState,
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowBuilder},
 };
 
@@ -610,13 +611,19 @@ impl<'a> State<'a> {
         self.num_dot_vertices = num_dot_vertices;
     }
 
-    /// Rewrites the transform gizmo's arm vertices for the current selection and camera.
+    /// Rewrites the transform gizmo's arm vertices for the current selection, tool and camera.
     ///
     /// Called every frame rather than on the dirty flag: the gizmo is a fixed pixel size on
     /// screen, so its arms stretch and rotate as the camera orbits or zooms even when nothing in
     /// the document changed. The vertex count is constant, so this is a single small
     /// `write_buffer` rather than a buffer rebuild.
     fn upload_gizmo(&mut self) {
+        // Only the Translate tool displays the 3D move axes. The Select tool and future tools do not.
+        if self.scene.tool() != tool::Tool::Translate {
+            self.num_gizmo_vertices = 0;
+            return;
+        }
+
         let arms = gizmo::translate_arms(
             self.scene.mesh(),
             self.scene.mode(),
@@ -648,12 +655,17 @@ impl<'a> State<'a> {
         self.egui_ctx.begin_frame(raw_input);
 
         // Run the extracted UI logic; it reports user intent back instead of mutating state
-        if let Some(mode) = self.ui_state.draw(
+        let ui_response = self.ui_state.draw(
             &self.egui_ctx,
             self.scene.mode(),
+            self.scene.tool(),
             self.scene.selected_count(),
-        ) {
+        );
+        if let Some(mode) = ui_response.mode {
             self.scene.set_mode(mode);
+        }
+        if let Some(tool) = ui_response.tool {
+            self.scene.set_tool(tool);
         }
 
         // If anything edited the mesh or selection, re-upload GPU buffers before rendering
@@ -833,6 +845,36 @@ async fn run() {
                         state.camera_controller.alt_pressed =
                             modifiers.state().contains(ModifiersState::ALT);
                         state.shift_pressed = modifiers.state().contains(ModifiersState::SHIFT);
+                    }
+                    WindowEvent::KeyboardInput {
+                        event:
+                            winit::event::KeyEvent {
+                                state: winit::event::ElementState::Pressed,
+                                physical_key: PhysicalKey::Code(key_code),
+                                repeat: false,
+                                ..
+                            },
+                        ..
+                    } => {
+                        // Maya hotkeys: Q = Select, W = Move, E = Rotate, R = Scale.
+                        // Only trigger when egui is not consuming keyboard input.
+                        if !response.consumed && !state.egui_ctx.wants_keyboard_input() {
+                            match key_code {
+                                KeyCode::KeyQ => {
+                                    state.scene.set_tool(tool::Tool::Select);
+                                }
+                                KeyCode::KeyW => {
+                                    state.scene.set_tool(tool::Tool::Translate);
+                                }
+                                KeyCode::KeyE => {
+                                    state.scene.set_tool(tool::Tool::Rotate);
+                                }
+                                KeyCode::KeyR => {
+                                    state.scene.set_tool(tool::Tool::Scale);
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     WindowEvent::MouseInput {
                         state: button_state,

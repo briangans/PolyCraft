@@ -264,4 +264,48 @@ mod tests {
         let eye = Point3::new(0.0, 0.0, 3.0);
         assert_eq!(axis_world_length(eye, eye, 600.0), 0.0);
     }
+
+    #[test]
+    fn translate_arms_returns_empty_when_no_selection() {
+        let mesh = cube();
+        let selection = Selection::new();
+        let eye = Point3::new(0.0, 0.0, 3.0);
+        let arms = translate_arms(&mesh, EditMode::Vertex, &selection, eye, 600.0);
+        assert!(arms.is_empty(), "unselected mesh must yield no gizmo arms");
+    }
+
+    #[test]
+    fn translate_arms_returns_three_colored_arms_anchored_at_pivot() {
+        let mesh = cube();
+        let mut selection = Selection::new();
+        selection.apply_click(Some(VertexId(0)), false, Selection::vertices_mut);
+        let eye = Point3::new(0.0, 0.0, 3.0);
+        let arms = translate_arms(&mesh, EditMode::Vertex, &selection, eye, 600.0);
+        assert_eq!(arms.len(), 3, "must yield X, Y, and Z axes");
+
+        let expected_pivot = mesh.vertex_position(VertexId(0));
+        for arm in &arms {
+            assert_eq!(
+                arm.start, expected_pivot,
+                "arm must start at selection pivot"
+            );
+        }
+
+        assert_eq!(arms[0].color, COLOR_AXIS_X);
+        assert_eq!(arms[1].color, COLOR_AXIS_Y);
+        assert_eq!(arms[2].color, COLOR_AXIS_Z);
+
+        // Arm ends must extend along each axis
+        assert!(arms[0].end.x > expected_pivot.x);
+        assert_eq!(arms[0].end.y, expected_pivot.y);
+        assert_eq!(arms[0].end.z, expected_pivot.z);
+
+        assert_eq!(arms[1].end.x, expected_pivot.x);
+        assert!(arms[1].end.y > expected_pivot.y);
+        assert_eq!(arms[1].end.z, expected_pivot.z);
+
+        assert_eq!(arms[2].end.x, expected_pivot.x);
+        assert_eq!(arms[2].end.y, expected_pivot.y);
+        assert!(arms[2].end.z > expected_pivot.z);
+    }
 }

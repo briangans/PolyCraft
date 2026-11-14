@@ -242,4 +242,33 @@ mod tests {
             .count();
         assert_eq!(unselected_dots, 42);
     }
+
+    #[test]
+    fn gizmo_line_vertices_converts_arms_into_unlit_line_pairs() {
+        use cgmath::Point3;
+        let arms = vec![
+            crate::gizmo::Arm {
+                start: Point3::new(0.0, 1.0, 2.0),
+                end: Point3::new(3.0, 1.0, 2.0),
+                color: [1.0, 0.0, 0.0],
+            },
+            crate::gizmo::Arm {
+                start: Point3::new(0.0, 1.0, 2.0),
+                end: Point3::new(0.0, 4.0, 2.0),
+                color: [0.0, 1.0, 0.0],
+            },
+        ];
+
+        let line_verts = gizmo_line_vertices(&arms);
+        assert_eq!(line_verts.len(), 4, "2 vertices per arm");
+        assert_eq!(line_verts[0].position, [0.0, 1.0, 2.0]);
+        assert_eq!(line_verts[0].color, [1.0, 0.0, 0.0]);
+        assert_eq!(line_verts[1].position, [3.0, 1.0, 2.0]);
+        assert_eq!(line_verts[1].color, [1.0, 0.0, 0.0]);
+
+        assert_eq!(line_verts[2].position, [0.0, 1.0, 2.0]);
+        assert_eq!(line_verts[2].color, [0.0, 1.0, 0.0]);
+        assert_eq!(line_verts[3].position, [0.0, 4.0, 2.0]);
+        assert_eq!(line_verts[3].color, [0.0, 1.0, 0.0]);
+    }
 }

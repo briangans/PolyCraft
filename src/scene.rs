@@ -8,6 +8,7 @@ use crate::picking::{self, Ray};
 use crate::selection::Selection;
 
 pub use crate::edit_mode::EditMode;
+pub use crate::tool::Tool;
 
 /// Click tolerance for components, in pixels. Measured on screen, so it feels the same at any zoom.
 pub const VERTEX_PICK_RADIUS_PIXELS: f32 = 8.0;
@@ -17,6 +18,7 @@ pub struct Scene {
     mesh: HalfEdgeMesh,
     dirty: bool,
     mode: EditMode,
+    tool: Tool,
     selection: Selection,
 }
 
@@ -26,6 +28,7 @@ impl Scene {
             mesh: HalfEdgeMesh::create_cube(),
             dirty: false,
             mode: EditMode::Object,
+            tool: Tool::default(),
             selection: Selection::new(),
         }
     }
@@ -55,6 +58,15 @@ impl Scene {
         self.mode = mode;
         self.selection.retain_mode(mode);
         self.dirty = true;
+    }
+
+    pub fn tool(&self) -> Tool {
+        self.tool
+    }
+
+    /// Sets the active manipulation or selection tool. Does not alter the current selection.
+    pub fn set_tool(&mut self, tool: Tool) {
+        self.tool = tool;
     }
 
     pub fn selection(&self) -> &Selection {
@@ -219,5 +231,26 @@ mod tests {
         scene.select_at(&miss_ray(), false, VIEWPORT_HEIGHT);
         assert!(!scene.selection().is_object_selected());
         assert_eq!(scene.selected_count(), 0);
+    }
+
+    #[test]
+    fn tool_can_be_switched_independently_of_selection_and_mode() {
+        let mut scene = Scene::new();
+        assert_eq!(scene.tool(), Tool::Translate);
+
+        scene.set_tool(Tool::Select);
+        assert_eq!(scene.tool(), Tool::Select);
+
+        // Selection remains intact across tool changes
+        scene.select_at(&front_ray(), false, VIEWPORT_HEIGHT);
+        assert_eq!(scene.selected_count(), 1);
+
+        scene.set_tool(Tool::Translate);
+        assert_eq!(scene.selected_count(), 1);
+        assert_eq!(scene.tool(), Tool::Translate);
+
+        // Mode changes preserve active tool
+        scene.set_mode(EditMode::Vertex);
+        assert_eq!(scene.tool(), Tool::Translate);
     }
 }
