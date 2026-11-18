@@ -73,37 +73,6 @@ impl GizmoAxis {
     }
 }
 
-/// The three world-space unit axes of a translate gizmo, with their Maya convention colours.
-/// Kept together so the drawing step and any later axis hit-testing agree on the same three.
-// Built from plain struct literals rather than `Vector3::unit_x()`, because cgmath's unit-vector
-// helpers are not `const fn`, and a `const` array cannot call them.
-pub const AXES: [(Vector3<f32>, [f32; 3]); 3] = [
-    (
-        Vector3 {
-            x: 1.0,
-            y: 0.0,
-            z: 0.0,
-        },
-        COLOR_AXIS_X,
-    ),
-    (
-        Vector3 {
-            x: 0.0,
-            y: 1.0,
-            z: 0.0,
-        },
-        COLOR_AXIS_Y,
-    ),
-    (
-        Vector3 {
-            x: 0.0,
-            y: 0.0,
-            z: 1.0,
-        },
-        COLOR_AXIS_Z,
-    ),
-];
-
 pub const COLOR_AXIS_X: [f32; 3] = [0.85, 0.20, 0.18];
 pub const COLOR_AXIS_Y: [f32; 3] = [0.25, 0.70, 0.24];
 pub const COLOR_AXIS_Z: [f32; 3] = [0.20, 0.40, 0.95];

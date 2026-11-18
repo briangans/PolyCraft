@@ -18,31 +18,8 @@ pub const COLOR_VERTEX_SELECTED: [f32; 3] = [1.0, 0.88, 0.15];
 pub const UNSELECTED_DOT_RADIUS_PIXELS: f32 = 3.0; // 6x6 pixel square dot
 pub const SELECTED_DOT_RADIUS_PIXELS: f32 = 4.5; // 9x9 pixel square dot
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct OverlayVertex {
-    pub position: [f32; 3],
-    pub normal: [f32; 3],
-    pub color: [f32; 3],
-}
-
-impl OverlayVertex {
-    pub fn new(position: [f32; 3], color: [f32; 3]) -> Self {
-        Self {
-            position,
-            normal: [0.0, 0.0, 0.0],
-            color,
-        }
-    }
-
-    pub fn new_dot_corner(position: [f32; 3], pixel_offset: [f32; 2], color: [f32; 3]) -> Self {
-        Self {
-            position,
-            normal: [pixel_offset[0], pixel_offset[1], 0.0],
-            color,
-        }
-    }
-}
+pub use crate::render_types::GpuVertex;
+pub type OverlayVertex = GpuVertex;
 
 pub struct OverlayBuffers {
     pub lines: Vec<OverlayVertex>,

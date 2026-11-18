@@ -13,7 +13,7 @@ use cgmath::{InnerSpace, Point3, Vector3};
 const OCCLUSION_TOLERANCE: f32 = 0.01;
 
 /// A world-space ray with a normalized direction.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ray {
     pub origin: Point3<f32>,
     pub direction: Vector3<f32>,
@@ -35,6 +35,24 @@ impl Ray {
             + camera.right() * (ndc_x * aspect * tan_half_fov)
             + camera.up() * (ndc_y * tan_half_fov);
         Self::new(camera.eye(), direction)
+    }
+
+    /// Constructs a picking ray directly from window pixel coordinates (top-left origin: +x right, +y down).
+    /// Returns `None` if viewport dimensions are non-positive.
+    pub fn from_screen(
+        camera: &Camera,
+        screen_x: f32,
+        screen_y: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) -> Option<Self> {
+        if viewport_width <= 0.0 || viewport_height <= 0.0 {
+            return None;
+        }
+        let ndc_x = (screen_x / viewport_width) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (screen_y / viewport_height) * 2.0;
+        let aspect = viewport_width / viewport_height;
+        Some(Self::through_ndc(camera, ndc_x, ndc_y, aspect))
     }
 
     pub fn point_at(&self, distance: f32) -> Point3<f32> {
@@ -279,6 +297,19 @@ mod tests {
         let aspect = 1.0;
         let clip = camera.build_view_projection_matrix(aspect) * point.to_homogeneous();
         (clip.x / clip.w, clip.y / clip.w)
+    }
+
+    #[test]
+    fn from_screen_matches_through_ndc() {
+        let camera = front_camera();
+        let (width, height) = (800.0, 600.0);
+        // Center of screen (400, 300) should be NDC (0, 0)
+        let ray_screen = Ray::from_screen(&camera, 400.0, 300.0, width, height).unwrap();
+        let ray_ndc = Ray::through_ndc(&camera, 0.0, 0.0, width / height);
+        assert!((ray_screen.direction - ray_ndc.direction).magnitude() < 1e-6);
+
+        // Invalid viewport returns None
+        assert_eq!(Ray::from_screen(&camera, 100.0, 100.0, 0.0, 600.0), None);
     }
 
     #[test]
