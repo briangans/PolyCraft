@@ -16,7 +16,7 @@ pub const VERTEX_PICK_RADIUS_PIXELS: f32 = 8.0;
 pub const EDGE_PICK_RADIUS_PIXELS: f32 = 6.0;
 
 /// How many actions `undo` can walk back before the oldest ones are dropped. Meshes here are small
-/// (the index buffer caps out around 16k quads), so snapshots stay cheap enough to keep a deep stack.
+/// (a snapshot is a few hundred KB at most), so they stay cheap enough to keep a deep stack.
 pub const HISTORY_DEPTH: usize = 64;
 
 /// The state undo/redo version: the geometry plus what was selected on it.

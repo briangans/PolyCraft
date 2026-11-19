@@ -63,7 +63,10 @@ pub struct RenderVertex {
 pub struct RenderMesh {
     pub vertices: Vec<RenderVertex>,
     pub vertex_faces: Vec<FaceId>,
-    pub indices: Vec<u16>,
+    /// Triangle indices into `vertices`. `u32`, not `u16`: vertices are un-welded per face, so a
+    /// modest model passes 65,536 of them and a `u16` index would silently wrap onto the wrong
+    /// vertices rather than fail.
+    pub indices: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -320,7 +323,8 @@ impl HalfEdgeMesh {
 
             let normal = self.face_normal(face);
             let normal_array = [normal.x, normal.y, normal.z];
-            let start_index = render_mesh.vertices.len() as u16;
+            // Taken before the fan's vertices are pushed, so it is their first index.
+            let start_index = render_mesh.vertices.len() as u32;
 
             for position in &positions {
                 render_mesh.vertices.push(RenderVertex {
@@ -331,10 +335,11 @@ impl HalfEdgeMesh {
             }
 
             // Triangle fan
-            for i in 1..(positions.len() - 1) as u16 {
+            for i in 1..(positions.len() - 1) {
+                let follower = start_index + i as u32;
                 render_mesh.indices.push(start_index);
-                render_mesh.indices.push(start_index + i);
-                render_mesh.indices.push(start_index + i + 1);
+                render_mesh.indices.push(follower);
+                render_mesh.indices.push(follower + 1);
             }
         }
 
@@ -486,6 +491,78 @@ mod tests {
             6 * 2 * 3,
             "two triangles per quad"
         );
+    }
+
+    /// Builds `count` disconnected unit quads, each with four of its own vertices, so the render mesh
+    /// has `count * 4` un-welded vertices - the quantity that pushes past 65,536.
+    fn quad_grid(count: usize) -> HalfEdgeMesh {
+        let mut positions = Vec::with_capacity(count * 4);
+        let mut faces = Vec::with_capacity(count);
+
+        for quad in 0..count {
+            // Spacing quads two units apart keeps each one a real square, so face normals stay
+            // non-degenerate, while still giving every quad vertices no other quad references.
+            let x = (quad % 256) as f32 * 2.0;
+            let y = (quad / 256) as f32 * 2.0;
+            let first = positions.len();
+            positions.extend([
+                Point3::new(x, y, 0.0),
+                Point3::new(x + 1.0, y, 0.0),
+                Point3::new(x + 1.0, y + 1.0, 0.0),
+                Point3::new(x, y + 1.0, 0.0),
+            ]);
+            faces.push(vec![first, first + 1, first + 2, first + 3]);
+        }
+
+        HalfEdgeMesh::from_faces(&positions, &faces)
+    }
+
+    #[test]
+    fn render_indices_reach_vertices_beyond_the_u16_range() {
+        // 20k quads un-weld to 80k vertices, so the final faces need indices no `u16` can hold. The
+        // old `as u16` truncated them, wrapping a far vertex back onto an early one - wrong geometry
+        // with no error to catch it.
+        let mesh = quad_grid(20_000);
+        let render_mesh = mesh.generate_render_buffers();
+        assert_eq!(render_mesh.vertices.len(), 80_000);
+        assert!(
+            render_mesh.vertices.len() > u16::MAX as usize + 1,
+            "the mesh must be big enough for this to mean anything"
+        );
+
+        let highest = *render_mesh
+            .indices
+            .iter()
+            .max()
+            .expect("a 20k-quad grid emits indices");
+        assert_eq!(
+            highest,
+            render_mesh.vertices.len() as u32 - 1,
+            "the last vertex needs its own index; a truncated u16 would have wrapped it"
+        );
+        assert!(
+            render_mesh
+                .indices
+                .iter()
+                .all(|i| (*i as usize) < render_mesh.vertices.len()),
+            "no index may point past the vertex list"
+        );
+    }
+
+    #[test]
+    fn every_face_fans_from_its_own_first_vertex() {
+        let mesh = quad_grid(8);
+        let render_mesh = mesh.generate_render_buffers();
+
+        for face in 0..8 {
+            let start = (face * 4) as u32;
+            // A triangle fan of a quad is two triangles sharing the fan's anchor vertex.
+            assert_eq!(
+                &render_mesh.indices[face * 6..face * 6 + 6],
+                &[start, start + 1, start + 2, start, start + 2, start + 3],
+                "face {face} must reference only the four vertices it owns"
+            );
+        }
     }
 
     #[test]
