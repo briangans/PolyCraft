@@ -14,7 +14,7 @@ PolyCraft is a trimmed-down Maya clone written in Rust, built to leverage decade
 
 ## 3. Architectural Rules
 - **Context Management:** Code is modularized. Keep files focused; prefer creating a new module over letting `main.rs` grow excessively.
-- **State Management:** Strict decoupling. The `State` struct encapsulates all `wgpu` initialization and render pipeline dispatch. The `winit` event loop strictly routes OS events.
+- **State Management:** Strict decoupling. `State` (in `renderer.rs`, not `main.rs`) encapsulates all `wgpu` initialization, render pipeline dispatch, and viewport interaction state. The `winit` event loop in `main.rs` strictly routes OS events and never touches `State` fields. Multi-field operations go through `State` interaction seams - `process_mouse_motion`, `process_scroll`, `handle_cursor_moved`, `handle_mouse_input`, `cancel_active_drag`, `set_alt_pressed`, `set_shift_pressed` - because a seam can split-borrow `self.camera_controller` and `self.camera` while two separate accessors each borrow all of `state` and fail to compile (E0499).
 - **Render Passes:** 3D Scene renders first with Z-buffer depth. `egui` renders second with `LoadOp::Load` to draw on top.
 - **Scene Ownership:** `scene.rs` owns the editable document: the mesh, the `EditMode`, `Selection`, and active `Tool`. Change them only through the `Scene` API (`mesh_mut()`, `set_mode()`, `set_tool()`, `select_at()`, `translate_vertices()`). Document mutations flag `dirty = true`; `State::render` calls `take_dirty()` to rebuild GPU buffers.
 - **UI Returns Intent:** `ui.rs` never mutates application state directly. `UiState::draw` returns what the user asked for (`UiResponse { mode, tool }`) and `main.rs` applies it.
@@ -27,20 +27,22 @@ PolyCraft is a trimmed-down Maya clone written in Rust, built to leverage decade
 polycraft/
 ├── Cargo.toml
 ├── docs/
-│   └── AI_DIGEST.md       # Central architecture, rules, workflow, and progress digest
+│   └── AI_DIGEST.md   # Central architecture, rules, workflow, and progress digest
 └── src/
-    ├── main.rs       # Entry point, winit loop, wgpu State, Vertex layout, buffer upload, hotkey routing
-    ├── mesh.rs       # Half-edge mesh (HalfEdgeMesh), topology queries, Newell normals, triangulation
-    ├── camera.rs     # Orbit camera, Maya navigation (Alt+LMB/MMB/RMB), view basis for picking
-    ├── scene.rs      # Editable document: mesh + EditMode + Selection + Tool, dirty flag, translate_vertices
-    ├── selection.rs  # Selected components per kind, Maya click semantics
-    ├── picking.rs    # Screen position -> ray; face/vertex/edge/object hit tests, ray_segment
-    ├── edit_mode.rs  # EditMode enum (Object/Vertex/Edge/Face)
-    ├── tool.rs       # Tool enum (Select/Translate/Rotate/Scale), Maya Q/W/E/R hotkeys
-    ├── gizmo.rs      # Transform gizmo math (pure): pivot, constant-pixel arm length, axis picking, drag projection
-    ├── overlay.rs    # Wireframe overlay, edge highlights, vertex square dots, gizmo line vertices
-    ├── ui.rs         # Spacebar/RMB marking pie menu, PolyCraft Tools window; returns UiResponse
-    └── shader.wgsl   # WGSL vertex/fragment shaders with flat shading, vertex dots, and unlit line passes
+    ├── main.rs         # Entry point: winit event loop, routes OS events into State, Maya hotkeys
+    ├── renderer.rs     # GPU renderer: wgpu init, State (camera/scene/egui/drag), render passes, event seams
+    ├── render_types.rs # Shared GPU layouts: GpuVertex (all passes) + CameraUniform (camera bind group)
+    ├── mesh.rs         # Half-edge mesh (HalfEdgeMesh), topology queries, Newell normals, triangulation
+    ├── camera.rs       # Orbit camera, Maya navigation (Alt+LMB/MMB/RMB), view basis for picking
+    ├── scene.rs        # Editable document: mesh + EditMode + Selection + Tool, dirty flag, translate_vertices
+    ├── selection.rs    # Selected components per kind, Maya click semantics
+    ├── picking.rs      # Screen position -> ray (Ray::from_screen); face/vertex/edge/object hit tests, ray_segment
+    ├── edit_mode.rs    # EditMode enum (Object/Vertex/Edge/Face)
+    ├── tool.rs         # Tool enum (Select/Translate/Rotate/Scale), Maya Q/W/E/R hotkeys
+    ├── gizmo.rs        # Transform gizmo math (pure): GizmoAxis, pivot, arm length, axis picking, drag projection
+    ├── overlay.rs      # Wireframe overlay, edge highlights, vertex square dots, gizmo line vertices
+    ├── ui.rs           # Spacebar/RMB marking pie menu, PolyCraft Tools window; returns UiResponse
+    └── shader.wgsl     # WGSL vertex/fragment shaders with flat shading, vertex dots, and unlit line passes
 ```
 
 ## 5. Conventions & Invariants
@@ -50,7 +52,7 @@ polycraft/
 - **Screen-Space Tolerances:** Picking and gizmo arm tolerances are measured in screen pixels (`VERTEX_PICK_RADIUS_PIXELS`, `EDGE_PICK_RADIUS_PIXELS`, `GIZMO_PICK_TOLERANCE_PIXELS`) via `world_per_pixel()`, maintaining consistent feel at any zoom level. Components behind nearer faces are occluded; gizmo arms bypass depth occlusion (`Always` pass).
 - **Selection Semantics:** One selection set per component kind; switching `EditMode` drops other kinds. Plain click replaces selection, Shift+click toggles, and plain click on empty space clears (Maya semantics).
 - **Tool Independence:** Active tool (`Tool::Select`, `Tool::Translate`, `Tool::Rotate`, `Tool::Scale`) is decoupled from `EditMode`. Switching modes preserves tool; switching tools preserves selection.
-- **GPU Vertex Layout Sync:** The GPU `Vertex` struct in `src/main.rs` derives `bytemuck::Pod`/`Zeroable` and must stay strictly in sync with `wgpu::VertexBufferLayout` and `@location(n)` declarations in `shader.wgsl`.
+- **GPU Vertex Layout Sync:** `GpuVertex` (and `CameraUniform`) live in `src/render_types.rs` and derive `bytemuck::Pod`/`Zeroable`. One struct serves every pass - `position` plus `normal`, which carries a surface normal for shaded faces but a screen-pixel offset for billboarded vertex dots - so it must stay strictly in sync with the single `wgpu::VertexBufferLayout` and the `@location(n)` declarations in `shader.wgsl`. `overlay.rs` exposes it as `OverlayVertex` via a type alias; do not reintroduce a second vertex struct.
 
 ## 6. Build, Verify & Git Workflow
 
@@ -80,10 +82,11 @@ Always run `cargo check` and `cargo test` after modifying Rust code. Do not repo
   - Visual overlays: selected faces tinted Maya warm orange, selected object tinted Maya green; wireframe edges with depth bias (cyan for selected); vertex square dots in Vertex mode (blue for unselected, bright yellow for selected).
   - Tool system: Q (Select), W (Move), E (Rotate), R (Scale) hotkeys and "PolyCraft Tools" egui panel.
   - Transform Gizmo (W key Move tool): constant-pixel-size 3D coordinate axes rendered with `Always` depth-pass at selection pivot. Hovering an axis highlights it in bright Maya yellow. Clicking and dragging an axis with LMB translates selected components (vertices, edges, faces, or object) live along the 3D axis with real-time normal and wireframe recalculation. Releasing LMB commits translation; pressing Escape cancels and restores initial positions.
-- **Implemented and unit-tested:** All 85 unit tests passing across camera, mesh, picking, scene, selection, tool, ui, overlay, and gizmo.
+- **Implemented and unit-tested:** All 86 unit tests passing across camera, mesh, picking, scene, selection, tool, ui, overlay, and gizmo. `picking::Ray::from_screen` (top-left pixel origin to NDC ray, used by `State::cursor_ray`) is covered alongside the other pure picking math.
   - `gizmo.rs` (Iterations 1 & 3): `GizmoAxis` enum (X, Y, Z), selection centroid (`pivot()`), constant-screen-size arm length (`axis_world_length()`), `translate_arms()` with active yellow highlight (`COLOR_AXIS_ACTIVE`), pure axis picking (`pick_gizmo_axis()`) via `picking::ray_segment`, 1D ray-axis projection (`project_ray_onto_axis()`), and unique component vertex collection (`selected_vertices()`).
   - `tool.rs` and `scene.rs` (Iteration 2): `Tool` enum (`Select`, `Translate`, `Rotate`, `Scale`) decoupled from `EditMode`. Maya hotkeys `Q`, `W`, `E`, `R` wired in `main.rs` via `WindowEvent::KeyboardInput` (safe from UI focus). `Scene::translate_vertices()` applies displacement to vertices and marks document dirty.
-  - Viewport & Event loop (Iteration 3): `main.rs` manages `drag_state` and `hovered_axis`. Moving mouse updates hover highlight or translates components along the chosen axis. Escape key restores initial positions.
+  - Viewport & Event loop (Iteration 3): `renderer.rs` `State` owns `drag_state` and `hovered_axis` (a private `DragState` struct). Moving the mouse updates the hover highlight or translates components along the chosen axis; Escape restores initial positions via `cancel_active_drag()`.
+  - Module Extraction (after Iteration 3): the roughly 1000-line `main.rs` was split into `renderer.rs` (wgpu init, `State`, all render passes, and the `process_mouse_motion`/`process_scroll`/`handle_cursor_moved`/`handle_mouse_input` interaction seams) and `render_types.rs` (`GpuVertex` + `CameraUniform`), leaving `main.rs` as the winit event loop and hotkey routing only. `overlay.rs` now aliases `OverlayVertex` to `GpuVertex` instead of declaring its own struct; dead accessors left behind by the split (`camera_mut`, `egui_ctx`) were removed.
 - **Not built yet:** Undo/redo stack, edit operations (extrude, bevel, cut), FBX export.
 - **Known limitations:** `u16` index buffer (about 16k quads max); fan triangulation needs convex faces; graphics backend chosen by `Instance::default()`; dirty flag re-uploads both mesh and overlay GPU buffers (split positions before high-frequency drag). `cargo clippy --all-targets` passes with 0 code warnings.
 - **Next Milestone:**

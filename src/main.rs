@@ -52,8 +52,7 @@ async fn run() {
                         state.handle_cursor_moved(*position);
                     }
                     WindowEvent::ModifiersChanged(modifiers) => {
-                        state.camera_controller_mut().alt_pressed =
-                            modifiers.state().contains(ModifiersState::ALT);
+                        state.set_alt_pressed(modifiers.state().contains(ModifiersState::ALT));
                         state.set_shift_pressed(modifiers.state().contains(ModifiersState::SHIFT));
                     }
                     WindowEvent::KeyboardInput {

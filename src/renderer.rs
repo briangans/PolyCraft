@@ -486,20 +486,12 @@ impl<'a> State<'a> {
         self.size
     }
 
-    pub fn camera_mut(&mut self) -> &mut Camera {
-        &mut self.camera
-    }
-
     pub fn camera_controller_mut(&mut self) -> &mut CameraController {
         &mut self.camera_controller
     }
 
     pub fn scene_mut(&mut self) -> &mut Scene {
         &mut self.scene
-    }
-
-    pub fn egui_ctx(&self) -> &egui::Context {
-        &self.egui_ctx
     }
 
     pub fn wants_keyboard_input(&self) -> bool {
