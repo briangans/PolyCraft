@@ -1,6 +1,7 @@
 mod camera;
 pub mod edit_mode;
 mod gizmo;
+mod history;
 mod mesh;
 mod overlay;
 pub mod picking;
@@ -13,11 +14,10 @@ mod ui;
 
 use renderer::State;
 use std::sync::Arc;
-use tool::Tool;
 use winit::{
     event::{DeviceEvent, Event, WindowEvent},
     event_loop::EventLoop,
-    keyboard::{KeyCode, ModifiersState, PhysicalKey},
+    keyboard::{ModifiersState, PhysicalKey},
     window::WindowBuilder,
 };
 
@@ -54,6 +54,7 @@ async fn run() {
                     WindowEvent::ModifiersChanged(modifiers) => {
                         state.set_alt_pressed(modifiers.state().contains(ModifiersState::ALT));
                         state.set_shift_pressed(modifiers.state().contains(ModifiersState::SHIFT));
+                        state.set_ctrl_pressed(modifiers.state().contains(ModifiersState::CONTROL));
                     }
                     WindowEvent::KeyboardInput {
                         event:
@@ -65,16 +66,11 @@ async fn run() {
                             },
                         ..
                     } => {
-                        // Maya hotkeys: Q = Select, W = Move, E = Rotate, R = Scale, Esc = Cancel drag.
+                        // Maya hotkeys: Q = Select, W = Move, E = Rotate, R = Scale, Esc = Cancel drag,
+                        // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z = Undo / Redo. `handle_hotkey` owns the keymap
+                        // so it can be unit-tested and can consult the modifiers it needs.
                         if !response.consumed && !state.wants_keyboard_input() {
-                            match key_code {
-                                KeyCode::KeyQ => state.scene_mut().set_tool(Tool::Select),
-                                KeyCode::KeyW => state.scene_mut().set_tool(Tool::Translate),
-                                KeyCode::KeyE => state.scene_mut().set_tool(Tool::Rotate),
-                                KeyCode::KeyR => state.scene_mut().set_tool(Tool::Scale),
-                                KeyCode::Escape => state.cancel_active_drag(),
-                                _ => {}
-                            }
+                            state.handle_hotkey(*key_code);
                         }
                     }
                     WindowEvent::MouseInput {

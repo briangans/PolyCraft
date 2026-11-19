@@ -5,7 +5,8 @@ use crate::edit_mode::EditMode;
 use crate::mesh::{EdgeId, FaceId, VertexId};
 use std::collections::HashSet;
 
-#[derive(Default)]
+/// Snapshot-able so undo/redo can version the selection alongside the mesh.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
     vertices: HashSet<VertexId>,
     edges: HashSet<EdgeId>,

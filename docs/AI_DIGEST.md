@@ -3,7 +3,7 @@
 ## 1. Project Vision
 PolyCraft is a trimmed-down Maya clone written in Rust, built to leverage decades of learned muscle memory (e.g., V-key vertex snapping, D-key pivot editing, Q/W/E/R tool switching).
 - **Core Features:** Polygon modeling, FBX export, pie menus, manipulator gizmos.
-- **Explicit Non-Goals:** Advanced rendering (mental ray/Vray), physics, NURBS, Output Window, complex construction history beyond immediate operations.
+- **Explicit Non-Goals:** Advanced rendering (mental ray/Vray), physics, fluids, particles, NURBS, Output Window, complex construction history beyond immediate operations.
 
 ## 2. Tech Stack & Dependencies
 - **Language:** Rust 2021 edition (Windows / MSVC ABI).
@@ -14,11 +14,12 @@ PolyCraft is a trimmed-down Maya clone written in Rust, built to leverage decade
 
 ## 3. Architectural Rules
 - **Context Management:** Code is modularized. Keep files focused; prefer creating a new module over letting `main.rs` grow excessively.
-- **State Management:** Strict decoupling. `State` (in `renderer.rs`, not `main.rs`) encapsulates all `wgpu` initialization, render pipeline dispatch, and viewport interaction state. The `winit` event loop in `main.rs` strictly routes OS events and never touches `State` fields. Multi-field operations go through `State` interaction seams - `process_mouse_motion`, `process_scroll`, `handle_cursor_moved`, `handle_mouse_input`, `cancel_active_drag`, `set_alt_pressed`, `set_shift_pressed` - because a seam can split-borrow `self.camera_controller` and `self.camera` while two separate accessors each borrow all of `state` and fail to compile (E0499).
+- **State Management:** Strict decoupling. `State` (in `renderer.rs`, not `main.rs`) encapsulates all `wgpu` initialization, render pipeline dispatch, and viewport interaction state. The `winit` event loop in `main.rs` strictly routes OS events and never touches `State` fields. Multi-field operations go through `State` interaction seams - `process_mouse_motion`, `process_scroll`, `handle_cursor_moved`, `handle_mouse_input`, `cancel_active_drag`, `undo`, `redo`, `handle_hotkey`, `set_alt_pressed`, `set_shift_pressed`, `set_ctrl_pressed` - because a seam can split-borrow `self.camera_controller` and `self.camera` while two separate accessors each borrow all of `state` and fail to compile (E0499).
+- **Scene Ownership:** `scene.rs` owns the editable document: the mesh, the `EditMode`, `Selection`, active `Tool`, and the undo/redo `HistoryStack`. Change them only through the `Scene` API (`mesh_mut()`, `set_mode()`, `set_tool()`, `select_at()`, `translate_vertices()`, `begin_action()`/`end_action()`/`cancel_action()`, `undo()`/`redo()`). Document mutations flag `dirty = true`; `State::render` calls `take_dirty()` to rebuild GPU buffers.
+- **UI Returns Intent:** `ui.rs` never mutates application state directly. `UiState::draw` takes what to display as a `UiContext` struct and returns what the user asked for (`UiResponse { mode, tool, undo, redo }`); `renderer.rs` applies it.
+- **Hotkeys Stay a Pure Map:** the Maya keymap lives in `renderer.rs::hotkey_for(key, ctrl, shift) -> Option<Hotkey>`, a free function that `State::handle_hotkey` carries out. Binding a key is adding a match arm; asserting one is a unit test - no window, no GPU context. `main.rs` only decides *whether* to offer the key (skipping it when the UI consumed the event or owns keyboard focus).
+- **Pure Logic Stays Testable:** Mesh topology, picking, selection, camera math, gizmo calculations, and the `HistoryStack` never touch `wgpu` or `winit`, and have unit tests next to the code (`mod tests`). `HistoryStack<T>` is generic over the snapshot type, so stack semantics are tested with `T = i32`.
 - **Render Passes:** 3D Scene renders first with Z-buffer depth. `egui` renders second with `LoadOp::Load` to draw on top.
-- **Scene Ownership:** `scene.rs` owns the editable document: the mesh, the `EditMode`, `Selection`, and active `Tool`. Change them only through the `Scene` API (`mesh_mut()`, `set_mode()`, `set_tool()`, `select_at()`, `translate_vertices()`). Document mutations flag `dirty = true`; `State::render` calls `take_dirty()` to rebuild GPU buffers.
-- **UI Returns Intent:** `ui.rs` never mutates application state directly. `UiState::draw` returns what the user asked for (`UiResponse { mode, tool }`) and `main.rs` applies it.
-- **Pure Logic Stays Testable:** Mesh topology, picking, selection, camera math, and gizmo calculations never touch `wgpu` or `winit`, and have unit tests next to the code (`mod tests`).
 - **Resilient Error Handling:** Recoverable errors must be handled gracefully rather than panicked; the application must not crash on surface resizes, minimize events, or transient GPU adapter conditions.
 
 ## 4. File Structure & Responsibilities
@@ -34,7 +35,8 @@ polycraft/
     ├── render_types.rs # Shared GPU layouts: GpuVertex (all passes) + CameraUniform (camera bind group)
     ├── mesh.rs         # Half-edge mesh (HalfEdgeMesh), topology queries, Newell normals, triangulation
     ├── camera.rs       # Orbit camera, Maya navigation (Alt+LMB/MMB/RMB), view basis for picking
-    ├── scene.rs        # Editable document: mesh + EditMode + Selection + Tool, dirty flag, translate_vertices
+    ├── scene.rs        # Editable document: mesh + EditMode + Selection + Tool, dirty flag, undo/redo, HistoryStack
+    ├── history.rs      # Undo/redo HistoryStack<T> (pure): begin/commit/cancel action capture, bounded undo/redo stacks
     ├── selection.rs    # Selected components per kind, Maya click semantics
     ├── picking.rs      # Screen position -> ray (Ray::from_screen); face/vertex/edge/object hit tests, ray_segment
     ├── edit_mode.rs    # EditMode enum (Object/Vertex/Edge/Face)

@@ -30,11 +30,14 @@ impl EdgeId {
     }
 }
 
+/// Document records are snapshot-able so `HistoryStack` can version them (see `scene::DocumentSnapshot`).
+#[derive(Clone, Debug, PartialEq)]
 pub struct MeshVertex {
     pub position: Point3<f32>,
     pub half_edge: Option<HalfEdgeId>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct HalfEdge {
     pub origin: VertexId,
     pub twin: Option<HalfEdgeId>,
@@ -43,6 +46,7 @@ pub struct HalfEdge {
     pub face: Option<FaceId>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct Face {
     pub half_edge: Option<HalfEdgeId>,
 }
@@ -62,6 +66,7 @@ pub struct RenderMesh {
     pub indices: Vec<u16>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct HalfEdgeMesh {
     pub vertices: Vec<MeshVertex>,
     pub half_edges: Vec<HalfEdge>,

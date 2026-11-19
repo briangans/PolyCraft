@@ -12,7 +12,7 @@ use crate::picking::Ray;
 use crate::render_types::{CameraUniform, GpuVertex};
 use crate::scene::Scene;
 use crate::tool::Tool;
-use crate::ui::UiState;
+use crate::ui::{UiContext, UiState};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -191,8 +191,58 @@ pub struct State<'a> {
     ui_state: UiState,
     cursor_pos: winit::dpi::PhysicalPosition<f64>,
     shift_pressed: bool,
+    ctrl_pressed: bool,
     drag_state: Option<DragState>,
     hovered_axis: Option<GizmoAxis>,
+}
+
+/// The name a gizmo drag records into history, Maya-style: the tool plus the component being moved
+/// ("Move Vertex", "Move Edge"). In Object mode Maya names the chunk after the tool alone.
+fn drag_action_label(mode: EditMode, tool: Tool) -> String {
+    if mode == EditMode::Object {
+        tool.label().to_owned()
+    } else {
+        format!("{} {}", tool.label(), mode.label())
+    }
+}
+
+/// A keyboard action the viewport responds to. Produced by [`hotkey_for`], carried out by
+/// `State::handle_hotkey`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hotkey {
+    SetTool(Tool),
+    CancelDrag,
+    Undo,
+    Redo,
+}
+
+/// The Maya keymap, as a pure function of the physical key and the Ctrl / Shift modifiers.
+///
+/// A free function rather than inline event-loop matching so the bindings - including the modifier
+/// rules below - are unit-testable without a window or a GPU context.
+///
+/// The tool keys only fire with Ctrl released: `Ctrl+Z` sends `KeyZ`, and without that guard a
+/// `Ctrl+E` intended as a menu mnemonic would silently switch to Rotate.
+fn hotkey_for(key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> Option<Hotkey> {
+    use winit::keyboard::KeyCode as Key;
+
+    if ctrl {
+        return match key {
+            Key::KeyZ if shift => Some(Hotkey::Redo),
+            Key::KeyZ => Some(Hotkey::Undo),
+            Key::KeyY => Some(Hotkey::Redo),
+            _ => None,
+        };
+    }
+
+    match key {
+        Key::KeyQ => Some(Hotkey::SetTool(Tool::Select)),
+        Key::KeyW => Some(Hotkey::SetTool(Tool::Translate)),
+        Key::KeyE => Some(Hotkey::SetTool(Tool::Rotate)),
+        Key::KeyR => Some(Hotkey::SetTool(Tool::Scale)),
+        Key::Escape => Some(Hotkey::CancelDrag),
+        _ => None,
+    }
 }
 
 impl<'a> State<'a> {
@@ -473,6 +523,7 @@ impl<'a> State<'a> {
             ui_state,
             cursor_pos: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             shift_pressed: false,
+            ctrl_pressed: false,
             drag_state: None,
             hovered_axis: None,
         }
@@ -490,10 +541,6 @@ impl<'a> State<'a> {
         &mut self.camera_controller
     }
 
-    pub fn scene_mut(&mut self) -> &mut Scene {
-        &mut self.scene
-    }
-
     pub fn wants_keyboard_input(&self) -> bool {
         self.egui_ctx.wants_keyboard_input()
     }
@@ -507,6 +554,50 @@ impl<'a> State<'a> {
 
     pub fn set_shift_pressed(&mut self, pressed: bool) {
         self.shift_pressed = pressed;
+    }
+
+    pub fn set_ctrl_pressed(&mut self, pressed: bool) {
+        self.ctrl_pressed = pressed;
+    }
+
+    /// Applies the Maya hotkey bound to `key`, returning true when the key was handled.
+    ///
+    /// The keymap itself is the pure [`hotkey_for`]; this only carries out what it asks for, so the
+    /// bindings stay unit-testable without a window or a GPU.
+    pub fn handle_hotkey(&mut self, key: winit::keyboard::KeyCode) -> bool {
+        match hotkey_for(key, self.ctrl_pressed, self.shift_pressed) {
+            Some(Hotkey::SetTool(tool)) => {
+                self.scene.set_tool(tool);
+                true
+            }
+            Some(Hotkey::CancelDrag) => {
+                self.cancel_active_drag();
+                true
+            }
+            Some(Hotkey::Undo) => {
+                self.undo();
+                true
+            }
+            Some(Hotkey::Redo) => {
+                self.redo();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Steps the document one action back. A seam rather than a `main.rs` call into `Scene`, because
+    /// an in-flight drag has to be abandoned first: undoing underneath an active drag would leave the
+    /// drag holding vertex ids and initial positions from the state that was just rolled back.
+    pub fn undo(&mut self) {
+        self.cancel_active_drag();
+        self.scene.undo();
+    }
+
+    /// Re-applies the last undone action, abandoning an in-flight drag for the same reason.
+    pub fn redo(&mut self) {
+        self.cancel_active_drag();
+        self.scene.redo();
     }
 
     pub fn set_alt_pressed(&mut self, pressed: bool) {
@@ -714,13 +805,22 @@ impl<'a> State<'a> {
                             initial_param,
                             initial_positions,
                         });
+                        // Opens the history step for this drag. Nothing has been moved yet, so this
+                        // snapshot is the state `undo` returns to. `end_action` on release records it,
+                        // which is what makes a whole drag one undo step instead of one per frame.
+                        let label = drag_action_label(self.scene.mode(), self.scene.tool());
+                        self.scene.begin_action(&label);
                     } else {
                         self.scene.select_at(&ray, self.shift_pressed, height);
                     }
                 }
             }
-        } else if button_state == winit::event::ElementState::Released {
-            self.drag_state = None;
+        } else if button_state == winit::event::ElementState::Released
+            && self.drag_state.take().is_some()
+        {
+            // Releases the translation, then records it. A press-and-release with no movement
+            // compares equal to the captured state, so it leaves no step in history.
+            self.scene.end_action();
         }
     }
 
@@ -728,6 +828,7 @@ impl<'a> State<'a> {
         if let Some(drag) = self.drag_state.take() {
             self.scene
                 .translate_vertices(&drag.initial_positions, cgmath::Vector3::new(0.0, 0.0, 0.0));
+            self.scene.cancel_action();
         }
     }
 
@@ -748,15 +849,27 @@ impl<'a> State<'a> {
 
         let ui_response = self.ui_state.draw(
             &self.egui_ctx,
-            self.scene.mode(),
-            self.scene.tool(),
-            self.scene.selected_count(),
+            UiContext {
+                mode: self.scene.mode(),
+                tool: self.scene.tool(),
+                selected_count: self.scene.selected_count(),
+                can_undo: self.scene.can_undo(),
+                can_redo: self.scene.can_redo(),
+                undo_label: self.scene.undo_label(),
+                redo_label: self.scene.redo_label(),
+            },
         );
         if let Some(mode) = ui_response.mode {
             self.scene.set_mode(mode);
         }
         if let Some(tool) = ui_response.tool {
             self.scene.set_tool(tool);
+        }
+        if ui_response.undo {
+            self.scene.undo();
+        }
+        if ui_response.redo {
+            self.scene.redo();
         }
 
         if self.scene.take_dirty() {
@@ -878,5 +991,97 @@ impl<'a> State<'a> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::KeyCode as Key;
+
+    #[test]
+    fn plain_keys_switch_tools_as_in_maya() {
+        assert_eq!(
+            hotkey_for(Key::KeyQ, false, false),
+            Some(Hotkey::SetTool(Tool::Select))
+        );
+        assert_eq!(
+            hotkey_for(Key::KeyW, false, false),
+            Some(Hotkey::SetTool(Tool::Translate))
+        );
+        assert_eq!(
+            hotkey_for(Key::KeyE, false, false),
+            Some(Hotkey::SetTool(Tool::Rotate))
+        );
+        assert_eq!(
+            hotkey_for(Key::KeyR, false, false),
+            Some(Hotkey::SetTool(Tool::Scale))
+        );
+    }
+
+    #[test]
+    fn escape_cancels_the_active_drag() {
+        assert_eq!(
+            hotkey_for(Key::Escape, false, false),
+            Some(Hotkey::CancelDrag)
+        );
+    }
+
+    #[test]
+    fn ctrl_z_undoes_and_the_redo_chords_redo() {
+        assert_eq!(hotkey_for(Key::KeyZ, true, false), Some(Hotkey::Undo));
+        assert_eq!(hotkey_for(Key::KeyZ, true, true), Some(Hotkey::Redo));
+        assert_eq!(hotkey_for(Key::KeyY, true, false), Some(Hotkey::Redo));
+    }
+
+    #[test]
+    fn tool_keys_do_not_fire_while_ctrl_is_held() {
+        // Otherwise `Ctrl+E` would quietly switch to Rotate, and `Ctrl+W` would close nothing but
+        // change the tool.
+        assert_eq!(hotkey_for(Key::KeyE, true, false), None);
+        assert_eq!(hotkey_for(Key::KeyW, true, false), None);
+        assert_eq!(hotkey_for(Key::KeyQ, true, false), None);
+    }
+
+    #[test]
+    fn unbound_keys_are_left_alone() {
+        assert_eq!(
+            hotkey_for(Key::KeyZ, false, false),
+            None,
+            "Z alone is not an undo key"
+        );
+        assert_eq!(hotkey_for(Key::KeyY, false, false), None);
+        assert_eq!(
+            hotkey_for(Key::Space, false, false),
+            None,
+            "Space belongs to the pie menu"
+        );
+    }
+
+    #[test]
+    fn shift_alone_does_not_reach_the_history() {
+        // Shift+click is additive selection, handled by picking, and Shift+Z must not undo.
+        assert_eq!(hotkey_for(Key::KeyZ, false, true), None);
+        assert_eq!(
+            hotkey_for(Key::Escape, false, true),
+            Some(Hotkey::CancelDrag)
+        );
+    }
+
+    #[test]
+    fn drag_labels_name_the_component_being_moved() {
+        assert_eq!(
+            drag_action_label(EditMode::Vertex, Tool::Translate),
+            "Move Vertex"
+        );
+        assert_eq!(
+            drag_action_label(EditMode::Edge, Tool::Translate),
+            "Move Edge"
+        );
+        assert_eq!(
+            drag_action_label(EditMode::Face, Tool::Translate),
+            "Move Face"
+        );
+        assert_eq!(drag_action_label(EditMode::Object, Tool::Translate), "Move");
     }
 }

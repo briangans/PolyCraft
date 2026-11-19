@@ -13,6 +13,36 @@ use egui::{Color32, Pos2, Rect, Vec2};
 pub struct UiResponse {
     pub mode: Option<EditMode>,
     pub tool: Option<Tool>,
+    /// The Undo button was clicked; the caller performs the undo.
+    pub undo: bool,
+    /// The Redo button was clicked; the caller performs the redo.
+    pub redo: bool,
+}
+
+/// Everything the UI displays for this frame, handed to [`UiState::draw`].
+///
+/// A struct rather than a long positional argument list: the two booleans and two option labels
+/// beside each other would be far too easy to pass in the wrong order to notice in a call site.
+#[derive(Clone, Copy, Debug)]
+pub struct UiContext<'a> {
+    pub mode: EditMode,
+    pub tool: Tool,
+    pub selected_count: usize,
+    /// Whether there is an action to step back / forward, so the buttons can be greyed out.
+    pub can_undo: bool,
+    pub can_redo: bool,
+    /// Name of the action Undo would revert ("Move Vertex"), shown on the button Maya-style.
+    pub undo_label: Option<&'a str>,
+    pub redo_label: Option<&'a str>,
+}
+
+/// Button text Maya-style: plain "Undo" when there is nothing to step back to, "Undo - Move Vertex"
+/// when there is, so the user can see what the hotkey will take away before pressing it.
+fn history_button_text(prefix: &str, label: Option<&str>) -> String {
+    match label {
+        Some(label) => format!("{prefix} - {label}"),
+        None => prefix.to_owned(),
+    }
 }
 
 const PIE_RADIUS: f32 = 70.0;
@@ -60,14 +90,17 @@ impl UiState {
         }
     }
 
-    /// Draws the UI for this frame. Returns the requested intents (mode/tool change) if any.
-    pub fn draw(
-        &mut self,
-        ctx: &egui::Context,
-        current_mode: EditMode,
-        current_tool: Tool,
-        selected_count: usize,
-    ) -> UiResponse {
+    /// Draws the UI for this frame. Returns the requested intents (mode/tool change, undo/redo) if any.
+    pub fn draw(&mut self, ctx: &egui::Context, current: UiContext<'_>) -> UiResponse {
+        let UiContext {
+            mode: current_mode,
+            tool: current_tool,
+            selected_count,
+            can_undo,
+            can_redo,
+            undo_label,
+            redo_label,
+        } = current;
         let mut response = UiResponse::default();
 
         // 1. Check if Right Mouse Button (without Alt, Maya-style) or Spacebar is held
@@ -168,6 +201,18 @@ impl UiState {
                     }
                 });
                 ui.separator();
+                ui.horizontal(|ui| {
+                    // The buttons report intent only; the caller owns the history and applies it.
+                    let undo_button = egui::Button::new(history_button_text("Undo", undo_label));
+                    if ui.add_enabled(can_undo, undo_button).clicked() {
+                        response.undo = true;
+                    }
+                    let redo_button = egui::Button::new(history_button_text("Redo", redo_label));
+                    if ui.add_enabled(can_redo, redo_button).clicked() {
+                        response.redo = true;
+                    }
+                });
+                ui.separator();
                 ui.label(format!("Mode: {}", current_mode.label()));
                 let count_str = match current_mode {
                     EditMode::Object => {
@@ -185,6 +230,7 @@ impl UiState {
                 ui.separator();
                 ui.label("Hold RMB or SPACE to open the Pie Menu.");
                 ui.label("Hotkeys: Q: Select | W: Move | E: Rotate | R: Scale");
+                ui.label("Ctrl+Z: Undo | Ctrl+Y / Ctrl+Shift+Z: Redo");
             });
         }
 
@@ -232,13 +278,39 @@ mod tests {
         }
     }
 
+    /// Frame state every pie-menu test draws with: nothing to undo, so the history buttons stay inert
+    /// and cannot interfere with the mode intents the tests assert on.
+    fn test_context() -> UiContext<'static> {
+        UiContext {
+            mode: EditMode::Object,
+            tool: Tool::Translate,
+            selected_count: 0,
+            can_undo: false,
+            can_redo: false,
+            undo_label: None,
+            redo_label: None,
+        }
+    }
+
     /// Runs one egui frame; returns what `draw` reported and the shapes it painted.
     fn run_frame_full(
         ctx: &egui::Context,
         ui_state: &mut UiState,
         events: Vec<egui::Event>,
         focused: bool,
-    ) -> (Option<EditMode>, Vec<egui::epaint::ClippedShape>) {
+    ) -> (UiResponse, Vec<egui::epaint::ClippedShape>) {
+        run_frame_with(ctx, ui_state, events, focused, test_context())
+    }
+
+    /// `run_frame_full` with the displayed state supplied by the caller, for the tests that need the
+    /// history buttons live.
+    fn run_frame_with(
+        ctx: &egui::Context,
+        ui_state: &mut UiState,
+        events: Vec<egui::Event>,
+        focused: bool,
+        context: UiContext<'_>,
+    ) -> (UiResponse, Vec<egui::epaint::ClippedShape>) {
         let mut picked = UiResponse::default();
         let mut modifiers = egui::Modifiers::NONE;
         for ev in &events {
@@ -258,9 +330,9 @@ mod tests {
             ..Default::default()
         };
         let output = ctx.run(input, |ctx| {
-            picked = ui_state.draw(ctx, EditMode::Object, Tool::Translate, 0);
+            picked = ui_state.draw(ctx, context);
         });
-        (picked.mode, output.shapes)
+        (picked, output.shapes)
     }
 
     /// Runs one egui frame with the given events and returns what `draw` reported.
@@ -270,7 +342,7 @@ mod tests {
         events: Vec<egui::Event>,
         focused: bool,
     ) -> Option<EditMode> {
-        run_frame_full(ctx, ui_state, events, focused).0
+        run_frame_full(ctx, ui_state, events, focused).0.mode
     }
 
     /// Opens the menu with the pointer at `center`.
@@ -459,10 +531,155 @@ mod tests {
 
         let mut response = UiResponse::default();
         let _ = ctx.run(input, |ctx| {
-            response = ui_state.draw(ctx, EditMode::Object, Tool::Translate, 0);
+            response = ui_state.draw(ctx, test_context());
         });
 
         // When not clicked, returns None for mode and tool
+        assert_eq!(response.mode, None);
+        assert_eq!(response.tool, None);
+    }
+
+    #[test]
+    fn history_buttons_are_inert_until_the_action_exists() {
+        // Nothing to step back to: the response carries no history intent even on an empty frame.
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::new();
+        let (response, _) = run_frame_full(&ctx, &mut ui_state, Vec::new(), true);
+        assert!(!response.undo);
+        assert!(!response.redo);
+    }
+
+    #[test]
+    fn button_labels_name_the_action_they_would_revert() {
+        assert_eq!(history_button_text("Undo", None), "Undo");
+        assert_eq!(
+            history_button_text("Undo", Some("Move Vertex")),
+            "Undo - Move Vertex",
+            "the user should be able to read what Ctrl+Z will take away before pressing it"
+        );
+        assert_eq!(
+            history_button_text("Redo", Some("Move Edge")),
+            "Redo - Move Edge"
+        );
+    }
+
+    /// Where `wanted` was painted this frame, as a clickable point inside it.
+    fn painted_text_center(shapes: &[egui::epaint::ClippedShape], wanted: &str) -> Option<Pos2> {
+        fn find(shape: &egui::epaint::Shape, wanted: &str) -> Option<Pos2> {
+            match shape {
+                egui::epaint::Shape::Text(text) => {
+                    let galley = &text.galley;
+                    // `galley.rect` is in galley-local space (`rect.top()` is always 0), so the
+                    // on-screen point is the shape's position plus that local offset.
+                    (galley.job.text == wanted).then(|| text.pos + galley.rect.center().to_vec2())
+                }
+                egui::epaint::Shape::Vec(inner) => inner.iter().find_map(|s| find(s, wanted)),
+                _ => None,
+            }
+        }
+        shapes
+            .iter()
+            .find_map(|clipped| find(&clipped.shape, wanted))
+    }
+
+    /// Presses and releases the primary button on the button labelled `wanted`, one egui frame apart
+    /// like real input, and reports what the frame that took the release returned. The click point is
+    /// read back out of the painted label rather than hardcoded, so the test survives the panel being
+    /// moved or the buttons changing size. Panics if no such label was painted.
+    fn click_button_labelled(context: UiContext<'_>, wanted: &str) -> UiResponse {
+        let ctx = egui::Context::default();
+        let mut ui_state = UiState::new();
+
+        // egui cannot lay out text on the very first frame: it hands the backend the font texture in
+        // `textures_delta` and only measures glyphs once the backend reports that texture back, so
+        // every label on frame one paints as `Shape::Noop`. Draw a throwaway frame first to get the
+        // fonts in, or there would be no label to find.
+        run_frame_with(&ctx, &mut ui_state, Vec::new(), true, context);
+
+        let (_, shapes) = run_frame_with(&ctx, &mut ui_state, Vec::new(), true, context);
+        let center = painted_text_center(&shapes, wanted)
+            .unwrap_or_else(|| panic!("no button labelled {wanted:?} was painted"));
+
+        let hover = vec![egui::Event::PointerMoved(center)];
+        run_frame_with(&ctx, &mut ui_state, hover, true, context);
+
+        let press = vec![egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        let pressed = run_frame_with(&ctx, &mut ui_state, press, true, context).0;
+        assert!(
+            !pressed.undo && !pressed.redo,
+            "pressing is not enough; the action belongs on release"
+        );
+
+        let release = vec![
+            egui::Event::PointerMoved(center),
+            egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        run_frame_with(&ctx, &mut ui_state, release, true, context).0
+    }
+
+    /// A frame state with one "Move Vertex" action waiting to be undone, and nothing to redo.
+    fn undoable_context() -> UiContext<'static> {
+        UiContext {
+            mode: EditMode::Vertex,
+            tool: Tool::Translate,
+            selected_count: 1,
+            can_undo: true,
+            can_redo: false,
+            undo_label: Some("Move Vertex"),
+            redo_label: None,
+        }
+    }
+
+    /// The same with the branches swapped: nothing to undo, one action to redo.
+    fn redoable_context() -> UiContext<'static> {
+        UiContext {
+            can_undo: false,
+            can_redo: true,
+            undo_label: None,
+            redo_label: Some("Move Vertex"),
+            ..undoable_context()
+        }
+    }
+
+    #[test]
+    fn clicking_undo_reports_only_the_undo_intent() {
+        let response = click_button_labelled(undoable_context(), "Undo - Move Vertex");
+        assert!(response.undo, "the enabled Undo button must report intent");
+        assert!(!response.redo, "the greyed Redo button must stay inert");
+    }
+
+    #[test]
+    fn clicking_redo_reports_only_the_redo_intent() {
+        let response = click_button_labelled(redoable_context(), "Redo - Move Vertex");
+        assert!(response.redo);
+        assert!(!response.undo);
+    }
+
+    #[test]
+    fn a_greyed_out_history_button_does_not_report_intent() {
+        // A disabled widget still paints its label, so this click lands on the button and must be
+        // swallowed by `add_enabled` rather than reaching the caller's history.
+        let response = click_button_labelled(test_context(), "Undo");
+        assert!(
+            !response.undo,
+            "clicking a disabled Undo must not step the document back"
+        );
+        assert!(!response.redo);
+    }
+
+    #[test]
+    fn clicking_a_history_button_does_not_change_the_mode_or_tool() {
+        let response = click_button_labelled(undoable_context(), "Undo - Move Vertex");
         assert_eq!(response.mode, None);
         assert_eq!(response.tool, None);
     }
