@@ -123,4 +123,6 @@ Write what the app *does now*, not how it got here. The per-iteration narrative 
 2. Update Section 4 (file structure) and Section 7 (status).
 3. Commit with a descriptive message.
 
+Editing this digest invalidates its cached KV prefix, so update it **once at the end** of a task, as steps 2-3 order it - never between turns mid-task, where every edit pays for a full re-prefill (see Section 0).
+
 Roles: All AI agents and human contributors adhere strictly to this digest for architecture, conventions, and status updates.
