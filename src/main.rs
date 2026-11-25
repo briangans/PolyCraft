@@ -3,6 +3,7 @@ pub mod edit_mode;
 mod gizmo;
 mod history;
 mod mesh;
+mod mesh_edit;
 mod overlay;
 pub mod picking;
 pub mod render_types;
