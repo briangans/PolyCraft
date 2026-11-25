@@ -249,17 +249,7 @@ impl HalfEdgeMesh {
     /// Newell's method: a stable polygon normal that uses every vertex, so concave and
     /// non-planar faces still come out right (the old first-three-vertices version did not).
     pub fn face_normal(&self, face: FaceId) -> Vector3<f32> {
-        let positions = self.face_positions(face);
-        let mut normal = Vector3::new(0.0, 0.0, 0.0);
-
-        for i in 0..positions.len() {
-            let current = positions[i];
-            let next = positions[(i + 1) % positions.len()];
-            normal.x += (current.y - next.y) * (current.z + next.z);
-            normal.y += (current.z - next.z) * (current.x + next.x);
-            normal.z += (current.x - next.x) * (current.y + next.y);
-        }
-
+        let normal = newell_normal(&self.face_positions(face));
         if normal.magnitude2() > 0.0 {
             normal.normalize()
         } else {
@@ -363,6 +353,11 @@ impl HalfEdgeMesh {
     /// then hand it to the document, so a bad extrude fails against a named invariant instead of
     /// becoming a corrupted viewport.
     ///
+    /// The last two passes are geometric rather than topological - a face with no area, and two faces over
+    /// the same corners - because both are invisible to the other six and ruin the viewport anyway. The
+    /// split is worth keeping in mind when reading a report: the first four passes say the *pointers* are
+    /// wrong, these two say the *shape* is.
+    ///
     /// It is a `Result`, not a panic or a `bool`, so a caller can *decline* a bad operation and keep
     /// the document it already had. An empty `Err` list is never returned. Cost is linear in
     /// half-edges; it is meant for after an edit and before a file import, not once per frame.
@@ -374,9 +369,55 @@ impl HalfEdgeMesh {
         scan.check_face_loops();
         scan.check_face_back_references();
         scan.check_directed_edges_are_unique();
+        scan.check_faces_bound_area();
+        scan.check_faces_are_distinct();
+        scan.check_vertex_fans_are_connected();
         scan.finish()
     }
 }
+
+/// Newell's method: the area-weighted normal of a polygon, taken from every vertex so concave and
+/// non-planar faces come out right.
+///
+/// Deliberately left un-normalized. Its magnitude is twice the projected area, which is what lets
+/// [`HalfEdgeMesh::face_normal`] normalize it *and* lets [`face_area`] answer "does this polygon exist at
+/// all" - the question `validate` asks of a face, and the one `mesh_edit` asks of a wall before building it.
+fn newell_normal(positions: &[Point3<f32>]) -> Vector3<f32> {
+    let mut normal = Vector3::new(0.0, 0.0, 0.0);
+
+    for index in 0..positions.len() {
+        let current = positions[index];
+        let next = positions[(index + 1) % positions.len()];
+        normal.x += (current.y - next.y) * (current.z + next.z);
+        normal.y += (current.z - next.z) * (current.x + next.x);
+        normal.z += (current.x - next.x) * (current.y + next.y);
+    }
+
+    normal
+}
+
+/// Twice the projected area of a polygon, squared - the number `validate` compares against
+/// [`MIN_FACE_AREA`] to decide a face exists.
+///
+/// Shared with `mesh_edit` so a primitive refuses a degenerate wall on exactly the same measurement the
+/// validator would later reject it on; two tolerances would eventually disagree about one face somewhere in
+/// between and the report would name neither.
+pub(crate) fn face_area(positions: &[Point3<f32>]) -> f32 {
+    newell_normal(positions).magnitude2()
+}
+
+/// The smallest [`face_area`] a face may have before [`HalfEdgeMesh::validate`] calls it degenerate.
+///
+/// An exactly collapsed face - repeated corners, or a ring of collinear ones - scores 0, so the floor only
+/// has to stay clear of floating-point cancellation rather than of real geometry. `1e-18` bounds the
+/// normal's magnitude at 1e-9, which sits below the thinnest wall `mesh_edit` permits an extrude to grow
+/// (4e-12 for a unit edge pushed 1e-6) and above nothing at all.
+///
+/// Absolute rather than relative to the mesh's scale, which is a real limitation worth naming: a model
+/// authored at a thousandth of a unit would have its faces judged against a human-scale floor. Making it
+/// relative would also reject legitimately thin walls, since those have small area *by definition*; the
+/// honest fix is a unit-aware import, not a smarter threshold.
+pub(crate) const MIN_FACE_AREA: f32 = 1e-18;
 
 /// Scratch state for [`HalfEdgeMesh::validate`], one pass per method.
 ///
@@ -720,6 +761,155 @@ impl<'a> TopologyScan<'a> {
             if let Some(first) = owners.insert((origin, destination), index) {
                 self.errors.push(format!(
                     "half edges {first} and {index} both run vertex {origin} to vertex {destination}"
+                ));
+            }
+        }
+    }
+
+    /// The half-edges ringing `face`, or `None` when they cannot be walked.
+    ///
+    /// Broken links are `check_face_loops`' business; the two passes below are about shape, and rearing
+    /// into a `next` that leads nowhere would either panic or add a second, vaguer complaint about damage
+    /// already on the list. So they step over an unwalkable face and let the topology report stand alone.
+    fn walk_face(&self, face: usize) -> Option<Vec<usize>> {
+        let first = self.mesh.faces.get(face)?.half_edge?.0;
+        let mut walked = Vec::new();
+        let mut cursor = first;
+
+        for _ in 0..=self.next_of.len() {
+            self.mesh.half_edges.get(cursor)?;
+            if self.face_of[cursor] != Some(face) {
+                return None;
+            }
+            walked.push(cursor);
+            cursor = self.next_of[cursor]?;
+            if cursor == first {
+                return (walked.len() >= 3).then_some(walked);
+            }
+        }
+
+        None
+    }
+
+    /// Every face must enclose area.
+    ///
+    /// A face with none renders as nothing yet still owns its corners, so it stays selectable and
+    /// `face_normal` has to answer with the zero vector - which is what makes an extrude of it report
+    /// "the selected faces point in opposite directions" about a single face. Collapsed corners and a ring
+    /// of collinear vertices both land here, and neither is a topology violation, so nothing else sees
+    /// them: a mesh can pass every other invariant while carrying a face the viewport cannot draw.
+    fn check_faces_bound_area(&mut self) {
+        for face in 0..self.mesh.faces.len() {
+            let Some(loop_edges) = self.walk_face(face) else {
+                continue;
+            };
+            // `resolve_ids` has already named a corner that is out of range, and indexing it here would
+            // panic while the mesh is being diagnosed - the same reason no pass dereferences a raw id.
+            let positions: Vec<Point3<f32>> = loop_edges
+                .iter()
+                .filter_map(|&edge| self.mesh.half_edges.get(edge))
+                .map(|edge| edge.origin)
+                .filter_map(|vertex| self.mesh.vertices.get(vertex.0))
+                .map(|vertex| vertex.position)
+                .collect();
+            if positions.len() != loop_edges.len() {
+                continue;
+            }
+
+            if face_area(&positions) < MIN_FACE_AREA {
+                self.errors.push(format!(
+                    "face {face} encloses no area, so it cannot be drawn, shaded or pushed anywhere"
+                ));
+            }
+        }
+    }
+
+    /// No two faces may span the same set of vertices.
+    ///
+    /// This is the "illegal geometry" case `check_directed_edges_are_unique` misses: two faces over the
+    /// same corners running the ring in *opposite* directions share no directed edge, so they satisfy every
+    /// other invariant while occupying the same space. The viewport Z-fights between them, `edge_faces`
+    /// reports whichever it reaches first, and an extrude of one grows a wall out of the other. Matching
+    /// on the sorted corner set rather than the loop means winding and starting corner cannot hide it.
+    fn check_faces_are_distinct(&mut self) {
+        let mut owners: HashMap<Vec<usize>, usize> = HashMap::new();
+
+        for face in 0..self.mesh.faces.len() {
+            let Some(loop_edges) = self.walk_face(face) else {
+                continue;
+            };
+            let mut corners: Vec<usize> = loop_edges
+                .iter()
+                .map(|&edge| self.mesh.half_edges[edge].origin.0)
+                .collect();
+            corners.sort_unstable();
+            corners.dedup();
+
+            if let Some(first) = owners.insert(corners.clone(), face) {
+                self.errors.push(format!(
+                    "faces {first} and {face} span the same {} corners, so they occupy the same space and \
+                     the renderer has to guess which one to draw",
+                    corners.len()
+                ));
+            }
+        }
+    }
+
+    /// The half-edges one step either side of `current` in the fan at `corner`, dropping a step that
+    /// would leave the corner.
+    ///
+    /// `twin(prev(e))` and `next(twin(e))` are the two rotations around a vertex: `prev` arrives at the
+    /// corner from inside one face, and crossing its `twin` enters the neighbouring face. A boundary edge
+    /// has no twin to cross, so the walk simply ends there - which is correct, an open fan is one fan.
+    fn around_corner(&self, corner: usize, current: usize) -> [Option<usize>; 2] {
+        let onward = self.prev_of[current].and_then(|prev| self.twin_of[prev]);
+        let backward = self.twin_of[current].and_then(|twin| self.next_of[twin]);
+        [onward, backward]
+            .map(|step| step.filter(|&next| self.mesh.half_edges[next].origin.0 == corner))
+    }
+
+    /// The faces meeting at a corner must form one fan, not several touching only at that point.
+    ///
+    /// A pinch satisfies every other invariant: each face is closed, each edge has at most two sides, no
+    /// corner is repeated, and `check_directed_edges_are_unique` finds nothing because the two parts share
+    /// no edge whatsoever - which is exactly the problem. Nothing can be walked from one side to the other,
+    /// so a bevel or a cut stops dead at the point, `outgoing_half_edges` silently mixes two unrelated
+    /// rings, and the viewport shows a seam that has no edge behind it. Rotating through the twins counts
+    /// the rings; more than one is the fault.
+    fn check_vertex_fans_are_connected(&mut self) {
+        let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); self.mesh.vertices.len()];
+        for (index, edge) in self.mesh.half_edges.iter().enumerate() {
+            if let Some(slot) = outgoing.get_mut(edge.origin.0) {
+                slot.push(index);
+            }
+        }
+
+        // Shared across corners: a half-edge starts at exactly one vertex, so a walk that covered it at its
+        // own corner has nothing left to say about it at any other.
+        let mut visited = vec![false; self.next_of.len()];
+        for (corner, corners) in outgoing.iter().enumerate() {
+            let mut fans = 0;
+
+            for &start in corners {
+                if visited[start] {
+                    continue;
+                }
+                fans += 1;
+
+                let mut walking = vec![start];
+                while let Some(current) = walking.pop() {
+                    if visited[current] {
+                        continue;
+                    }
+                    visited[current] = true;
+                    walking.extend(self.around_corner(corner, current).into_iter().flatten());
+                }
+            }
+
+            if fans > 1 {
+                self.errors.push(format!(
+                    "vertex {corner} joins {fans} separate fans of faces, so the mesh only touches itself \
+                     at that point and nothing can be walked from one side to the other"
                 ));
             }
         }
@@ -1114,6 +1304,71 @@ mod tests {
         ];
         let mesh = HalfEdgeMesh::from_faces(&positions, &[vec![0, 1, 2], vec![0, 1, 3]]);
         expect_invalid(&mesh, "both run vertex 0 to vertex 1");
+    }
+
+    #[test]
+    fn two_faces_over_the_same_corners_are_rejected() {
+        // The overlap `check_directed_edges_are_unique` cannot see: the second face runs the ring backwards,
+        // so it shares no *directed* edge with the first, and every twin links up correctly. Topologically
+        // tidy, and two faces in exactly the same place - the viewport Z-fights between them, `edge_faces`
+        // answers with whichever it reaches first, and extruding one grows a wall out of the other.
+        let positions = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ];
+        let mesh = HalfEdgeMesh::from_faces(&positions, &[vec![0, 1, 2, 3], vec![3, 2, 1, 0]]);
+        expect_invalid(&mesh, "faces 0 and 1 span the same 4 corners");
+    }
+
+    #[test]
+    fn two_faces_that_share_only_an_edge_are_not_duplicates() {
+        // The pass has to key on the whole corner set, not on a pair: these two quads meet along edge 1-2
+        // and are the ordinary case every extrude produces. Rejecting them would reject modeling.
+        let positions = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+            Point3::new(2.0, 1.0, 0.0),
+        ];
+        let mesh = HalfEdgeMesh::from_faces(&positions, &[vec![0, 1, 2, 3], vec![4, 5, 2, 1]]);
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("two quads hinged on one edge are legal: {errors:?}"));
+    }
+
+    #[test]
+    fn a_face_whose_corners_fall_on_one_line_is_rejected() {
+        // Three distinct, correctly linked, non-duplicate corners in a straight line bound nothing. Every
+        // topology invariant holds; only the shape is wrong, and a face like this is what makes
+        // `face_normal` return zero and an extrude of it report that the selection points both ways.
+        let positions = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+        ];
+        let mesh = HalfEdgeMesh::from_faces(&positions, &[vec![0, 1, 2]]);
+        expect_invalid(&mesh, "face 0 encloses no area");
+    }
+
+    #[test]
+    fn two_faces_touching_at_one_vertex_are_rejected() {
+        // A pinch, and the realistic version of "a vertex with one line to it": two triangles that meet at
+        // corner 0 and nowhere else. Each face is well-formed on its own - distinct corners, real area, no
+        // repeated directed edge - so every other pass is satisfied, yet the solid has a single point of
+        // contact that no face ring crosses. Bevels and cuts cannot walk past it, and `edge_faces` has
+        // nothing to report because the two halves share no edge at all.
+        let positions = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(-1.0, 0.0, 0.0),
+            Point3::new(0.0, -1.0, 0.0),
+        ];
+        let mesh = HalfEdgeMesh::from_faces(&positions, &[vec![0, 1, 2], vec![0, 3, 4]]);
+        expect_invalid(&mesh, "vertex 0 joins 2 separate fans");
     }
 
     #[test]

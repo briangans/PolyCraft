@@ -198,6 +198,7 @@ impl Scene {
     }
 
     /// Selects whatever the ray hits, in the current mode. `additive` keeps what was already
+    /// selected and toggles the clicked component (Shift+click in Maya).
     pub fn select_at(&mut self, ray: &Ray, additive: bool, viewport_height: f32) {
         let changed = match self.mode {
             EditMode::Object => {

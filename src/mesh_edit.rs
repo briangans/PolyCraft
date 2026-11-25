@@ -33,7 +33,8 @@ use cgmath::{InnerSpace, Point3, Vector3};
 use std::collections::{HashMap, HashSet};
 
 use crate::mesh::{
-    EdgeId, Face, FaceId, HalfEdge, HalfEdgeId, HalfEdgeMesh, MeshVertex, TopologyErrors, VertexId,
+    face_area, EdgeId, Face, FaceId, HalfEdge, HalfEdgeId, HalfEdgeMesh, MeshVertex,
+    TopologyErrors, VertexId, MIN_FACE_AREA,
 };
 
 /// What [`HalfEdgeMesh::split_edge`] created, so a follow-up operation does not have to rediscover it.
@@ -51,8 +52,9 @@ pub struct SplitEdge {
 }
 
 /// How far a face must travel to count as extruded. Below this the walls collapse onto their own base
-/// edge and every one of them is a degenerate face with no area - which [`HalfEdgeMesh::validate`] does
-/// not look for, since judging area needs geometry rather than topology.
+/// edge and every one of them becomes a degenerate face with no area, which `validate` now rejects - so
+/// this is not the only thing standing between a zero offset and a broken mesh, it is what makes the
+/// refusal arrive as "an extrusion needs a non-zero offset" instead of a list of faces with no area.
 const MIN_EXTRUDE_OFFSET: f32 = 1e-6;
 
 /// What [`HalfEdgeMesh::extrude_faces`] created.
@@ -485,6 +487,9 @@ impl HalfEdgeMesh {
         if let Some(reason) = self.stranded_corner_blocker(&loops, &walls, &region) {
             return Err(vec![reason]);
         }
+        if let Some(reason) = self.degenerate_wall_blocker(&walls, offset) {
+            return Err(vec![reason]);
+        }
 
         let mut candidate = self.clone();
 
@@ -701,6 +706,38 @@ impl HalfEdgeMesh {
                      stranded; Maya splits it into one corner per diverging face, which this build does \
                      not do yet",
                     corner.0
+                )
+            })
+    }
+
+    /// Why this offset would stand a wall on an edge it runs parallel to, if it would.
+    ///
+    /// A wall is the quad `[a, b, b + offset, a + offset]`, so its area is the cross product of the base
+    /// edge and the offset: push straight along an edge and that wall flattens to a line. `validate` now
+    /// rejects a face with no area, which is why extruding the cube's front *and* bottom faces along +z
+    /// used to fail - and it does still catch it, but as "face 10 encloses no area", which never mentions
+    /// the direction that caused it. Refusing here says which edge, before a vertex or a face is created.
+    ///
+    /// The area is measured exactly the way `validate` measures it, rather than against a fresh tolerance,
+    /// so the two cannot disagree about where the boundary sits.
+    fn degenerate_wall_blocker(
+        &self,
+        walls: &[(VertexId, VertexId)],
+        offset: Vector3<f32>,
+    ) -> Option<String> {
+        walls
+            .iter()
+            .find(|&&(near, far)| {
+                let near = self.vertices[near.0].position;
+                let far = self.vertices[far.0].position;
+                face_area(&[near, far, far + offset, near + offset]) < MIN_FACE_AREA
+            })
+            .map(|&(near, far)| {
+                format!(
+                    "the extrusion offset ({}, {}, {}) runs along the edge from vertex {} to vertex {}, so \
+                     the wall standing on that edge would have no area; extrude the faces one at a time, or \
+                     pick a selection whose edges do not point that way",
+                    offset.x, offset.y, offset.z, near.0, far.0
                 )
             })
     }
@@ -1509,14 +1546,20 @@ mod tests {
 
     #[test]
     fn two_faces_sharing_an_edge_move_as_one_slab_without_a_wall_between_them() {
-        // Front and bottom share edge 0-1, so they weld: one copy of each shared corner and no wall grown
+        // Front and right share edge 1-2, so they weld: one copy of each shared corner and no wall grown
         // across the hinge. That is the difference between one slab and two coincident shells, which would
         // render as z-fighting and read as a self-intersection.
+        //
+        // The offset is diagonal on purpose. A cube's edges run along all three axes, so an axis-aligned
+        // push is parallel to *some* boundary edge of any two-face region and the wall standing there would
+        // have no area - pushing front and bottom along +z flattens the wall on the bottom's edge 5-1, which
+        // the guard refuses. Averaging the two outward normals, which is what `Scene` hands down, points
+        // between the axes and is parallel to none of them.
         let before = HalfEdgeMesh::create_cube();
         let mut mesh = before.clone();
 
         let shape = mesh
-            .extrude_faces(&[FaceId(0), FaceId(5)], push_front())
+            .extrude_faces(&[FaceId(0), FaceId(1)], Vector3::new(0.5, 0.0, 0.5))
             .expect("two faces hinged on one edge should extrude together");
 
         assert_eq!(
@@ -1528,7 +1571,7 @@ mod tests {
         assert_eq!(
             shape.side_faces.len(),
             6,
-            "eight outer edges less the two at the hinge"
+            "seven distinct edges around the pair, less the hinge they share"
         );
         assert!(
             mesh.boundary_edges().is_empty(),
