@@ -18,6 +18,8 @@ rustc-ice-*.txt
 
 # Scratch output from redirecting cargo/test/app runs during development
 *.log
+err.txt
+out.txt
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
