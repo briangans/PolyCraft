@@ -17,6 +17,8 @@ pub struct UiResponse {
     pub undo: bool,
     /// The Redo button was clicked; the caller performs the redo.
     pub redo: bool,
+    /// The Extrude button was clicked; the caller performs it and decides how far the faces travel.
+    pub extrude: bool,
 }
 
 /// Everything the UI displays for this frame, handed to [`UiState::draw`].
@@ -34,6 +36,11 @@ pub struct UiContext<'a> {
     /// Name of the action Undo would revert ("Move Vertex"), shown on the button Maya-style.
     pub undo_label: Option<&'a str>,
     pub redo_label: Option<&'a str>,
+    /// Whether an extrude is possible right now, so the button greys out for the same reason the hotkey
+    /// does nothing rather than looking live and then refusing quietly.
+    pub can_extrude: bool,
+    /// The outcome of the last command, echoed under the buttons the way Maya's command line does it.
+    pub notice: Option<&'a str>,
 }
 
 /// Button text Maya-style: plain "Undo" when there is nothing to step back to, "Undo - Move Vertex"
@@ -42,6 +49,17 @@ fn history_button_text(prefix: &str, label: Option<&str>) -> String {
     match label {
         Some(label) => format!("{prefix} - {label}"),
         None => prefix.to_owned(),
+    }
+}
+
+/// Button text for the extrude command. Greyed out it reads as a disabled "Extrude"; live it names the
+/// key that does the same thing, so the panel teaches the binding the way the history buttons teach
+/// theirs.
+fn extrude_button_text(can_extrude: bool) -> &'static str {
+    if can_extrude {
+        "Extrude  (Shift+E)"
+    } else {
+        "Extrude"
     }
 }
 
@@ -100,6 +118,8 @@ impl UiState {
             can_redo,
             undo_label,
             redo_label,
+            can_extrude,
+            notice,
         } = current;
         let mut response = UiResponse::default();
 
@@ -213,6 +233,14 @@ impl UiState {
                     }
                 });
                 ui.separator();
+                // Extrude sits with the history buttons rather than the tool row: it is a command that
+                // changes the mesh, not a mode the gizmo can be in, and Maya keeps it on the mesh
+                // toolbar for the same reason.
+                let extrude_button = egui::Button::new(extrude_button_text(can_extrude));
+                if ui.add_enabled(can_extrude, extrude_button).clicked() {
+                    response.extrude = true;
+                }
+                ui.separator();
                 ui.label(format!("Mode: {}", current_mode.label()));
                 let count_str = match current_mode {
                     EditMode::Object => {
@@ -227,10 +255,25 @@ impl UiState {
                     EditMode::Face => &format!("Selected: {} faces", selected_count),
                 };
                 ui.label(count_str);
+                if let Some(notice) = notice {
+                    ui.separator();
+                    // Wrapped rather than truncated: the useful half of a refusal is usually the second
+                    // sentence, the one naming the component to go and fix. `Label::wrap_mode`, not
+                    // `Response::wrap_mode` - the latter does not exist in egui 0.28.
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(notice)
+                                .size(11.0)
+                                .color(egui::Color32::from_gray(200)),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Wrap),
+                    );
+                }
                 ui.separator();
                 ui.label("Hold RMB or SPACE to open the Pie Menu.");
                 ui.label("Hotkeys: Q: Select | W: Move | E: Rotate | R: Scale");
                 ui.label("Ctrl+Z: Undo | Ctrl+Y / Ctrl+Shift+Z: Redo");
+                ui.label("Shift+E: Extrude selected faces");
             });
         }
 
@@ -289,6 +332,8 @@ mod tests {
             can_redo: false,
             undo_label: None,
             redo_label: None,
+            can_extrude: false,
+            notice: None,
         }
     }
 
@@ -637,6 +682,8 @@ mod tests {
             can_redo: false,
             undo_label: Some("Move Vertex"),
             redo_label: None,
+            can_extrude: false,
+            notice: None,
         }
     }
 

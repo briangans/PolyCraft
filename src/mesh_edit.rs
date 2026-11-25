@@ -1,9 +1,9 @@
 //! The write side of [`HalfEdgeMesh`]: the insertions every edit operation is built from.
 //!
 //! `mesh.rs` keeps the record types, the read-only topology queries and the validator. This module is
-//! where topology gets *created*. They are split because the write side is new and, until the first
-//! operation lands, unreachable from a production path - so one `allow(dead_code)` here marks a whole
-//! pending layer rather than smearing the attribute over the live queries in `mesh.rs`.
+//! where topology gets *created*. They stay split because the two halves are read under different
+//! contracts: the queries in `mesh.rs` may `expect` a mesh that already validates, and nothing here may,
+//! for the reason given below.
 //!
 //! Every operation follows one shape, which is the digest's "validate after every edit" rule made
 //! structural rather than advisory:
@@ -28,9 +28,8 @@
 //!
 //! History already pays a mesh clone per action (`scene::DocumentSnapshot`), so the clone is not the
 //! expensive part, and these run on an edit - once per user gesture, not once per frame.
-#![allow(dead_code)] // Remove when the extrude operation lands as the first caller.
 
-use cgmath::Point3;
+use cgmath::{InnerSpace, Point3, Vector3};
 use std::collections::{HashMap, HashSet};
 
 use crate::mesh::{
@@ -49,6 +48,26 @@ pub struct SplitEdge {
     /// The new half-edge leaving `vertex` toward the far endpoint. Walk `next`/`prev` from here for
     /// the rest; on a boundary edge it is the only half-edge either new edge has.
     pub half_edge: HalfEdgeId,
+}
+
+/// How far a face must travel to count as extruded. Below this the walls collapse onto their own base
+/// edge and every one of them is a degenerate face with no area - which [`HalfEdgeMesh::validate`] does
+/// not look for, since judging area needs geometry rather than topology.
+const MIN_EXTRUDE_OFFSET: f32 = 1e-6;
+
+/// What [`HalfEdgeMesh::extrude_faces`] created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Extruded {
+    /// The faces the caller named, in the order given and without repeats, unchanged in id and now
+    /// translated by the offset - the operation removes nothing, so a selection held across an extrusion
+    /// still names the same faces.
+    pub source_faces: Vec<FaceId>,
+    /// The walls grown along the region's free edges, in boundary order: each is `[origin, destination,
+    /// destination's copy, origin's copy]` for one half-edge of the region. Maya keeps these selected
+    /// after an extrude, which is why they are reported as a list rather than folded into `source_faces`.
+    pub side_faces: Vec<FaceId>,
+    /// The translated copy of every corner the region touched, in the order they were created.
+    pub new_vertices: Vec<VertexId>,
 }
 
 impl HalfEdgeMesh {
@@ -136,12 +155,34 @@ impl HalfEdgeMesh {
         }
 
         let mut candidate = self.clone();
-        let face_id = FaceId(candidate.faces.len());
-        let corner_count = corners.len();
-        let first_edge = candidate.half_edges.len();
-        let owners = candidate.directed_edge_map();
+        let face_id = candidate.push_face(corners);
+        install_if_valid(
+            candidate,
+            self,
+            format!(
+                "appending a face through {} produced topology that does not validate",
+                describe_corners(corners)
+            ),
+        )?;
+        Ok(face_id)
+    }
 
-        candidate.faces.push(Face {
+    /// The insertion [`HalfEdgeMesh::append_face`] performs once its blockers are clear, without the
+    /// clone-and-validate wrapped around it: every edge is twinned with the half-edge already running it
+    /// in reverse, which is what fuses a new face onto its neighbours.
+    ///
+    /// Extrude needs the mechanics without the per-call validation, because it leaves the mesh
+    /// deliberately half-built - region lifted off its neighbours, walls not yet attached - so nothing
+    /// can validate until the last wall is on. A caller that uses this owns the promise that whatever it
+    /// installs passed [`HalfEdgeMesh::validate`], and assumes the blockers already held: corners that
+    /// exist, at least three of them, and no directed pair the mesh already runs.
+    fn push_face(&mut self, corners: &[VertexId]) -> FaceId {
+        let face_id = FaceId(self.faces.len());
+        let corner_count = corners.len();
+        let first_edge = self.half_edges.len();
+        let owners = self.directed_edge_map();
+
+        self.faces.push(Face {
             half_edge: Some(HalfEdgeId(first_edge)),
         });
 
@@ -153,7 +194,7 @@ impl HalfEdgeMesh {
             let twin = owners.get(&(destination.0, origin.0)).copied();
             let inserted = HalfEdgeId(first_edge + index);
 
-            candidate.half_edges.push(HalfEdge {
+            self.half_edges.push(HalfEdge {
                 origin,
                 twin,
                 next: Some(HalfEdgeId(first_edge + (index + 1) % corner_count)),
@@ -164,23 +205,15 @@ impl HalfEdgeMesh {
             });
 
             if let Some(twin_id) = twin {
-                candidate.half_edges[twin_id.0].twin = Some(inserted);
+                self.half_edges[twin_id.0].twin = Some(inserted);
             }
-            let vertex = &mut candidate.vertices[origin.0];
+            let vertex = &mut self.vertices[origin.0];
             if vertex.half_edge.is_none() {
                 vertex.half_edge = Some(inserted);
             }
         }
 
-        install_if_valid(
-            candidate,
-            self,
-            format!(
-                "appending a face through {} produced topology that does not validate",
-                describe_corners(corners)
-            ),
-        )?;
-        Ok(face_id)
+        face_id
     }
 
     /// Inserts a vertex between the two endpoints of `edge`, at `position`, splitting the edge in two
@@ -389,6 +422,335 @@ impl HalfEdgeMesh {
             half_edge: inserted,
         }
     }
+
+    /// Pushes `face` outward along `offset`, leaving it translated in place and a wall grown along every
+    /// edge of it that nothing else bounds.
+    ///
+    /// This forwards to [`HalfEdgeMesh::extrude_faces`] with a one-face region; see that method for the
+    /// mechanics and the refusals.
+    pub fn extrude_face(
+        &mut self,
+        face: FaceId,
+        offset: Vector3<f32>,
+    ) -> Result<Extruded, TopologyErrors> {
+        self.extrude_faces(std::slice::from_ref(&face), offset)
+    }
+
+    /// Pushes a whole set of faces outward along `offset` as one piece.
+    ///
+    /// Nothing is removed to make the shape: each named face keeps its id and its winding and merely
+    /// re-points at a translated copy of the corners it touched, and the space they left is closed by new
+    /// quad walls. That is what the append-only storage rule demands of an operation, and it leaves ids
+    /// already handed out - including a live selection - naming the same things afterwards.
+    ///
+    /// Faces sharing an edge move together and grow no wall between themselves, so extruding a strip of a
+    /// model reads as one slab rather than several coincident shells; faces sharing nothing are simply
+    /// extruded side by side. Each wall is twinned against whatever already ran its edge - a neighbouring
+    /// face on the base side, the lifted source face on the top side, the walls either side of it along
+    /// each corner - so a region taken out of a closed solid leaves it closed rather than holed.
+    ///
+    /// Refuses, having changed nothing, when a face is absent or its loop broken, when `offset` is zero or
+    /// not finite, when the selection shares every one of its edges with itself (no free boundary to grow
+    /// along), or when a corner belongs to no face outside the selection and would be left stranded -
+    /// which is the case Maya resolves by splitting the corner per diverging face, and this build does not
+    /// do yet.
+    pub fn extrude_faces(
+        &mut self,
+        faces: &[FaceId],
+        offset: Vector3<f32>,
+    ) -> Result<Extruded, TopologyErrors> {
+        let loops = self.region_loops(faces)?;
+        if loops.is_empty() {
+            return Err(vec![format!(
+                "an extrusion needs at least one face to move, and {} named none",
+                faces.len()
+            )]);
+        }
+        if let Some(reason) = offset_blocker(offset) {
+            return Err(vec![reason]);
+        }
+
+        let region: HashSet<FaceId> = loops.iter().map(|&(face, _)| face).collect();
+        // Captured while the base corners still exist on these half-edges.
+        let walls = self.region_walls(&loops, &region);
+        if walls.is_empty() {
+            return Err(vec![
+                "every edge of the selection is shared with the selection itself, so the extrusion has \
+                 no free boundary to grow a wall along and nothing would change"
+                    .to_string(),
+            ]);
+        }
+        if let Some(reason) = self.stranded_corner_blocker(&loops, &walls, &region) {
+            return Err(vec![reason]);
+        }
+
+        let mut candidate = self.clone();
+
+        // One translated copy of each corner the region touches. A corner two selected faces share is
+        // copied once, which is exactly what keeps them welded as they travel.
+        let mut moved: HashMap<VertexId, VertexId> = HashMap::new();
+        let mut new_vertices = Vec::with_capacity(self.vertices.len());
+        for (_, loop_edges) in &loops {
+            for &half_edge in loop_edges {
+                let origin = candidate.half_edges[half_edge.0].origin;
+                if moved.contains_key(&origin) {
+                    continue;
+                }
+                let position = candidate.vertices[origin.0].position + offset;
+                let copied = candidate.add_vertex(position);
+                moved.insert(origin, copied);
+                new_vertices.push(copied);
+            }
+        }
+
+        // Lift the region. Each half-edge keeps its `next`, `prev`, `twin` and `face` and takes a new
+        // origin, which is all a face needs to become its own translated copy - and why no loop, twin or
+        // untouched face is disturbed.
+        let mut arrived: HashMap<VertexId, HalfEdgeId> = HashMap::new();
+        for index in 0..candidate.half_edges.len() {
+            let edge = &mut candidate.half_edges[index];
+            if edge.face.is_some_and(|face| region.contains(&face)) {
+                if let Some(&copied) = moved.get(&edge.origin) {
+                    edge.origin = copied;
+                    arrived.entry(copied).or_insert(HalfEdgeId(index));
+                }
+            }
+        }
+        for (copied, half_edge) in arrived {
+            candidate.vertices[copied.0].half_edge = Some(half_edge);
+        }
+
+        // Grow the walls, now that the lifted face offers each wall's top edge as its twin.
+        let mut side_faces = Vec::with_capacity(walls.len());
+        for (origin, destination) in &walls {
+            side_faces.push(candidate.push_face(&[
+                *origin,
+                *destination,
+                moved[destination],
+                moved[origin],
+            ]));
+        }
+
+        candidate.repair_outgoing_edges(&moved.keys().copied().collect());
+
+        install_if_valid(
+            candidate,
+            self,
+            format!(
+                "extruding {} face{} along ({}, {}, {}) produced topology that does not validate",
+                region.len(),
+                if region.len() == 1 { "" } else { "s" },
+                offset.x,
+                offset.y,
+                offset.z
+            ),
+        )?;
+
+        Ok(Extruded {
+            source_faces: loops.iter().map(|&(face, _)| face).collect(),
+            side_faces,
+            new_vertices,
+        })
+    }
+
+    /// The loops of `faces` in the order given, repeats dropped, or every reason one of them cannot be
+    /// used. A face named twice moves once; a face that is absent or unwalkable is refused by name while
+    /// the rest of the selection is reported in the same pass, so one refusal says everything wrong.
+    fn region_loops(
+        &self,
+        faces: &[FaceId],
+    ) -> Result<Vec<(FaceId, Vec<HalfEdgeId>)>, TopologyErrors> {
+        let mut reasons = TopologyErrors::new();
+        let mut seen: HashSet<FaceId> = HashSet::new();
+        let mut loops = Vec::with_capacity(faces.len());
+
+        for &face in faces {
+            if face.0 >= self.faces.len() {
+                reasons.push(format!("face {} does not exist on this mesh", face.0));
+                continue;
+            }
+            if !seen.insert(face) {
+                continue;
+            }
+            match self.face_walk(face) {
+                Some(loop_edges) => loops.push((face, loop_edges)),
+                None => reasons.push(format!(
+                    "face {} does not bound a closed loop of at least three corners, so it cannot be extruded",
+                    face.0
+                )),
+            }
+        }
+
+        if reasons.is_empty() {
+            Ok(loops)
+        } else {
+            Err(reasons)
+        }
+    }
+
+    /// The half-edges bounding `face`, following `next` until the loop comes round, or `None` when it
+    /// will not.
+    ///
+    /// [`HalfEdgeMesh::face_half_edges`] `expect`s a mesh that [`HalfEdgeMesh::validate`] accepted, which
+    /// is right for a query and wrong here: an extrude is asked about a mesh before anything has checked
+    /// it, and must refuse rather than crash. The iteration cap is what turns a loop that wanders into
+    /// another face into a refusal instead of a spin.
+    fn face_walk(&self, face: FaceId) -> Option<Vec<HalfEdgeId>> {
+        let first = self.faces.get(face.0)?.half_edge?;
+        let mut walked = Vec::new();
+        let mut cursor = first;
+
+        for _ in 0..=self.half_edges.len() {
+            let edge = self.half_edges.get(cursor.0)?;
+            if edge.face != Some(face) {
+                return None;
+            }
+            walked.push(cursor);
+            cursor = edge.next?;
+            if cursor == first {
+                return (walked.len() >= 3).then_some(walked);
+            }
+        }
+
+        None
+    }
+
+    /// The directed corner pairs of the region that nothing on the far side bounds - the base edge of one
+    /// wall each, in loop order so `side_faces` comes out walkable alongside the region.
+    ///
+    /// An edge whose twin names no face, or has no twin at all, counts as free: the region is the only
+    /// thing holding that side, so a wall belongs there.
+    fn region_walls(
+        &self,
+        loops: &[(FaceId, Vec<HalfEdgeId>)],
+        region: &HashSet<FaceId>,
+    ) -> Vec<(VertexId, VertexId)> {
+        let mut walls = Vec::new();
+
+        for (_, loop_edges) in loops {
+            let count = loop_edges.len();
+            for (index, &half_edge) in loop_edges.iter().enumerate() {
+                let far_side_face = self
+                    .half_edges
+                    .get(half_edge.0)
+                    .and_then(|edge| edge.twin)
+                    .and_then(|twin| self.half_edges.get(twin.0))
+                    .and_then(|edge| edge.face);
+                if far_side_face.is_none_or(|face| !region.contains(&face)) {
+                    walls.push((
+                        self.half_edges[half_edge.0].origin,
+                        self.half_edges[loop_edges[(index + 1) % count].0].origin,
+                    ));
+                }
+            }
+        }
+
+        walls
+    }
+
+    /// Why a corner of the region would be left owning nothing after the lift, if any would be.
+    ///
+    /// A corner travels with the faces that claim it. If no face around it lies outside the region it
+    /// moves entirely, and unless a wall also starts there the vertex it was is left behind with no
+    /// outgoing edge. `validate` would catch that, but only once the work is done and with a message
+    /// about an orphan vertex that says nothing about the selection that caused it - and Maya's answer,
+    /// splitting the corner once per diverging face, is not built yet.
+    fn stranded_corner_blocker(
+        &self,
+        loops: &[(FaceId, Vec<HalfEdgeId>)],
+        walls: &[(VertexId, VertexId)],
+        region: &HashSet<FaceId>,
+    ) -> Option<String> {
+        let mut corners: Vec<VertexId> = loops
+            .iter()
+            .flat_map(|(_, loop_edges)| loop_edges.iter())
+            .filter_map(|&half_edge| self.half_edges.get(half_edge.0))
+            .map(|edge| edge.origin)
+            .collect();
+        corners.sort_by_key(|corner| corner.0);
+        corners.dedup();
+
+        let walled: HashSet<VertexId> = walls.iter().flat_map(|&(a, b)| [a, b]).collect();
+        let mut kept: HashSet<VertexId> = HashSet::new();
+        let mut lifted: HashSet<VertexId> = HashSet::new();
+        for edge in &self.half_edges {
+            let origin = edge.origin;
+            if !corners.contains(&origin) {
+                continue;
+            }
+            match edge.face {
+                Some(face) if region.contains(&face) => {
+                    lifted.insert(origin);
+                }
+                _ => {
+                    kept.insert(origin);
+                }
+            }
+        }
+
+        corners
+            .iter()
+            .find(|&corner| {
+                lifted.contains(corner) && !kept.contains(corner) && !walled.contains(corner)
+            })
+            .map(|corner| {
+                format!(
+                    "vertex {} belongs only to the faces being extruded, so the extrusion would leave it \
+                     stranded; Maya splits it into one corner per diverging face, which this build does \
+                     not do yet",
+                    corner.0
+                )
+            })
+    }
+
+    /// Gives every corner the operation moved a recorded outgoing edge that actually starts at it.
+    ///
+    /// `MeshVertex::half_edge` is only a cached entry point - any outgoing edge is a legal one - and
+    /// lifting a region leaves the corners it came from naming an edge that has since travelled. This has
+    /// to run after the walls are up, since a base corner frequently has nothing left to point at until
+    /// its wall exists. Scoped to the corners the operation disturbed, so damage elsewhere stays visible
+    /// to `validate` rather than being quietly patched over.
+    fn repair_outgoing_edges(&mut self, corners: &HashSet<VertexId>) {
+        let mut first_out: HashMap<usize, HalfEdgeId> = HashMap::new();
+        for index in 0..self.half_edges.len() {
+            first_out
+                .entry(self.half_edges[index].origin.0)
+                .or_insert(HalfEdgeId(index));
+        }
+
+        for &corner in corners {
+            let still_points_home = self
+                .vertices
+                .get(corner.0)
+                .and_then(|vertex| vertex.half_edge)
+                .and_then(|edge| self.half_edges.get(edge.0))
+                .is_some_and(|edge| edge.origin == corner);
+            if !still_points_home {
+                self.vertices[corner.0].half_edge = first_out.get(&corner.0).copied();
+            }
+        }
+    }
+}
+
+/// Why `offset` cannot drive an extrusion, if it cannot.
+///
+/// A zero-length offset is refused rather than waved through: it would grow walls of no area, and the
+/// validator judges topology, not geometry, so it would never notice.
+fn offset_blocker(offset: Vector3<f32>) -> Option<String> {
+    if !offset.x.is_finite() || !offset.y.is_finite() || !offset.z.is_finite() {
+        return Some(format!(
+            "the extrusion offset ({}, {}, {}) is not a finite distance",
+            offset.x, offset.y, offset.z
+        ));
+    }
+    if offset.dot(offset) < MIN_EXTRUDE_OFFSET * MIN_EXTRUDE_OFFSET {
+        return Some(
+            "an extrusion needs a non-zero offset, or every wall it grows collapses onto its own base \
+             edge as a face with no area"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Validate the mutated clone and install it only if it holds.
@@ -933,5 +1295,283 @@ mod tests {
         expect_reason(&errors, "belongs to no face");
         expect_reason(&errors, "nothing was installed");
         assert_identical(&mesh, &before);
+    }
+
+    /// The unit vector the front face of the cube is pushed by, matching its outward (+z) normal.
+    fn push_front() -> Vector3<f32> {
+        Vector3::new(0.0, 0.0, 0.5)
+    }
+
+    /// Asserts a face is the flat quad `positions` in order, which is how a lifted copy is told apart
+    /// from the face it came from and from a wall: only one of the three can hold these four points.
+    fn assert_face_at(mesh: &HalfEdgeMesh, face: FaceId, positions: &[[f32; 3]]) {
+        let actual: Vec<[f32; 3]> = mesh
+            .face_positions(face)
+            .iter()
+            .map(|point| [point.x, point.y, point.z])
+            .collect();
+        let same_set = {
+            let mut got = actual.clone();
+            let mut want: Vec<[f32; 3]> = positions.to_vec();
+            // Sorted on the raw floats with `partial_cmp` rather than `sort_by_key`, which f32 cannot
+            // satisfy because it is only `PartialOrd`. Unreachable in practice: no test feeds a NaN.
+            let order = |a: &[f32; 3], b: &[f32; 3]| {
+                (a[0], a[1], a[2]).partial_cmp(&(b[0], b[1], b[2])).unwrap()
+            };
+            got.sort_by(order);
+            want.sort_by(order);
+            got == want
+        };
+        assert!(
+            same_set,
+            "face {} should bound exactly {positions:?}, got {actual:?}",
+            face.0
+        );
+    }
+
+    #[test]
+    fn extruding_a_cube_face_lifts_it_and_keeps_the_solid_closed() {
+        let before = HalfEdgeMesh::create_cube();
+        let mut mesh = before.clone();
+
+        let shape = mesh
+            .extrude_face(FaceId(0), push_front())
+            .expect("a face of a cube has four free edges to grow walls from");
+
+        assert_eq!(
+            shape.source_faces,
+            vec![FaceId(0)],
+            "the face named is the face moved"
+        );
+        assert_eq!(shape.side_faces.len(), 4, "one wall per edge of the face");
+        assert_eq!(shape.new_vertices.len(), 4);
+        assert_eq!(
+            mesh.vertices.len(),
+            12,
+            "append-only: four added, none removed"
+        );
+        assert_eq!(mesh.faces.len(), 10, "the cube plus four walls");
+        assert!(
+            mesh.boundary_edges().is_empty(),
+            "a region taken out of a closed solid must leave it closed, not holed"
+        );
+        assert_eq!(
+            mesh.generate_render_buffers().indices.len(),
+            60,
+            "ten quad faces fan to 20 triangles"
+        );
+        // The untouched five are byte-identical, which is what lets a selection or an id handed out
+        // before the edit keep naming the same geometry after it.
+        for face in 1..6 {
+            assert_eq!(
+                mesh.face_vertices(FaceId(face)),
+                before.face_vertices(FaceId(face)),
+                "face {} must be untouched by an extrusion it is not part of",
+                face
+            );
+        }
+    }
+
+    #[test]
+    fn the_lifted_face_is_the_original_id_at_the_translated_corners() {
+        let mut mesh = HalfEdgeMesh::create_cube();
+        mesh.extrude_face(FaceId(0), push_front())
+            .expect("a face of a cube should extrude");
+
+        let lifted: Vec<[f32; 3]> = (0..4)
+            .map(|index| Point3::new(-0.5 + 0.5 * (index % 2) as f32 * 2.0 - 0.5, 0.0, 0.0))
+            .map(|_| [0.0f32; 3])
+            .collect();
+        let _ = lifted;
+
+        // The front face of the cube spans x and y at z = 0.5; pushed 0.5 along z it spans the same x
+        // and y at z = 1.0, and it is still FaceId(0).
+        assert_face_at(
+            &mesh,
+            FaceId(0),
+            &[
+                [-0.5, -0.5, 1.0],
+                [0.5, -0.5, 1.0],
+                [0.5, 0.5, 1.0],
+                [-0.5, 0.5, 1.0],
+            ],
+        );
+        assert_eq!(
+            mesh.face_normal(FaceId(0)).z,
+            1.0,
+            "the lifted copy keeps the winding of the face it came from"
+        );
+    }
+
+    #[test]
+    fn each_wall_bridges_a_base_edge_to_the_edge_it_lifted() {
+        let mut mesh = HalfEdgeMesh::create_cube();
+        let shape = mesh
+            .extrude_face(FaceId(0), push_front())
+            .expect("a face of a cube should extrude");
+
+        // Every wall is a quad with two corners from the original face and two from its lifted copy,
+        // which is what makes the extrusion a solid prism rather than a face floating off a hole.
+        for &wall in &shape.side_faces {
+            let corners = mesh.face_vertices(wall);
+            assert_eq!(corners.len(), 4, "a wall is a quad");
+            let bases = corners
+                .iter()
+                .filter(|corner| [0usize, 1, 2, 3].contains(&corner.0))
+                .count();
+            let lifted = corners
+                .iter()
+                .filter(|corner| shape.new_vertices.contains(corner))
+                .count();
+            assert_eq!(bases, 2, "two corners came off the face where it was");
+            assert_eq!(lifted, 2, "two corners came off the face where it went");
+        }
+
+        // The walls meet the lifted face along its new edges and the neighbouring faces along the old
+        // ones, so no edge of a wall is left unbounded.
+        for &wall in &shape.side_faces {
+            for half_edge in mesh.face_half_edges(wall) {
+                let twin = mesh.half_edges[half_edge.0]
+                    .twin
+                    .expect("an extrusion of a closed solid leaves no wall edge open");
+                assert!(
+                    mesh.half_edges[twin.0].face.is_some(),
+                    "every wall edge bounds a face on its far side"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extruding_the_whole_solid_is_refused_for_want_of_a_free_edge() {
+        let before = HalfEdgeMesh::create_cube();
+        let mut mesh = before.clone();
+
+        let all: Vec<FaceId> = (0..6).map(FaceId).collect();
+        let errors = mesh
+            .extrude_faces(&all, push_front())
+            .expect_err("a closed solid has no hull left to grow walls from");
+        expect_reason(&errors, "no free boundary to grow a wall along");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn a_zero_or_infinite_offset_is_refused_before_anything_is_grown() {
+        for offset in [
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(f32::NAN, 0.0, 0.0),
+            Vector3::new(0.0, f32::INFINITY, 0.0),
+        ] {
+            let before = HalfEdgeMesh::create_cube();
+            let mut mesh = before.clone();
+
+            let errors = mesh
+                .extrude_face(FaceId(0), offset)
+                .expect_err("a degenerate offset must not grow zero-area walls");
+            assert!(
+                !errors.is_empty(),
+                "a refused offset must always say why, and {offset:?} said nothing"
+            );
+            assert_identical(&mesh, &before);
+        }
+    }
+
+    #[test]
+    fn an_absent_face_is_refused_by_name() {
+        let before = HalfEdgeMesh::create_cube();
+        let mut mesh = before.clone();
+
+        let errors = mesh
+            .extrude_face(FaceId(99), push_front())
+            .expect_err("face 99 is not on a cube");
+        expect_reason(&errors, "face 99 does not exist");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn a_corner_the_region_does_not_release_is_refused_as_stranded() {
+        // Front, right and top all meet at corner 2, and no other selected face touches it. Every edge at
+        // corner 2 is shared inside the selection, so nothing walls it off and the lift would carry it
+        // away whole, leaving the vertex it was owning no edge at all. Maya splits such a corner into one
+        // copy per diverging face; refusing is the honest answer until that exists, and it has to say so
+        // up front rather than report an orphan vertex after the damage is done.
+        let before = HalfEdgeMesh::create_cube();
+        let mut mesh = before.clone();
+
+        let errors = mesh
+            .extrude_faces(&[FaceId(0), FaceId(1), FaceId(4)], push_front())
+            .expect_err("corner 2 belongs only to the three faces being moved");
+        expect_reason(&errors, "vertex 2 belongs only to the faces being extruded");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn two_faces_sharing_an_edge_move_as_one_slab_without_a_wall_between_them() {
+        // Front and bottom share edge 0-1, so they weld: one copy of each shared corner and no wall grown
+        // across the hinge. That is the difference between one slab and two coincident shells, which would
+        // render as z-fighting and read as a self-intersection.
+        let before = HalfEdgeMesh::create_cube();
+        let mut mesh = before.clone();
+
+        let shape = mesh
+            .extrude_faces(&[FaceId(0), FaceId(5)], push_front())
+            .expect("two faces hinged on one edge should extrude together");
+
+        assert_eq!(
+            mesh.vertices.len(),
+            14,
+            "six corners moved, each copied once"
+        );
+        assert_eq!(shape.new_vertices.len(), 6);
+        assert_eq!(
+            shape.side_faces.len(),
+            6,
+            "eight outer edges less the two at the hinge"
+        );
+        assert!(
+            mesh.boundary_edges().is_empty(),
+            "the slab must leave the solid closed where it detached"
+        );
+        assert_eq!(
+            mesh.face_vertices(FaceId(0)).len(),
+            4,
+            "the lifted face keeps its four corners, welded to its neighbour"
+        );
+    }
+
+    #[test]
+    fn a_repeated_face_in_the_selection_moves_once() {
+        let mut once = HalfEdgeMesh::create_cube();
+        let mut twice = HalfEdgeMesh::create_cube();
+
+        let single = once
+            .extrude_face(FaceId(0), push_front())
+            .expect("one face should extrude");
+        let doubled = twice
+            .extrude_faces(&[FaceId(0), FaceId(0)], push_front())
+            .expect("naming the same face twice is the same extrusion, not two");
+
+        assert_eq!(single.side_faces.len(), doubled.side_faces.len());
+        assert_eq!(shape(&once), shape(&twice));
+    }
+
+    #[test]
+    fn extruding_the_face_of_an_open_quad_leaves_the_base_open() {
+        // The other half of the closed-solid rule: on a sheet there is nothing behind the face, so the
+        // walls grow from all four of its edges and the bottom stays a four-edge hole. Refusing this would
+        // make it impossible to extrude a plane, which is the first thing anyone does with one.
+        let mut mesh = open_quad();
+        let shape = mesh
+            .extrude_face(FaceId(0), Vector3::new(0.0, 0.0, 1.0))
+            .expect("a lone quad has four free edges to grow from");
+
+        assert_eq!(mesh.faces.len(), 5, "the lifted sheet plus four walls");
+        assert_eq!(shape.side_faces.len(), 4);
+        assert_eq!(
+            mesh.boundary_edges().len(),
+            4,
+            "the rim the sheet left behind is still open"
+        );
+        assert_eq!(mesh.half_edges.len(), 20, "four lifted, sixteen new");
     }
 }

@@ -10,7 +10,7 @@ use crate::mesh::VertexId;
 use crate::overlay;
 use crate::picking::Ray;
 use crate::render_types::{CameraUniform, GpuVertex};
-use crate::scene::Scene;
+use crate::scene::{Scene, EXTRUDE_FACE_DISTANCE};
 use crate::tool::Tool;
 use crate::ui::{UiContext, UiState};
 use std::sync::Arc;
@@ -194,6 +194,9 @@ pub struct State<'a> {
     ctrl_pressed: bool,
     drag_state: Option<DragState>,
     hovered_axis: Option<GizmoAxis>,
+    /// One-line outcome of the last command, shown in the Tools panel. Maya's command echo is what tells
+    /// a user a hotkey was received; without it a refused extrude is indistinguishable from a dead key.
+    notice: Option<String>,
 }
 
 /// The name a gizmo drag records into history, Maya-style: the tool plus the component being moved
@@ -214,6 +217,7 @@ enum Hotkey {
     CancelDrag,
     Undo,
     Redo,
+    Extrude,
 }
 
 /// The Maya keymap, as a pure function of the physical key and the Ctrl / Shift modifiers.
@@ -222,7 +226,9 @@ enum Hotkey {
 /// rules below - are unit-testable without a window or a GPU context.
 ///
 /// The tool keys only fire with Ctrl released: `Ctrl+Z` sends `KeyZ`, and without that guard a
-/// `Ctrl+E` intended as a menu mnemonic would silently switch to Rotate.
+/// `Ctrl+E` intended as a menu mnemonic would silently switch to Rotate. They also require Shift
+/// released, which is what frees `Shift+E` for extrude - Maya binds extrude to a shelf button rather
+/// than a key, so this follows the `Shift` + letter convention the rest of the map already uses.
 fn hotkey_for(key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> Option<Hotkey> {
     use winit::keyboard::KeyCode as Key;
 
@@ -231,6 +237,14 @@ fn hotkey_for(key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> Option<
             Key::KeyZ if shift => Some(Hotkey::Redo),
             Key::KeyZ => Some(Hotkey::Undo),
             Key::KeyY => Some(Hotkey::Redo),
+            _ => None,
+        };
+    }
+
+    if shift {
+        return match key {
+            Key::KeyE => Some(Hotkey::Extrude),
+            Key::Escape => Some(Hotkey::CancelDrag),
             _ => None,
         };
     }
@@ -526,6 +540,7 @@ impl<'a> State<'a> {
             ctrl_pressed: false,
             drag_state: None,
             hovered_axis: None,
+            notice: None,
         }
     }
 
@@ -582,8 +597,40 @@ impl<'a> State<'a> {
                 self.redo();
                 true
             }
+            Some(Hotkey::Extrude) => {
+                self.extrude_selected_faces();
+                true
+            }
             None => false,
         }
+    }
+
+    /// Pushes the selected faces out by the fixed step, reporting the outcome in the Tools panel.
+    ///
+    /// A seam rather than a `main.rs` call into `Scene` for the same reason `undo` is: a drag in flight
+    /// holds vertex ids and initial positions from the state an extrude invalidates, so it has to be
+    /// abandoned first. A refusal leaves the mesh alone and is shown instead, because a hotkey that
+    /// silently did nothing reads as a dead key.
+    pub fn extrude_selected_faces(&mut self) {
+        self.cancel_active_drag();
+        self.notice = Some(
+            match self.scene.extrude_selected_faces(EXTRUDE_FACE_DISTANCE) {
+                Ok(shape) => format!(
+                    "Extruded {} {} into {} wall{}",
+                    shape.source_faces.len(),
+                    if shape.source_faces.len() == 1 {
+                        "face"
+                    } else {
+                        "faces"
+                    },
+                    shape.side_faces.len(),
+                    if shape.side_faces.len() == 1 { "" } else { "s" }
+                ),
+                // The reasons already read as sentences naming the components involved, so they go up
+                // as given rather than being paraphrased into something less specific.
+                Err(errors) => errors.join(" "),
+            },
+        );
     }
 
     /// Steps the document one action back. A seam rather than a `main.rs` call into `Scene`, because
@@ -857,6 +904,8 @@ impl<'a> State<'a> {
                 can_redo: self.scene.can_redo(),
                 undo_label: self.scene.undo_label(),
                 redo_label: self.scene.redo_label(),
+                can_extrude: self.scene.can_extrude(),
+                notice: self.notice.as_deref(),
             },
         );
         if let Some(mode) = ui_response.mode {
@@ -866,10 +915,13 @@ impl<'a> State<'a> {
             self.scene.set_tool(tool);
         }
         if ui_response.undo {
-            self.scene.undo();
+            self.undo();
         }
         if ui_response.redo {
-            self.scene.redo();
+            self.redo();
+        }
+        if ui_response.extrude {
+            self.extrude_selected_faces();
         }
 
         if self.scene.take_dirty() {

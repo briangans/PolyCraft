@@ -4,9 +4,12 @@
 //! dirty. `State::render` checks that flag once per frame and re-uploads the GPU buffers.
 
 use crate::history::HistoryStack;
-use crate::mesh::HalfEdgeMesh;
+use crate::mesh::{FaceId, HalfEdgeMesh, TopologyErrors};
+use crate::mesh_edit::Extruded;
 use crate::picking::{self, Ray};
 use crate::selection::Selection;
+use cgmath::{InnerSpace, Vector3};
+use std::collections::HashSet;
 
 pub use crate::edit_mode::EditMode;
 pub use crate::tool::Tool;
@@ -18,6 +21,11 @@ pub const EDGE_PICK_RADIUS_PIXELS: f32 = 6.0;
 /// How many actions `undo` can walk back before the oldest ones are dropped. Meshes here are small
 /// (a snapshot is a few hundred KB at most), so they stay cheap enough to keep a deep stack.
 pub const HISTORY_DEPTH: usize = 64;
+
+/// How far one extrude moves a face, in model units. The document opens on a unit cube, so a quarter of
+/// it is clearly visible at the default zoom without needing a drag distance to feel right - and pressing
+/// again accumulates, since the walls an extrude leaves behind are what Maya keeps selected.
+pub const EXTRUDE_FACE_DISTANCE: f32 = 0.25;
 
 /// The state undo/redo version: the geometry plus what was selected on it.
 ///
@@ -37,6 +45,18 @@ pub struct Scene {
     tool: Tool,
     selection: Selection,
     history: HistoryStack<DocumentSnapshot>,
+    last_extrude: Option<LastExtrude>,
+}
+
+/// The direction the last extrude travelled and the faces it grew, so pressing extrude again pushes the
+/// same lump further the way Maya's tool keeps its last direction.
+///
+/// Needed because the walls an extrude leaves behind - which is what it selects next - point in every
+/// direction around the lump at once. Averaging their normals gives zero, so a repeated press would be
+/// refused as having no common direction and the first gesture would be the last one you could make.
+struct LastExtrude {
+    direction: Vector3<f32>,
+    faces: Vec<FaceId>,
 }
 
 impl Scene {
@@ -48,6 +68,7 @@ impl Scene {
             tool: Tool::default(),
             selection: Selection::new(),
             history: HistoryStack::new(HISTORY_DEPTH),
+            last_extrude: None,
         }
     }
 
@@ -57,7 +78,6 @@ impl Scene {
 
     /// Mutable access to the mesh. Flags the document dirty so the renderer re-uploads it next
     /// frame. Wrap calls in `begin_action` / `end_action` if the change should be undoable.
-    #[allow(dead_code)] // First caller will be the upcoming edit operations (extrude, delete)
     pub fn mesh_mut(&mut self) -> &mut HalfEdgeMesh {
         self.dirty = true;
         &mut self.mesh
@@ -119,8 +139,95 @@ impl Scene {
         self.dirty = true;
     }
 
+    /// Whether an extrude is available: faces are what extrude moves, and it needs at least one.
+    ///
+    /// Shared by the hotkey seam and the Tools panel so the button greys out for exactly the reason the
+    /// key does nothing, rather than looking live and then failing quietly.
+    pub fn can_extrude(&self) -> bool {
+        self.mode == EditMode::Face
+            && self
+                .selection
+                .faces()
+                .iter()
+                .any(|&face| face.0 < self.mesh.faces.len())
+    }
+
+    /// Pushes every selected face outward along `distance` times the average of their normals, growing a
+    /// wall behind each edge of the selection nothing else bounds, and keeps the walls selected as Maya
+    /// does. One undoable step: the whole operation lands in history as "Extrude Face" or "Extrude Faces".
+    ///
+    /// Returns how the region moved, or every reason nothing happened - the mesh is untouched either
+    /// way, because [`crate::mesh_edit`] primitives refuse before they change anything.
+    pub fn extrude_selected_faces(&mut self, distance: f32) -> Result<Extruded, TopologyErrors> {
+        if !self.can_extrude() {
+            return Err(vec![
+                "extrude moves faces, so it needs at least one face selected in Face mode"
+                    .to_string(),
+            ]);
+        }
+
+        let mut faces: Vec<FaceId> = self
+            .selection
+            .faces()
+            .iter()
+            .copied()
+            .filter(|&face| face.0 < self.mesh.faces.len())
+            .collect();
+        faces.sort_by_key(|face| face.0);
+
+        let Some(direction) = self.extrude_direction_for(&faces) else {
+            return Err(vec![
+                "the selected faces point in opposite directions, so there is no single way to push them; \
+                 extrude them one at a time"
+                    .to_string(),
+            ]);
+        };
+
+        self.begin_action(&extrude_label(faces.len()));
+        let outcome = self.mesh_mut().extrude_faces(&faces, direction * distance);
+
+        match outcome {
+            Ok(shape) => {
+                // Maya leaves the walls selected, so pressing the hotkey again grows the same lump.
+                // Only the face set is touched: whatever object or component selection exists belongs
+                // to a different mode and is this edit's business even less than it was before.
+                let walls = shape.side_faces.clone();
+                self.selection.faces_mut().clear();
+                self.selection.faces_mut().extend(walls.iter());
+                self.last_extrude = Some(LastExtrude {
+                    direction,
+                    faces: walls,
+                });
+                self.end_action();
+                Ok(shape)
+            }
+            Err(errors) => {
+                // Nothing reached the mesh, so there is no step worth recording - and leaving an action
+                // open would file the *next* edit under this one.
+                self.cancel_action();
+                Err(errors)
+            }
+        }
+    }
+
+    /// Which way an extrude of `faces` should travel.
+    ///
+    /// The last extrude's direction while the selection is still entirely the walls it grew, so pressing
+    /// the key again pushes the same lump further; otherwise the average of the faces' own normals, which
+    /// is what sends a selected corner diagonally out as Maya does. `None` only when there is neither a
+    /// remembered direction to lean on nor a common normal to average - four walls around a lump point
+    /// every which way and average to nothing on their own.
+    fn extrude_direction_for(&self, faces: &[FaceId]) -> Option<Vector3<f32>> {
+        if let Some(last) = &self.last_extrude {
+            let grew: HashSet<FaceId> = last.faces.iter().copied().collect();
+            if faces.iter().all(|face| grew.contains(face)) {
+                return Some(last.direction);
+            }
+        }
+        extrude_direction(&self.mesh, faces)
+    }
+
     /// Selects whatever the ray hits, in the current mode. `additive` keeps what was already
-    /// selected and toggles the clicked component (Shift+click in Maya).
     pub fn select_at(&mut self, ray: &Ray, additive: bool, viewport_height: f32) {
         let changed = match self.mode {
             EditMode::Object => {
@@ -241,6 +348,9 @@ impl Scene {
         self.mesh = snapshot.mesh;
         self.selection = snapshot.selection;
         self.dirty = true;
+        // Undo renumbers faces, so the walls a remembered extrude direction belongs to may no longer be
+        // the faces that id names. It is tool state rather than document state, and cheaper to forget.
+        self.last_extrude = None;
 
         // The user may have switched modes after the action being undone, and future topology edits can
         // remove components a stale selection still names. Neither must survive into the document.
@@ -260,6 +370,41 @@ impl Scene {
                 .edges_mut()
                 .retain(|edge| live.contains(edge));
         }
+    }
+}
+
+/// The single direction a group of faces should travel, or `None` when they have no common one.
+///
+/// The average of the faces' outward normals, which is what makes extruding a corner of the cube push it
+/// diagonally out as Maya does rather than along whichever face was clicked last. Returns `None` when the
+/// normals cancel out - two opposite faces averaged together point nowhere, and moving them by a zero
+/// vector would be refused downstream as a degenerate offset with a message about wall area that says
+/// nothing about the selection.
+fn extrude_direction(mesh: &HalfEdgeMesh, faces: &[FaceId]) -> Option<Vector3<f32>> {
+    let total = faces
+        .iter()
+        .map(|&face| mesh.face_normal(face))
+        .fold(Vector3::new(0.0, 0.0, 0.0), |sum, normal| sum + normal);
+
+    // `face_normal` returns a unit vector for a face with area and the zero vector for a collapsed one,
+    // so a non-finite or vanishing sum means the faces give no usable direction rather than that the
+    // arithmetic overflows.
+    if !total.x.is_finite() || !total.y.is_finite() || !total.z.is_finite() {
+        return None;
+    }
+    let magnitude = total.magnitude();
+    if magnitude < f32::EPSILON {
+        return None;
+    }
+    Some(total / magnitude)
+}
+
+/// The name the step takes in history, matching Maya's singular and plural command labels.
+fn extrude_label(face_count: usize) -> String {
+    if face_count == 1 {
+        "Extrude Face".to_string()
+    } else {
+        "Extrude Faces".to_string()
     }
 }
 
@@ -595,6 +740,194 @@ mod tests {
             scene.selected_count(),
             1,
             "undo keeps the selection alongside the geometry it was made with"
+        );
+    }
+
+    /// Asserts a refusal named `needle` and never came back empty-handed.
+    fn expect_reason(errors: &[String], needle: &str) {
+        assert!(!errors.is_empty(), "a refusal must always give a reason");
+        assert!(
+            errors.iter().any(|error| error.contains(needle)),
+            "expected a reason containing {needle:?}, got {errors:?}"
+        );
+    }
+
+    /// Selects the front face by ray, the way a click in Face mode would.
+    fn select_front_face(scene: &mut Scene) {
+        scene.select_at(&front_ray(), false, VIEWPORT_HEIGHT);
+        assert_eq!(
+            scene.selected_count(),
+            1,
+            "the test depends on hitting one face"
+        );
+    }
+
+    #[test]
+    fn extrude_is_off_until_a_face_is_selected_in_face_mode() {
+        let mut scene = Scene::new();
+        assert!(
+            !scene.can_extrude(),
+            "Object mode has no faces to move, so the button must not look live"
+        );
+
+        scene.set_mode(EditMode::Face);
+        assert!(
+            !scene.can_extrude(),
+            "Face mode with nothing selected still has nothing to move"
+        );
+
+        select_front_face(&mut scene);
+        assert!(scene.can_extrude(), "one face selected is enough");
+    }
+
+    #[test]
+    fn extrude_is_refused_in_vertex_mode_without_touching_the_mesh() {
+        let mut scene = Scene::new();
+        scene.set_mode(EditMode::Vertex);
+        scene.select_at(&corner_ray(), false, VIEWPORT_HEIGHT);
+        scene.take_dirty();
+        let before = scene.mesh().clone();
+
+        let errors = scene
+            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+            .expect_err("vertices do not extrude");
+        expect_reason(&errors, "needs at least one face selected in Face mode");
+        assert_eq!(scene.mesh(), &before);
+        assert!(
+            !scene.can_undo(),
+            "a refusal records no step, so Undo still belongs to whatever came before"
+        );
+    }
+
+    #[test]
+    fn extruding_a_selected_face_lands_one_undoable_step_named_for_the_command() {
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        let before = scene.mesh().clone();
+
+        let shape = scene
+            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+            .expect("a selected face of the cube should extrude");
+
+        assert_eq!(shape.side_faces.len(), 4);
+        assert_eq!(scene.mesh().faces.len(), 10);
+        assert!(scene.can_undo());
+        assert_eq!(
+            scene.undo_label(),
+            Some("Extrude Face"),
+            "the step is named after the command, as Maya's history panel shows it"
+        );
+
+        assert!(scene.undo());
+        assert_eq!(
+            scene.mesh(),
+            &before,
+            "one undo returns the whole cube, not half a prism"
+        );
+        assert!(scene.can_redo());
+        assert!(scene.redo());
+        assert_eq!(
+            scene.mesh().faces.len(),
+            10,
+            "redo re-grows the same extrusion"
+        );
+    }
+
+    #[test]
+    fn extrude_hands_the_selection_to_the_walls_it_grew() {
+        // Maya leaves the new geometry selected so the next press keeps growing the same lump. Handing
+        // back the source faces instead would extrude the same face twice into coincident shells.
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+
+        let shape = scene
+            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+            .expect("a selected face of the cube should extrude");
+
+        let selected: Vec<FaceId> = {
+            let mut faces: Vec<FaceId> = scene.selection.faces().iter().copied().collect();
+            faces.sort_by_key(|face| face.0);
+            faces
+        };
+        assert_eq!(
+            selected, shape.side_faces,
+            "the walls are what stays selected"
+        );
+
+        // Pressing again grows from the walls rather than colliding with the first prism. The count is
+        // asserted against the mesh, not a remembered number: nine outer edges is what four walls
+        // standing side by side present once the seams between them are discounted.
+        let before = scene.mesh().faces.len();
+        let grown = scene
+            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+            .expect("extruding again should grow the same lump further");
+        assert_eq!(
+            scene.mesh().faces.len(),
+            before + grown.side_faces.len(),
+            "the second press adds exactly the walls it reports"
+        );
+        assert!(
+            grown.side_faces.len() > 1,
+            "four walls standing together must present more than one free edge"
+        );
+        assert!(
+            scene.mesh().boundary_edges().is_empty(),
+            "the solid stays closed however many times it is extruded"
+        );
+    }
+
+    #[test]
+    fn an_extrude_refusal_leaves_history_and_selection_exactly_as_they_were() {
+        // Selecting every face is reachable through Ctrl+A. Two opposite faces averaged together point
+        // nowhere, so this is refused before the mesh is ever asked for walls. What matters is that the
+        // failed command is invisible to history: an empty step filed under "Extrude Faces" would make
+        // the next Undo look like it had done nothing.
+        let mut scene = face_mode_scene();
+        for face in 0..6 {
+            scene.selection.faces_mut().insert(FaceId(face));
+        }
+        scene.take_dirty();
+        let before = scene.mesh().clone();
+
+        let errors = scene
+            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+            .expect_err("opposite faces have no common direction to travel");
+        expect_reason(&errors, "no single way to push them");
+        assert_eq!(scene.mesh(), &before);
+        assert!(!scene.can_undo(), "a refused command never reaches history");
+        assert_eq!(
+            scene.selected_count(),
+            6,
+            "the selection the user made is not this command's to change"
+        );
+    }
+
+    #[test]
+    fn a_closed_selection_is_refused_before_the_mesh_is_touched() {
+        // Any region forming a closed surface has its outward normals sum to nothing, so selecting a whole
+        // solid gives the command nowhere to send it and it is turned away here rather than at the mesh.
+        // Reached the way a user reaches it: grow a lump, then Ctrl+A the result.
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        scene
+            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+            .expect("a selected face of the cube should extrude");
+
+        let faces = scene.mesh().faces.len();
+        scene.selection.faces_mut().clear();
+        for face in 0..faces {
+            scene.selection.faces_mut().insert(FaceId(face));
+        }
+        let before = scene.mesh().clone();
+
+        let errors = scene
+            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+            .expect_err("a closed solid has nothing to grow from");
+        expect_reason(&errors, "no single way to push them");
+        assert_eq!(
+            scene.mesh(),
+            &before,
+            "the refusal must not have cut into the solid"
         );
     }
 }
