@@ -63,8 +63,10 @@ pub struct Extruded {
     /// still names the same faces.
     pub source_faces: Vec<FaceId>,
     /// The walls grown along the region's free edges, in boundary order: each is `[origin, destination,
-    /// destination's copy, origin's copy]` for one half-edge of the region. Maya keeps these selected
-    /// after an extrude, which is why they are reported as a list rather than folded into `source_faces`.
+    /// destination's copy, origin's copy]` for one half-edge of the region. Reported so a caller can count
+    /// them, highlight them or chain them into another operation; the selection itself deliberately stays
+    /// on `source_faces`, both because that is what Maya does and because it is what makes the next press
+    /// travel along the way the geometry under the cursor faces.
     pub side_faces: Vec<FaceId>,
     /// The translated copy of every corner the region touched, in the order they were created.
     pub new_vertices: Vec<VertexId>,

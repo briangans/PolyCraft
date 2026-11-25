@@ -45,18 +45,6 @@ pub struct Scene {
     tool: Tool,
     selection: Selection,
     history: HistoryStack<DocumentSnapshot>,
-    last_extrude: Option<LastExtrude>,
-}
-
-/// The direction the last extrude travelled and the faces it grew, so pressing extrude again pushes the
-/// same lump further the way Maya's tool keeps its last direction.
-///
-/// Needed because the walls an extrude leaves behind - which is what it selects next - point in every
-/// direction around the lump at once. Averaging their normals gives zero, so a repeated press would be
-/// refused as having no common direction and the first gesture would be the last one you could make.
-struct LastExtrude {
-    direction: Vector3<f32>,
-    faces: Vec<FaceId>,
 }
 
 impl Scene {
@@ -68,7 +56,6 @@ impl Scene {
             tool: Tool::default(),
             selection: Selection::new(),
             history: HistoryStack::new(HISTORY_DEPTH),
-            last_extrude: None,
         }
     }
 
@@ -152,12 +139,17 @@ impl Scene {
                 .any(|&face| face.0 < self.mesh.faces.len())
     }
 
-    /// Pushes every selected face outward along `distance` times the average of their normals, growing a
-    /// wall behind each edge of the selection nothing else bounds, and keeps the walls selected as Maya
-    /// does. One undoable step: the whole operation lands in history as "Extrude Face" or "Extrude Faces".
+    /// Pushes every selected face outward along `distance` times the average of their own normals,
+    /// growing a wall behind each edge of the selection nothing else bounds. One undoable step, landed in
+    /// history as "Extrude Face" or "Extrude Faces".
     ///
-    /// Returns how the region moved, or every reason nothing happened - the mesh is untouched either
-    /// way, because [`crate::mesh_edit`] primitives refuse before they change anything.
+    /// The faces that moved stay selected rather than the walls that were created. That keeps the
+    /// highlight on the geometry the user pointed at, and it is also what makes the direction work: the
+    /// moved face carries the same normal it had before, so pressing again pushes the same lump further,
+    /// while a wall the user goes on to pick travels along its own normal instead of inheriting one.
+    ///
+    /// Returns how the region moved, or every reason nothing happened - the mesh is untouched either way,
+    /// because [`crate::mesh_edit`] primitives refuse before they change anything.
     pub fn extrude_selected_faces(&mut self, distance: f32) -> Result<Extruded, TopologyErrors> {
         if !self.can_extrude() {
             return Err(vec![
@@ -175,7 +167,10 @@ impl Scene {
             .collect();
         faces.sort_by_key(|face| face.0);
 
-        let Some(direction) = self.extrude_direction_for(&faces) else {
+        // The average of the selection's own normals and nothing else, always recomputed from the live
+        // mesh: averaging is what sends a two-face corner diagonally out the way Maya does, and refusing
+        // when the normals cancel is what stops opposite faces being pushed into each other.
+        let Some(direction) = extrude_direction(&self.mesh, &faces) else {
             return Err(vec![
                 "the selected faces point in opposite directions, so there is no single way to push them; \
                  extrude them one at a time"
@@ -187,17 +182,9 @@ impl Scene {
         let outcome = self.mesh_mut().extrude_faces(&faces, direction * distance);
 
         match outcome {
+            // Selection deliberately untouched: the ids of the faces that moved are unchanged, because
+            // the primitive appends and re-points rather than replacing them.
             Ok(shape) => {
-                // Maya leaves the walls selected, so pressing the hotkey again grows the same lump.
-                // Only the face set is touched: whatever object or component selection exists belongs
-                // to a different mode and is this edit's business even less than it was before.
-                let walls = shape.side_faces.clone();
-                self.selection.faces_mut().clear();
-                self.selection.faces_mut().extend(walls.iter());
-                self.last_extrude = Some(LastExtrude {
-                    direction,
-                    faces: walls,
-                });
                 self.end_action();
                 Ok(shape)
             }
@@ -208,23 +195,6 @@ impl Scene {
                 Err(errors)
             }
         }
-    }
-
-    /// Which way an extrude of `faces` should travel.
-    ///
-    /// The last extrude's direction while the selection is still entirely the walls it grew, so pressing
-    /// the key again pushes the same lump further; otherwise the average of the faces' own normals, which
-    /// is what sends a selected corner diagonally out as Maya does. `None` only when there is neither a
-    /// remembered direction to lean on nor a common normal to average - four walls around a lump point
-    /// every which way and average to nothing on their own.
-    fn extrude_direction_for(&self, faces: &[FaceId]) -> Option<Vector3<f32>> {
-        if let Some(last) = &self.last_extrude {
-            let grew: HashSet<FaceId> = last.faces.iter().copied().collect();
-            if faces.iter().all(|face| grew.contains(face)) {
-                return Some(last.direction);
-            }
-        }
-        extrude_direction(&self.mesh, faces)
     }
 
     /// Selects whatever the ray hits, in the current mode. `additive` keeps what was already
@@ -348,9 +318,6 @@ impl Scene {
         self.mesh = snapshot.mesh;
         self.selection = snapshot.selection;
         self.dirty = true;
-        // Undo renumbers faces, so the walls a remembered extrude direction belongs to may no longer be
-        // the faces that id names. It is tool state rather than document state, and cheaper to forget.
-        self.last_extrude = None;
 
         // The user may have switched modes after the action being undone, and future topology edits can
         // remove components a stale selection still names. Neither must survive into the document.
@@ -360,7 +327,7 @@ impl Scene {
         self.selection.vertices_mut().retain(|v| v.0 < vertex_count);
         self.selection.faces_mut().retain(|f| f.0 < face_count);
         if !self.selection.edges().is_empty() {
-            let live: std::collections::HashSet<crate::mesh::EdgeId> = self
+            let live: HashSet<crate::mesh::EdgeId> = self
                 .mesh
                 .edges()
                 .into_iter()
@@ -834,45 +801,94 @@ mod tests {
     }
 
     #[test]
-    fn extrude_hands_the_selection_to_the_walls_it_grew() {
-        // Maya leaves the new geometry selected so the next press keeps growing the same lump. Handing
-        // back the source faces instead would extrude the same face twice into coincident shells.
+    fn an_extrude_leaves_the_face_that_was_pointed_at_selected() {
+        // The highlight stays on the geometry the user clicked. That is also what keeps the direction
+        // honest: a face carries its own normal, so the thing under the cursor is what decides where it
+        // goes next - no remembered direction is involved anywhere.
         let mut scene = face_mode_scene();
         select_front_face(&mut scene);
 
-        let shape = scene
+        scene
             .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
             .expect("a selected face of the cube should extrude");
 
-        let selected: Vec<FaceId> = {
-            let mut faces: Vec<FaceId> = scene.selection.faces().iter().copied().collect();
-            faces.sort_by_key(|face| face.0);
-            faces
-        };
         assert_eq!(
-            selected, shape.side_faces,
-            "the walls are what stays selected"
-        );
-
-        // Pressing again grows from the walls rather than colliding with the first prism. The count is
-        // asserted against the mesh, not a remembered number: nine outer edges is what four walls
-        // standing side by side present once the seams between them are discounted.
-        let before = scene.mesh().faces.len();
-        let grown = scene
-            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
-            .expect("extruding again should grow the same lump further");
-        assert_eq!(
-            scene.mesh().faces.len(),
-            before + grown.side_faces.len(),
-            "the second press adds exactly the walls it reports"
+            scene.selection.faces().len(),
+            1,
+            "the selection is exactly the face that was clicked"
         );
         assert!(
-            grown.side_faces.len() > 1,
-            "four walls standing together must present more than one free edge"
+            scene.selection.faces().contains(&FaceId(0)),
+            "the front face keeps its id across an extrude, because the primitive appends and re-points"
+        );
+        assert_near(
+            scene.mesh().face_center(FaceId(0)),
+            Point3::new(0.0, 0.0, 0.5 + EXTRUDE_FACE_DISTANCE),
+            "and it is the cap that travelled, not the hole it left behind",
+        );
+    }
+
+    #[test]
+    fn pressing_extrude_twice_pushes_straight_out_along_the_face_normal() {
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+
+        scene
+            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+            .expect("the first press should extrude");
+        scene
+            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+            .expect("the second press should extrude the cap again");
+
+        assert_near(
+            scene.mesh().face_center(FaceId(0)),
+            Point3::new(0.0, 0.0, 0.5 + 2.0 * EXTRUDE_FACE_DISTANCE),
+            "two presses travel along +z with no sideways drift, since the cap still faces +z",
         );
         assert!(
             scene.mesh().boundary_edges().is_empty(),
             "the solid stays closed however many times it is extruded"
+        );
+    }
+
+    #[test]
+    fn a_wall_picked_after_an_extrude_travels_along_its_own_normal() {
+        // The regression this replaces: the direction of the first extrude used to be remembered and
+        // reused whenever the selection was a subset of it, so picking one wall and pressing the key slid
+        // that wall along the *original* face's normal - through the prism - instead of out of the wall.
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        scene
+            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+            .expect("a selected face of the cube should extrude");
+
+        let walls: Vec<FaceId> = (6..scene.mesh().faces.len()).map(FaceId).collect();
+        let right_wall = walls
+            .into_iter()
+            .find(|&wall| scene.mesh().face_normal(wall).x > 0.9)
+            .expect("one of the four walls must face +x");
+        let before = scene.mesh().face_center(right_wall);
+
+        scene.selection.faces_mut().clear();
+        scene.selection.faces_mut().insert(right_wall);
+        scene
+            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+            .expect("a single wall should extrude on its own");
+
+        assert_near(
+            scene.mesh().face_center(right_wall),
+            Point3::new(before.x + EXTRUDE_FACE_DISTANCE, before.y, before.z),
+            "the wall moves out along +x, its own normal, and not along the front face's +z",
+        );
+    }
+
+    /// Point equality with the tolerance floating-point accumulation deserves, so a test failure means
+    /// the geometry moved wrong rather than that an addition rounded.
+    fn assert_near(actual: Point3<f32>, expected: Point3<f32>, note: &str) {
+        let drift = (actual - expected).magnitude();
+        assert!(
+            drift < 1e-5,
+            "{note}: expected {expected:?}, got {actual:?}"
         );
     }
 
