@@ -277,19 +277,25 @@ impl Space {
 /// The direction the selection itself points, for [`Space::Component`], or `None` when the geometry has
 /// no single answer.
 ///
-/// Per mode: a face gives its own normal; an edge gives the line between its two corners; a vertex gives
-/// the average of the faces around it, which is the smooth shading direction and the one a user reading a
-/// rounded corner expects. `EditMode::Object` gives nothing, because there is no component geometry to
-/// read a direction out of.
+/// Per mode: a face gives its own normal; an edge gives the average of the normals of the faces that meet
+/// at it; a vertex gives the average of the faces around it. The last two are the smooth-shading direction,
+/// and they are what Maya's component space puts under the normal axis - for an edge it is the bisector of
+/// the two faces, the direction a bevel would push it, which is why dragging it thickens a wall rather than
+/// sliding the edge along its own length. `EditMode::Object` gives nothing, because there is no component
+/// geometry to read a direction out of.
 ///
 /// `None` also covers the case where the selection points two ways at once - two opposite faces, or two
-/// edges running counter to each other - because their sum cancels, and pushing a selection by a zero
-/// vector would move it nowhere while looking like a live gizmo. Callers fall back to world rather than
-/// refusing to draw.
+/// edges whose bisectors run counter to each other - because their sum cancels, and pushing a selection by
+/// a zero vector would move it nowhere while looking like a live gizmo. Callers fall back to world rather
+/// than refusing to draw.
 ///
-/// An edge's sign comes out of [`EdgeId`]'s canonical order rather than from either face, so it is stable
-/// but arbitrary: one selected edge gives an exact direction, several may cancel by accident as often as
-/// by design.
+/// Reading the direction out of faces rather than out of the edge's own endpoints also drops an arbitrariness
+/// the earlier version carried: [`EdgeId`] canonicalises its two vertices, so an edge-line axis had a sign
+/// that came from vertex numbering and could flip between two visually identical meshes. A face normal has a
+/// sign that comes from winding, which is the geometry's own.
+///
+/// A boundary edge has one face to average, so it tilts with that face; an edge a stale selection still
+/// names has none, contributes nothing, and the frame falls back to world.
 pub fn selection_axis(
     mesh: &HalfEdgeMesh,
     mode: EditMode,
@@ -308,9 +314,13 @@ pub fn selection_axis(
         }
         EditMode::Edge => {
             for &edge in selection.edges() {
-                let start = mesh.vertex_position(VertexId(edge.0));
-                let end = mesh.vertex_position(VertexId(edge.1));
-                total += end - start;
+                // Both faces that meet at the edge, or just the one a boundary edge has. `edge_faces`
+                // answers (None, None) for an id the mesh no longer has, so a stale selection contributes
+                // nothing and the frame falls back rather than pointing at a deleted edge.
+                let (own, neighbour) = mesh.edge_faces(edge);
+                for face in own.into_iter().chain(neighbour) {
+                    total += mesh.face_normal(face);
+                }
             }
         }
         EditMode::Vertex => {
@@ -473,6 +483,7 @@ pub fn project_ray_onto_axis(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::FaceId;
     use crate::selection::Selection;
 
     fn cube() -> HalfEdgeMesh {
@@ -896,5 +907,85 @@ mod tests {
         // Ray pointing straight along +X
         let ray = Ray::new(Point3::new(-5.0, 0.0, 0.0), Vector3::new(1.0, 0.0, 0.0));
         assert_eq!(project_ray_onto_axis(pivot, axis, &ray), None);
+    }
+
+    #[test]
+    fn an_edge_aims_the_gizmo_between_the_faces_that_meet_at_it() {
+        let mesh = cube();
+        let mut selection = Selection::new();
+        selection.apply_click(Some(crate::mesh::EdgeId(0, 1)), false, Selection::edges_mut);
+        let axis = selection_axis(&mesh, EditMode::Edge, &selection).expect("a live edge aims");
+        let bisector = Vector3::new(0.0, -1.0, 1.0) / 2.0f32.sqrt();
+        assert!(
+            (axis - bisector).magnitude() < 1e-6,
+            "expected the bisector of the front and bottom faces, got {axis:?}"
+        );
+    }
+
+    #[test]
+    fn a_face_aims_the_gizmo_straight_out_of_itself() {
+        let mesh = cube();
+        let mut selection = Selection::new();
+        selection.faces_mut().insert(FaceId(0));
+        let axis = selection_axis(&mesh, EditMode::Face, &selection).expect("a live face aims");
+        assert!(
+            (axis - mesh.face_normal(FaceId(0))).magnitude() < 1e-6,
+            "a lone face must aim along its own normal, got {axis:?}"
+        );
+    }
+
+    #[test]
+    fn a_vertex_aims_the_gizmo_the_way_the_faces_around_it_do() {
+        let mesh = cube();
+        let mut selection = Selection::new();
+        selection.vertices_mut().insert(VertexId(0));
+        let axis = selection_axis(&mesh, EditMode::Vertex, &selection).expect("a live vertex aims");
+        // Three faces meet at a corner of the cube, so the average points out along the diagonal.
+        let diagonal = Vector3::new(-1.0, -1.0, 1.0) / 3.0f32.sqrt();
+        assert!(
+            (axis - diagonal).magnitude() < 1e-5,
+            "expected the corner's outward diagonal, got {axis:?}"
+        );
+    }
+
+    #[test]
+    fn a_selection_that_points_two_ways_has_no_axis_to_offer() {
+        let mesh = cube();
+
+        // Faces 0 and 2 are the front and the back, so their normals are exactly opposed.
+        let mut faces = Selection::new();
+        faces.faces_mut().insert(FaceId(0));
+        faces.faces_mut().insert(FaceId(2));
+        assert!(
+            selection_axis(&mesh, EditMode::Face, &faces).is_none(),
+            "opposite normals cancel, and a gizmo that pushed by a zero vector would move nothing"
+        );
+
+        // The two horizontal edges at opposite corners of the cube: front-bottom bisects to
+        // (0, -1, 1) and back-top bisects to (0, 1, -1), so the pair sums to nothing.
+        let mut edges = Selection::new();
+        edges.edges_mut().insert(crate::mesh::EdgeId(0, 1));
+        edges.edges_mut().insert(crate::mesh::EdgeId(6, 7));
+        assert!(
+            selection_axis(&mesh, EditMode::Edge, &edges).is_none(),
+            "a selection whose bisectors cancel must fall back to world, not aim at zero"
+        );
+    }
+
+    #[test]
+    fn a_stale_selection_contributes_nothing_rather_than_pointing_at_nothing() {
+        let mesh = cube();
+        let mut selection = Selection::new();
+        selection.faces_mut().insert(FaceId(99));
+        selection.edges_mut().insert(crate::mesh::EdgeId(40, 41));
+        selection.vertices_mut().insert(VertexId(99));
+
+        for mode in [EditMode::Face, EditMode::Edge, EditMode::Vertex] {
+            assert!(
+                selection_axis(&mesh, mode, &selection).is_none(),
+                "an id the mesh no longer has must yield no axis in {mode:?}, so the gizmo falls back \
+                 to world instead of aiming at a deleted component"
+            );
+        }
     }
 }
