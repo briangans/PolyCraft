@@ -3,6 +3,7 @@
 //! Anything that changes the mesh or the selection goes through here, which flags the document as
 //! dirty. `State::render` checks that flag once per frame and re-uploads the GPU buffers.
 
+use crate::gizmo::Space;
 use crate::history::HistoryStack;
 use crate::mesh::{FaceId, HalfEdgeMesh, TopologyErrors};
 use crate::picking::{self, Ray};
@@ -77,6 +78,8 @@ pub struct Scene {
     dirty: bool,
     mode: EditMode,
     tool: Tool,
+    /// Which orientation the transform gizmo is drawn and dragged in. Maya's "reference system".
+    space: Space,
     selection: Selection,
     history: HistoryStack<DocumentSnapshot>,
     /// An extrude waiting for the mouse to give it a depth. `None` the rest of the time.
@@ -90,6 +93,7 @@ impl Scene {
             dirty: false,
             mode: EditMode::Object,
             tool: Tool::default(),
+            space: Space::default(),
             selection: Selection::new(),
             history: HistoryStack::new(HISTORY_DEPTH),
             extrude: None,
@@ -132,6 +136,30 @@ impl Scene {
     pub fn set_tool(&mut self, tool: Tool) {
         self.abandon_extrude();
         self.tool = tool;
+    }
+
+    /// Which orientation the transform gizmo is drawn and dragged in.
+    pub fn space(&self) -> Space {
+        self.space
+    }
+
+    /// Chooses the gizmo's reference system.
+    ///
+    /// Unlike [`Scene::set_mode`] and [`Scene::set_tool`] this does not abandon an armed extrude, because
+    /// it cannot strand one: an extrude travels along the normal of the faces it is moving, which no space
+    /// changes. Nor does it disturb a translate drag already in flight - `DragState` keeps the frame it was
+    /// grabbed with, so the arms can be redrawn in the new orientation without the geometry lurching
+    /// sideways mid-pull. The new space takes effect on the next grab.
+    ///
+    /// The document is not marked dirty: no vertex moved, and the handle is re-uploaded every frame anyway.
+    pub fn set_space(&mut self, space: Space) {
+        self.space = space;
+    }
+
+    /// Steps World -> Component -> World, so a single control cycles the pair rather than needing a picker.
+    pub fn cycle_space(&mut self) {
+        let next = self.space.next();
+        self.set_space(next);
     }
 
     pub fn selection(&self) -> &Selection {

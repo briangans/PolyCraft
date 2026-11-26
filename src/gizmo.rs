@@ -21,7 +21,7 @@ use crate::mesh::{HalfEdgeMesh, VertexId};
 use crate::picking::{world_per_pixel, Ray};
 use crate::scene::EditMode;
 use crate::selection::Selection;
-use cgmath::{InnerSpace, Point3, Vector3};
+use cgmath::{vec3, InnerSpace, Point3, Vector3};
 
 /// Bright yellow highlight when an axis is hovered or actively dragged (Maya convention).
 pub const COLOR_AXIS_ACTIVE: [f32; 3] = [1.0, 0.90, 0.15];
@@ -233,6 +233,130 @@ impl Frame {
     }
 }
 
+/// Which orientation the transform gizmo is drawn and dragged in - Maya's "reference system" control.
+///
+/// `World` is the fixed coordinate frame the app has always used. `Component` takes the orientation from
+/// the geometry under the selection, which is what makes a move out of a tilted face draggable without
+/// hunting for the world axis that happens to point nearest it. It is the same arrangement the extrude
+/// handle already uses, reached here from the selection instead of from the faces about to travel.
+///
+/// There is deliberately no `Object` variant. The document holds one mesh whose vertices are stored in
+/// world coordinates - no transform, rotation or scale exists anywhere in `Scene` or `HalfEdgeMesh` - so
+/// an object frame would be numerically identical to `World` while implying a hierarchy the app does not
+/// have. Add the variant when an object transform lands, not before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Space {
+    /// The world axes, whatever is selected.
+    #[default]
+    World,
+    /// An axis derived from the selected components, with the other two spanning across it.
+    Component,
+}
+
+impl Space {
+    /// Every space, in the order the label cycles.
+    pub const ALL: [Space; 2] = [Space::World, Space::Component];
+
+    /// Name for the panel button.
+    pub fn label(self) -> &'static str {
+        match self {
+            Space::World => "World",
+            Space::Component => "Component",
+        }
+    }
+
+    /// The next space, so one control cycles rather than needing a picker.
+    pub fn next(self) -> Space {
+        match self {
+            Space::World => Space::Component,
+            Space::Component => Space::World,
+        }
+    }
+}
+
+/// The direction the selection itself points, for [`Space::Component`], or `None` when the geometry has
+/// no single answer.
+///
+/// Per mode: a face gives its own normal; an edge gives the line between its two corners; a vertex gives
+/// the average of the faces around it, which is the smooth shading direction and the one a user reading a
+/// rounded corner expects. `EditMode::Object` gives nothing, because there is no component geometry to
+/// read a direction out of.
+///
+/// `None` also covers the case where the selection points two ways at once - two opposite faces, or two
+/// edges running counter to each other - because their sum cancels, and pushing a selection by a zero
+/// vector would move it nowhere while looking like a live gizmo. Callers fall back to world rather than
+/// refusing to draw.
+///
+/// An edge's sign comes out of [`EdgeId`]'s canonical order rather than from either face, so it is stable
+/// but arbitrary: one selected edge gives an exact direction, several may cancel by accident as often as
+/// by design.
+pub fn selection_axis(
+    mesh: &HalfEdgeMesh,
+    mode: EditMode,
+    selection: &Selection,
+) -> Option<Vector3<f32>> {
+    let mut total = vec3(0.0, 0.0, 0.0);
+
+    match mode {
+        EditMode::Object => return None,
+        EditMode::Face => {
+            for &face in selection.faces() {
+                if face.0 < mesh.faces.len() {
+                    total += mesh.face_normal(face);
+                }
+            }
+        }
+        EditMode::Edge => {
+            for &edge in selection.edges() {
+                let start = mesh.vertex_position(VertexId(edge.0));
+                let end = mesh.vertex_position(VertexId(edge.1));
+                total += end - start;
+            }
+        }
+        EditMode::Vertex => {
+            for &vertex in selection.vertices() {
+                for &half_edge in &mesh.outgoing_half_edges(vertex) {
+                    if let Some(face) = mesh.half_edges[half_edge.0].face {
+                        total += mesh.face_normal(face);
+                    }
+                }
+            }
+        }
+    }
+
+    // `normalize` on a zero vector hands back NaN in every component, which would draw an arm pointing at
+    // nothing and project the cursor onto a direction that does not exist.
+    let magnitude = total.magnitude();
+    if magnitude.is_finite() && magnitude > 0.0 {
+        Some(total / magnitude)
+    } else {
+        None
+    }
+}
+
+/// The frame the transform gizmo should use for the current selection and [`Space`], or `None` when there
+/// is nothing to anchor it to.
+///
+/// `Space::Component` falls back to [`Frame::world`] wherever [`selection_axis`] has no answer, rather
+/// than hiding the gizmo: a user who has switched to component space and then clicked a whole object
+/// still needs to move it, and a vanished gizmo reads as a bug in the tool rather than as an empty
+/// selection. The fallback is silent by design - the geometry simply has no preferred direction.
+pub fn frame_for(
+    mesh: &HalfEdgeMesh,
+    mode: EditMode,
+    selection: &Selection,
+    space: Space,
+) -> Option<Frame> {
+    let pivot = pivot(mesh, mode, selection)?;
+    if space == Space::World {
+        return Some(Frame::world(pivot));
+    }
+    let frame = selection_axis(mesh, mode, selection)
+        .and_then(|axis| Frame::from_axis(pivot, axis))
+        .unwrap_or_else(|| Frame::world(pivot));
+    Some(frame)
+}
+
 /// The three arms of a frame at world `length`, with `active_axis` highlighted in bright yellow.
 ///
 /// This is the only place arm endpoints are computed, so drawing and picking cannot drift apart - a
@@ -256,26 +380,27 @@ pub fn arms(frame: &Frame, length: f32, active_axis: Option<GizmoAxis>) -> Vec<A
         .collect()
 }
 
-/// The translate gizmo's arms for the current selection and camera, in world space: anchored at the
-/// selection's pivot, each world-long enough to measure `AXIS_LENGTH_PIXELS` at the pivot's depth.
-/// Empty with no selection, or for a degenerate view where an arm would have no size.
-pub fn translate_arms(
-    mesh: &HalfEdgeMesh,
-    mode: EditMode,
-    selection: &Selection,
+/// The three arms of `frame`, each long enough to measure `AXIS_LENGTH_PIXELS` at the frame's own depth.
+///
+/// Takes the frame rather than the selection because drawing and picking must agree exactly on where an
+/// arm is: the two used to build their own world frame from the pivot independently, which was harmless
+/// only while every gizmo was world-aligned. With [`Space::Component`] a drift between them would put the
+/// click target on a different line than the one the user aimed at, and a component-space gizmo whose
+/// arms tilt while the drag follows a world axis is worse still - it lies about where the geometry will
+/// go. Both callers now take their frame from the same [`frame_for`].
+///
+/// Empty for a degenerate view where an arm would have no size.
+pub fn frame_arms(
+    frame: &Frame,
     camera_eye: Point3<f32>,
     viewport_height: f32,
     active_axis: Option<GizmoAxis>,
 ) -> Vec<Arm> {
-    let pivot = match pivot(mesh, mode, selection) {
-        Some(pivot) => pivot,
-        None => return Vec::new(),
-    };
-    let length = axis_world_length(pivot, camera_eye, viewport_height);
+    let length = axis_world_length(frame.origin, camera_eye, viewport_height);
     if length <= 0.0 {
         return Vec::new();
     }
-    arms(&Frame::world(pivot), length, active_axis)
+    arms(frame, length, active_axis)
 }
 
 /// Tests if a ray passes within `tolerance_pixels` of any arm of `frame`.
@@ -317,24 +442,6 @@ pub fn pick_frame_axis(
     }
 
     best.map(|(_, axis)| axis)
-}
-
-/// Tests if a ray passes within `tolerance_pixels` of any arm of the world-space gizmo at `pivot`.
-pub fn pick_gizmo_axis(
-    pivot: Point3<f32>,
-    camera_eye: Point3<f32>,
-    viewport_height: f32,
-    ray: &Ray,
-    tolerance_pixels: f32,
-) -> Option<GizmoAxis> {
-    let length = axis_world_length(pivot, camera_eye, viewport_height);
-    pick_frame_axis(
-        &Frame::world(pivot),
-        length,
-        ray,
-        tolerance_pixels,
-        viewport_height,
-    )
 }
 
 /// Calculates the scalar parameter `t` along the axis line `L(t) = pivot + t * axis_direction`
@@ -486,12 +593,32 @@ mod tests {
         assert_eq!(GizmoAxis::from_index(3), None);
     }
 
+    /// The arms the translate gizmo draws, assembled exactly as `State` assembles them: one call to
+    /// [`frame_for`], then that frame's arms. The module used to offer a `translate_arms` that did both
+    /// internally, which meant the renderer's pick path and its draw path each derived their own frame -
+    /// harmless while every gizmo was world-aligned, and a misaligned handle the moment they are not.
+    fn translate_arms(
+        mesh: &HalfEdgeMesh,
+        mode: EditMode,
+        selection: &Selection,
+        space: Space,
+        eye: Point3<f32>,
+        active: Option<GizmoAxis>,
+    ) -> Vec<Arm> {
+        let Some(frame) = frame_for(mesh, mode, selection, space) else {
+            return Vec::new();
+        };
+        frame_arms(&frame, eye, VIEWPORT, active)
+    }
+
+    const VIEWPORT: f32 = 600.0;
+
     #[test]
     fn translate_arms_returns_empty_when_no_selection() {
         let mesh = cube();
         let selection = Selection::new();
         let eye = Point3::new(0.0, 0.0, 3.0);
-        let arms = translate_arms(&mesh, EditMode::Vertex, &selection, eye, 600.0, None);
+        let arms = translate_arms(&mesh, EditMode::Vertex, &selection, Space::World, eye, None);
         assert!(arms.is_empty(), "unselected mesh must yield no gizmo arms");
     }
 
@@ -501,7 +628,7 @@ mod tests {
         let mut selection = Selection::new();
         selection.apply_click(Some(VertexId(0)), false, Selection::vertices_mut);
         let eye = Point3::new(0.0, 0.0, 3.0);
-        let arms = translate_arms(&mesh, EditMode::Vertex, &selection, eye, 600.0, None);
+        let arms = translate_arms(&mesh, EditMode::Vertex, &selection, Space::World, eye, None);
         assert_eq!(arms.len(), 3, "must yield X, Y, and Z axes");
 
         let expected_pivot = mesh.vertex_position(VertexId(0));
@@ -541,8 +668,8 @@ mod tests {
             &mesh,
             EditMode::Vertex,
             &selection,
+            Space::World,
             eye,
-            600.0,
             Some(GizmoAxis::Y),
         );
         assert_eq!(arms_highlight_y[0].color, COLOR_AXIS_X);
@@ -691,8 +818,27 @@ mod tests {
         );
     }
 
+    /// Picks the world-aligned gizmo the way `State` now does: take the frame, then pick that frame's
+    /// arms. The `pick_gizmo_axis` this replaces was a second route to the same answer, and a second
+    /// route is exactly where a component-space handle starts lying about where it is.
+    fn pick_world_axis(
+        pivot: Point3<f32>,
+        eye: Point3<f32>,
+        viewport_height: f32,
+        ray: &Ray,
+    ) -> Option<GizmoAxis> {
+        let length = axis_world_length(pivot, eye, viewport_height);
+        pick_frame_axis(
+            &Frame::world(pivot),
+            length,
+            ray,
+            GIZMO_PICK_TOLERANCE_PIXELS,
+            viewport_height,
+        )
+    }
+
     #[test]
-    fn pick_gizmo_axis_finds_axis_within_pixel_tolerance() {
+    fn a_world_gizmo_is_picked_within_pixel_tolerance() {
         let pivot = Point3::new(0.0, 0.0, 0.0);
         let eye = Point3::new(0.0, 0.0, 3.0);
         let viewport_height = 600.0;
@@ -703,31 +849,23 @@ mod tests {
         let target = Point3::new(arm_len * 0.5, 0.0, 0.0);
         let ray = Ray::new(eye, target - eye);
 
-        let hit = pick_gizmo_axis(
-            pivot,
-            eye,
-            viewport_height,
-            &ray,
-            GIZMO_PICK_TOLERANCE_PIXELS,
+        assert_eq!(
+            pick_world_axis(pivot, eye, viewport_height, &ray),
+            Some(GizmoAxis::X)
         );
-        assert_eq!(hit, Some(GizmoAxis::X));
 
         // Aim ray directly at the midpoint of the Y axis arm (0, arm_len * 0.5, 0)
         let target_y = Point3::new(0.0, arm_len * 0.5, 0.0);
         let ray_y = Ray::new(eye, target_y - eye);
 
-        let hit_y = pick_gizmo_axis(
-            pivot,
-            eye,
-            viewport_height,
-            &ray_y,
-            GIZMO_PICK_TOLERANCE_PIXELS,
+        assert_eq!(
+            pick_world_axis(pivot, eye, viewport_height, &ray_y),
+            Some(GizmoAxis::Y)
         );
-        assert_eq!(hit_y, Some(GizmoAxis::Y));
     }
 
     #[test]
-    fn pick_gizmo_axis_returns_none_when_ray_misses() {
+    fn a_world_gizmo_returns_none_when_the_ray_misses() {
         let pivot = Point3::new(0.0, 0.0, 0.0);
         let eye = Point3::new(0.0, 0.0, 3.0);
         let viewport_height = 600.0;
@@ -736,14 +874,7 @@ mod tests {
         let target = Point3::new(5.0, 5.0, 0.0);
         let ray = Ray::new(eye, target - eye);
 
-        let hit = pick_gizmo_axis(
-            pivot,
-            eye,
-            viewport_height,
-            &ray,
-            GIZMO_PICK_TOLERANCE_PIXELS,
-        );
-        assert_eq!(hit, None);
+        assert_eq!(pick_world_axis(pivot, eye, viewport_height, &ray), None);
     }
 
     #[test]

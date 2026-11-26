@@ -12,7 +12,7 @@ use crate::picking::Ray;
 use crate::render_types::{CameraUniform, GpuVertex};
 use crate::scene::{ExtrudeCommit, Scene};
 use crate::tool::Tool;
-use crate::ui::{UiContext, UiState};
+use crate::ui::{UiContext, UiResponse, UiState};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -215,7 +215,12 @@ impl DragAnchor {
 
 struct DragState {
     axis: GizmoAxis,
-    pivot: cgmath::Point3<f32>,
+    /// The orientation this drag was grabbed in, kept for its whole life rather than re-read each event.
+    ///
+    /// Re-deriving it from the selection would make the drag follow the *current* space while the arms the
+    /// user is pulling were drawn in another, and would also let a selection change mid-drag swing the
+    /// travel axis under the cursor. Both draw and pick read the same value back out of here.
+    frame: gizmo::Frame,
     anchor: DragAnchor,
     initial_positions: Vec<(VertexId, cgmath::Point3<f32>)>,
 }
@@ -321,6 +326,7 @@ enum Hotkey {
     Undo,
     Redo,
     Extrude,
+    CycleSpace,
 }
 
 /// The Maya keymap, as a pure function of the physical key and the Ctrl / Shift modifiers.
@@ -332,6 +338,12 @@ enum Hotkey {
 /// `Ctrl+E` intended as a menu mnemonic would silently switch to Rotate. They also require Shift
 /// released, which is what frees `Shift+E` for extrude - Maya binds extrude to a shelf button rather
 /// than a key, so this follows the `Shift` + letter convention the rest of the map already uses.
+///
+/// `X` is a deliberate divergence rather than a Maya keymap copy: bare `x` is Maya's press-and-release
+/// "snap to grids", and this app has no snapping of any kind yet, so there is nothing here for it to
+/// conflict with. It sits with the tool keys rather than outside them so the same modifier guard applies
+/// (`Ctrl+X` is Cut everywhere, and must not reorient the handle). When snapping lands, it will need this
+/// key back or a different home for the reference system - hence the note.
 fn hotkey_for(key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> Option<Hotkey> {
     use winit::keyboard::KeyCode as Key;
 
@@ -357,6 +369,7 @@ fn hotkey_for(key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> Option<
         Key::KeyW => Some(Hotkey::SetTool(Tool::Translate)),
         Key::KeyE => Some(Hotkey::SetTool(Tool::Rotate)),
         Key::KeyR => Some(Hotkey::SetTool(Tool::Scale)),
+        Key::KeyX => Some(Hotkey::CycleSpace),
         Key::Escape => Some(Hotkey::CancelDrag),
         _ => None,
     }
@@ -705,6 +718,13 @@ impl<'a> State<'a> {
                 self.begin_extrude_drag();
                 true
             }
+            Some(Hotkey::CycleSpace) => {
+                self.scene.cycle_space();
+                // Echoed because the only other signal is the handle reorienting, which is easy to miss on
+                // a face whose normal already runs along a world axis.
+                self.notice = Some(format!("Gizmo space: {}", self.scene.space().label()));
+                true
+            }
             None => false,
         }
     }
@@ -905,6 +925,50 @@ impl<'a> State<'a> {
         self.num_dot_vertices = num_dot_vertices;
     }
 
+    /// The frame the transform gizmo is drawn and picked in this frame, or `None` when there is nothing to
+    /// anchor it to.
+    ///
+    /// One accessor feeding the draw path and both pick paths, because a handle drawn from one frame and
+    /// clicked against another puts the click target on a different line than the one the user aimed at.
+    /// That was invisible while every gizmo was world-aligned; with [`gizmo::Space::Component`] tilting the
+    /// arms it becomes a handle that picks nothing.
+    ///
+    /// A drag in flight reports the frame it was grabbed with rather than the current one, so pressing the
+    /// space toggle mid-pull cannot redraw the arms somewhere else while the geometry keeps travelling along
+    /// the arm actually held.
+    fn gizmo_frame(&self) -> Option<gizmo::Frame> {
+        if let Some(drag) = self.drag_state.as_ref() {
+            return Some(drag.frame);
+        }
+        gizmo::frame_for(
+            self.scene.mesh(),
+            self.scene.mode(),
+            self.scene.selection(),
+            self.scene.space(),
+        )
+    }
+
+    /// Which arm of `frame` the cursor is over, or `None` for none of them.
+    ///
+    /// The arm length has to come from the frame's own depth rather than the selection's, so this computes
+    /// it the way [`gizmo::frame_arms`] does; sharing one pick helper across hover and press is what keeps
+    /// the two from disagreeing about where an arm ends.
+    fn gizmo_axis_under(
+        &self,
+        frame: gizmo::Frame,
+        ray: &Ray,
+        viewport_height: f32,
+    ) -> Option<GizmoAxis> {
+        let length = gizmo::axis_world_length(frame.origin, self.camera.eye(), viewport_height);
+        gizmo::pick_frame_axis(
+            &frame,
+            length,
+            ray,
+            gizmo::GIZMO_PICK_TOLERANCE_PIXELS,
+            viewport_height,
+        )
+    }
+
     fn upload_gizmo(&mut self) {
         // An armed extrude owns the handle: the axis it will travel along is the depth control, so it
         // replaces the translate gizmo for as long as the drag is open, whatever tool is selected. Only
@@ -937,14 +1001,15 @@ impl<'a> State<'a> {
             .map(|d| d.axis)
             .or(self.hovered_axis);
 
-        let arms = gizmo::translate_arms(
-            self.scene.mesh(),
-            self.scene.mode(),
-            self.scene.selection(),
-            self.camera.eye(),
-            self.config.height as f32,
-            active_axis,
-        );
+        let arms = match self.gizmo_frame() {
+            Some(frame) => gizmo::frame_arms(
+                &frame,
+                self.camera.eye(),
+                self.config.height as f32,
+                active_axis,
+            ),
+            None => Vec::new(),
+        };
         let vertices = overlay::gizmo_line_vertices(&arms);
         self.num_gizmo_vertices = vertices.len() as u32;
         if self.num_gizmo_vertices > 0 {
@@ -982,12 +1047,12 @@ impl<'a> State<'a> {
             if self.extrude_state.is_some() {
                 self.track_extrude_drag(&ray);
             } else if let Some(drag) = self.drag_state.as_mut() {
-                let axis_dir = drag.axis.unit_vector();
+                let travel = drag.frame.direction(drag.axis);
                 if let Some(current_param) =
-                    gizmo::project_ray_onto_axis(drag.pivot, axis_dir, &ray)
+                    gizmo::project_ray_onto_axis(drag.frame.origin, travel, &ray)
                 {
                     drag.anchor.advance(current_param, f32::MAX);
-                    let delta_vec = axis_dir * drag.anchor.applied;
+                    let delta_vec = travel * drag.anchor.applied;
                     self.scene
                         .translate_vertices(&drag.initial_positions, delta_vec);
                 }
@@ -996,19 +1061,9 @@ impl<'a> State<'a> {
                 && !self.ui_state.pie_menu_active
                 && !self.egui_ctx.wants_pointer_input()
             {
-                if let Some(pivot) =
-                    gizmo::pivot(self.scene.mesh(), self.scene.mode(), self.scene.selection())
-                {
-                    self.hovered_axis = gizmo::pick_gizmo_axis(
-                        pivot,
-                        self.camera.eye(),
-                        height,
-                        &ray,
-                        gizmo::GIZMO_PICK_TOLERANCE_PIXELS,
-                    );
-                } else {
-                    self.hovered_axis = None;
-                }
+                self.hovered_axis = self
+                    .gizmo_frame()
+                    .and_then(|frame| self.gizmo_axis_under(frame, &ray, height));
             } else {
                 self.hovered_axis = None;
             }
@@ -1037,31 +1092,18 @@ impl<'a> State<'a> {
             {
                 let height = self.config.height as f32;
                 if let Some(ray) = self.cursor_ray() {
-                    let hit_axis = if self.scene.tool() == Tool::Translate {
-                        gizmo::pivot(self.scene.mesh(), self.scene.mode(), self.scene.selection())
-                            .and_then(|pivot| {
-                                gizmo::pick_gizmo_axis(
-                                    pivot,
-                                    self.camera.eye(),
-                                    height,
-                                    &ray,
-                                    gizmo::GIZMO_PICK_TOLERANCE_PIXELS,
-                                )
-                            })
+                    let frame = if self.scene.tool() == Tool::Translate {
+                        self.gizmo_frame()
                     } else {
                         None
                     };
+                    let hit_axis =
+                        frame.and_then(|frame| self.gizmo_axis_under(frame, &ray, height));
 
-                    if let Some(axis) = hit_axis {
-                        let pivot = gizmo::pivot(
-                            self.scene.mesh(),
-                            self.scene.mode(),
-                            self.scene.selection(),
-                        )
-                        .unwrap();
+                    if let Some((frame, axis)) = frame.zip(hit_axis) {
                         let anchor = DragAnchor::at(gizmo::project_ray_onto_axis(
-                            pivot,
-                            axis.unit_vector(),
+                            frame.origin,
+                            frame.direction(axis),
                             &ray,
                         ));
                         let initial_positions: Vec<(VertexId, cgmath::Point3<f32>)> = self
@@ -1073,7 +1115,7 @@ impl<'a> State<'a> {
 
                         self.drag_state = Some(DragState {
                             axis,
-                            pivot,
+                            frame,
                             anchor,
                             initial_positions,
                         });
@@ -1113,6 +1155,40 @@ impl<'a> State<'a> {
         }
     }
 
+    /// Carries out what the panel asked for this frame.
+    ///
+    /// A seam of its own because `ui.rs` reports intent only: nothing in the panel can reach `Scene`, which
+    /// is what keeps the history rules - abandoning an armed extrude before switching mode or tool - in one
+    /// place whether the command arrived from a button, the pie menu or a hotkey.
+    fn apply_ui_response(&mut self, response: UiResponse) {
+        if let Some(mode) = response.mode {
+            self.scene.set_mode(mode);
+        }
+        if let Some(tool) = response.tool {
+            self.scene.set_tool(tool);
+        }
+        if let Some(space) = response.space {
+            self.scene.set_space(space);
+        }
+        if response.undo {
+            self.undo();
+        }
+        if response.redo {
+            self.redo();
+        }
+        if response.extrude {
+            // The panel button means two different things depending on whether a drag is open, which is
+            // what its label says: arm a new extrude, or settle the one already travelling at the depth
+            // the mouse reached. Routing both through here keeps the viewport click and the button in
+            // agreement rather than each holding their own idea of the gesture's second half.
+            if self.scene.is_extruding() {
+                self.commit_extrude_drag();
+            } else {
+                self.begin_extrude_drag();
+            }
+        }
+    }
+
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -1140,32 +1216,11 @@ impl<'a> State<'a> {
                 redo_label: self.scene.redo_label(),
                 can_extrude: self.scene.can_extrude(),
                 extruding: self.scene.is_extruding(),
+                space: self.scene.space(),
                 notice: self.notice.as_deref(),
             },
         );
-        if let Some(mode) = ui_response.mode {
-            self.scene.set_mode(mode);
-        }
-        if let Some(tool) = ui_response.tool {
-            self.scene.set_tool(tool);
-        }
-        if ui_response.undo {
-            self.undo();
-        }
-        if ui_response.redo {
-            self.redo();
-        }
-        if ui_response.extrude {
-            // The panel button means two different things depending on whether a drag is open, which is
-            // what its label says: arm a new extrude, or settle the one already travelling at the depth
-            // the mouse reached. Routing both through here keeps the viewport click and the button in
-            // agreement rather than each holding their own idea of the gesture's second half.
-            if self.scene.is_extruding() {
-                self.commit_extrude_drag();
-            } else {
-                self.begin_extrude_drag();
-            }
-        }
+        self.apply_ui_response(ui_response);
 
         if self.scene.take_dirty() {
             self.upload_mesh();
@@ -1361,6 +1416,18 @@ mod tests {
             hotkey_for(Key::Escape, false, true),
             Some(Hotkey::CancelDrag)
         );
+    }
+
+    #[test]
+    fn x_cycles_the_gizmo_reference_system() {
+        assert_eq!(
+            hotkey_for(Key::KeyX, false, false),
+            Some(Hotkey::CycleSpace)
+        );
+        // Held with a modifier it must stay quiet, or a `Ctrl+X` cut would silently reorient the handle
+        // instead of doing nothing at all.
+        assert_eq!(hotkey_for(Key::KeyX, true, false), None);
+        assert_eq!(hotkey_for(Key::KeyX, false, true), None);
     }
 
     #[test]

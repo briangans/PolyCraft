@@ -1,6 +1,7 @@
 //! UI layer (egui). It never mutates application state directly: `UiState::draw` returns what
 //! the user asked for (for example a new `EditMode`) and the caller applies it.
 
+use crate::gizmo::Space;
 use crate::scene::EditMode;
 use crate::tool::Tool;
 use egui::{Color32, Pos2, Rect, Vec2};
@@ -8,7 +9,7 @@ use egui::{Color32, Pos2, Rect, Vec2};
 /// The user intents returned by `UiState::draw`.
 ///
 /// Following the project architecture, `ui.rs` never mutates application state directly; it returns
-/// the user's intent to `main.rs`, which applies it to `Scene`.
+/// the user's intent and `State::apply_ui_response` in `renderer.rs` applies it to `Scene`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UiResponse {
     pub mode: Option<EditMode>,
@@ -21,6 +22,8 @@ pub struct UiResponse {
     /// is already open the same press settles it at the depth the mouse reached, so the panel can finish
     /// the gesture without the viewport.
     pub extrude: bool,
+    /// A reference-system button was clicked, so the caller re-orients the transform gizmo.
+    pub space: Option<Space>,
 }
 
 /// Everything the UI displays for this frame, handed to [`UiState::draw`].
@@ -45,6 +48,9 @@ pub struct UiContext<'a> {
     /// are already moving and a second one cannot start, so the button shows what the next click will do
     /// instead of offering the command again.
     pub extruding: bool,
+    /// Which orientation the transform gizmo is currently drawn and dragged in, so the button beside it can
+    /// show the one that is live.
+    pub space: Space,
     /// The outcome of the last command, echoed under the buttons the way Maya's command line does it.
     pub notice: Option<&'a str>,
 }
@@ -130,6 +136,7 @@ impl UiState {
             redo_label,
             can_extrude,
             extruding,
+            space: current_space,
             notice,
         } = current;
         let mut response = UiResponse::default();
@@ -231,9 +238,23 @@ impl UiState {
                         response.tool = Some(Tool::Scale);
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Gizmo:");
+                    // The reference system the handle is drawn and dragged in. Both values stay clickable
+                    // at all times: Component falls back to the world axes wherever the selection has no
+                    // single direction of its own, so the control is never offering something that will do
+                    // nothing - it just has less to say in Object mode.
+                    for candidate in Space::ALL {
+                        if ui
+                            .selectable_label(current_space == candidate, candidate.label())
+                            .clicked()
+                        {
+                            response.space = Some(candidate);
+                        }
+                    }
+                });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    // The buttons report intent only; the caller owns the history and applies it.
                     let undo_button = egui::Button::new(history_button_text("Undo", undo_label));
                     if ui.add_enabled(can_undo, undo_button).clicked() {
                         response.undo = true;
@@ -323,6 +344,19 @@ mod tests {
         assert_eq!(slot_toward(Vec2::new(60.0, 40.0)), Some(EditMode::Object));
     }
 
+    #[test]
+    fn an_exact_diagonal_falls_to_whichever_slot_comes_later_in_the_table() {
+        // The pie has four slots, not eight, so a flick down a diagonal is not a fifth choice - it is a
+        // tie between two, and `max_by` takes the last maximum. Pinning the outcome is not about the
+        // direction a person can hit by eye (a true 45.000... degrees is unreachable with a mouse); it is
+        // that the answer comes from the ORDER of `pie_slots()`. Reordering that table to move a button
+        // round the dial would otherwise change tie behaviour as a silent side effect.
+        assert_eq!(slot_toward(Vec2::new(30.0, 30.0)), Some(EditMode::Face));
+        assert_eq!(slot_toward(Vec2::new(30.0, -30.0)), Some(EditMode::Object));
+        assert_eq!(slot_toward(Vec2::new(-30.0, 30.0)), Some(EditMode::Vertex));
+        assert_eq!(slot_toward(Vec2::new(-30.0, -30.0)), Some(EditMode::Vertex));
+    }
+
     // Frame-level tests: drive `UiState::draw` through egui with synthetic input, no window needed.
 
     fn space_event(pressed: bool) -> egui::Event {
@@ -349,6 +383,7 @@ mod tests {
             can_extrude: false,
             extruding: false,
             notice: None,
+            space: Space::World,
         }
     }
 
@@ -700,6 +735,7 @@ mod tests {
             can_extrude: false,
             extruding: false,
             notice: None,
+            space: Space::World,
         }
     }
 
@@ -745,5 +781,31 @@ mod tests {
         let response = click_button_labelled(undoable_context(), "Undo - Move Vertex");
         assert_eq!(response.mode, None);
         assert_eq!(response.tool, None);
+    }
+
+    #[test]
+    fn clicking_the_other_reference_system_reports_the_space_intent() {
+        // The panel is drawn with World selected, so the Component label is the one that changes
+        // something. Asserting nothing else moved matters as much as the field that did: the row sits
+        // directly above the history buttons, and a mis-set `space` is otherwise easy to mistake for a
+        // stray undo when reading a frame back.
+        let response = click_button_labelled(test_context(), "Component");
+        assert_eq!(response.space, Some(Space::Component));
+        assert_eq!(response.mode, None);
+        assert_eq!(response.tool, None);
+        assert!(!response.undo && !response.redo && !response.extrude);
+    }
+
+    #[test]
+    fn the_reference_system_row_offers_both_spaces_even_with_nothing_selected() {
+        // Component falls back to the world axes when the selection has no direction of its own, so
+        // grey-ing it out in Object mode would be the panel hiding a control that does have an effect -
+        // it is how the user gets BACK to World after extruding in Face mode.
+        let response = click_button_labelled(test_context(), "World");
+        assert_eq!(
+            response.space,
+            Some(Space::World),
+            "the row must stay live rather than appearing disabled"
+        );
     }
 }
