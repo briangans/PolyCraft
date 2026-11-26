@@ -58,6 +58,24 @@ pub struct EdgeLoopCommit {
     pub new_vertices: usize,
 }
 
+/// How far a bevel cuts along each edge meeting the one it trims, as a fraction of those edges.
+///
+/// A fraction rather than a distance so one setting reads the same on a unit cube and on a hundred-unit
+/// terrain, which is the form [`crate::mesh_edit::HalfEdgeMesh::bevel_edge`] takes. Deliberately modest: a
+/// bevel is meant to read as a rounded edge, and past about a third the facet starts eating the faces
+/// either side of it instead of standing between them.
+pub const BEVEL_AMOUNT: f32 = 0.2;
+
+/// What a settled bevel did, for the command echo.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BevelCommit {
+    /// The facet opened between the two faces the trimmed edge used to join.
+    pub facet: FaceId,
+    /// The four edges now bounding that facet, in order around it. They take over the selection, because
+    /// the edge the user had picked no longer names a pair of vertices on the mesh.
+    pub facet_edges: [EdgeId; 4],
+}
+
 /// An extrude awaiting the depth the mouse is giving it.
 #[derive(Clone, Debug)]
 struct ActiveExtrude {
@@ -422,6 +440,80 @@ impl Scene {
             count => Err(vec![format!(
                 "an edge loop runs through one edge at a time and {count} are selected; two of them can \
                  name the same ring, so narrow the selection to the edge you want cut"
+            )]),
+        }
+    }
+
+    /// Whether a bevel can be applied here: one, and only one, edge selected in Edge mode.
+    ///
+    /// Shared by the hotkey seam and the Tools panel so the button greys out for exactly the reason the key
+    /// does nothing. One at a time is a real limit rather than a shortcut: a bevel relocates the corners it
+    /// passes through, so a second selected edge sharing a vertex with the first would be measured from a
+    /// corner that has already slid. Disjoint edges would survive it, but telling the two cases apart means
+    /// walking the whole selection's adjacency here, and guessing wrong puts a facet in the wrong place -
+    /// worse than asking.
+    pub fn can_bevel(&self) -> bool {
+        self.mode == EditMode::Edge && self.live_edges().len() == 1
+    }
+
+    /// Trims the single selected edge and fills the gap with a flat facet: Maya's *Bevel*. One undoable
+    /// step.
+    ///
+    /// The four edges bounding the new facet take over the selection, because the edge that was picked can
+    /// no longer be trusted to mean what the user clicked. A bevel reuses both of its endpoints as corners
+    /// of the facet, so the same `EdgeId` still resolves - see the note on id reuse in
+    /// [`crate::mesh_edit::HalfEdgeMesh::bevel_edge`] - and a highlight left on it would sit a bevel's width
+    /// away from where the pointer was. Rebuilding the selection from the facet's own outline is the only
+    /// way the highlight tracks what the command actually made.
+    ///
+    /// Returns what the bevel opened, or every reason nothing happened, the document untouched.
+    pub fn bevel_selected_edge(&mut self) -> Result<BevelCommit, TopologyErrors> {
+        let edge = self.bevel_target()?;
+
+        self.begin_action("Bevel Edge");
+        let mut mesh = self.mesh.clone();
+        match mesh.bevel_edge(edge, BEVEL_AMOUNT) {
+            Ok(shape) => {
+                let [a, b, c, d] = shape.corners;
+                let facet_edges = [
+                    EdgeId::between(a, b),
+                    EdgeId::between(b, c),
+                    EdgeId::between(c, d),
+                    EdgeId::between(d, a),
+                ];
+                self.mesh = mesh;
+                self.dirty = true;
+                self.selection.edges_mut().clear();
+                self.selection.edges_mut().extend(facet_edges);
+                self.end_action();
+                Ok(BevelCommit {
+                    facet: shape.face,
+                    facet_edges,
+                })
+            }
+            Err(errors) => {
+                // Nothing reached the document, so there is no step worth recording - and an action left
+                // open would file the *next* edit under this one.
+                self.cancel_action();
+                Err(errors)
+            }
+        }
+    }
+
+    /// The one edge to trim, or why the selection cannot name one.
+    fn bevel_target(&self) -> Result<EdgeId, TopologyErrors> {
+        let edges = self.live_edges();
+        match edges.len() {
+            0 if self.mode != EditMode::Edge => Err(vec![
+                "a bevel trims edges, so switch to Edge mode and select the edge to round".to_string(),
+            ]),
+            0 => Err(vec![
+                "a bevel needs one edge selected; click an edge of the mesh first".to_string(),
+            ]),
+            1 => Ok(edges[0]),
+            count => Err(vec![format!(
+                "a bevel trims one edge at a time and {count} are selected; the bevel moves the corners it \
+                 passes through, so pick the single edge you want rounded"
             )]),
         }
     }
@@ -1626,6 +1718,160 @@ mod tests {
         let errors = scene
             .insert_edge_loop()
             .expect_err("a dead edge names nothing to cut");
+        expect_reason(&errors, "needs one edge selected");
+    }
+
+    #[test]
+    fn a_bevel_needs_exactly_one_edge_selected_in_edge_mode() {
+        // The same four states the loop cut offers, because the bevel button reads the same rule: wrong
+        // mode, right mode nothing picked, one picked, and the ambiguous case.
+        let mut object_mode = Scene::new();
+        object_mode
+            .selection
+            .edges_mut()
+            .insert(EdgeId::between(VertexId(0), VertexId(1)));
+        assert!(
+            !object_mode.can_bevel(),
+            "Object mode has no edge for a bevel to trim"
+        );
+
+        assert!(
+            !edge_mode_scene().can_bevel(),
+            "Edge mode with nothing selected"
+        );
+
+        let mut one = edge_mode_scene();
+        one.selection
+            .edges_mut()
+            .insert(EdgeId::between(VertexId(0), VertexId(1)));
+        assert!(one.can_bevel(), "one edge is exactly what is wanted");
+
+        let two = scene_with_edges(&[
+            EdgeId::between(VertexId(0), VertexId(1)),
+            EdgeId::between(VertexId(2), VertexId(3)),
+        ]);
+        assert!(
+            !two.can_bevel(),
+            "a bevel moves the corners it passes through, so two at once is refused"
+        );
+    }
+
+    #[test]
+    fn beveling_a_cube_edge_opens_a_facet_and_hands_the_selection_to_it() {
+        let mut scene = scene_with_edges(&[EdgeId::between(VertexId(0), VertexId(1))]);
+
+        let bevel = scene
+            .bevel_selected_edge()
+            .unwrap_or_else(|errors| panic!("one cube edge should bevel cleanly: {errors:?}"));
+
+        assert_eq!(scene.mesh().faces.len(), 7, "the facet is the seventh face");
+        assert_eq!(scene.mesh().vertices.len(), 10);
+        assert_eq!(scene.mesh().edges().len(), 15);
+        assert!(scene.take_dirty(), "the renderer must be told to redraw");
+
+        let facet = bevel.facet;
+        assert_eq!(scene.mesh().face_vertices(facet).len(), 4);
+        assert_eq!(
+            bevel.facet_edges.len(),
+            scene.selection.edges().len(),
+            "the facet's own outline is what stays highlighted"
+        );
+        assert!(
+            scene.selection.edges().iter().all(|&edge| scene
+                .mesh()
+                .edges()
+                .iter()
+                .any(|&(live, _)| live == edge)),
+            "every edge left selected must exist on the mesh"
+        );
+        // The hazard the primitive's note on id reuse documents, pinned where a caller would trip over it:
+        // the trimmed edge's own pair still resolves afterwards, because both endpoints were reused as facet
+        // corners. It is not dangling - it names the facet's near edge, which is why a selection cannot be
+        // carried across a bevel and why the corners, not the ids, are the record of what moved.
+        let picked = EdgeId::between(VertexId(0), VertexId(1));
+        assert!(
+            scene.selection.edges().contains(&picked),
+            "the pair survives as one of the facet's four edges"
+        );
+        let before = HalfEdgeMesh::create_cube();
+        let moved =
+            |index: usize| scene.mesh().vertices[index].position != before.vertices[index].position;
+        assert!(
+            moved(0) && moved(1),
+            "and both endpoints slid, so the id that still resolves points at different geometry"
+        );
+    }
+
+    #[test]
+    fn beveling_a_cube_edge_is_one_undo_step() {
+        let before = HalfEdgeMesh::create_cube();
+        let mut scene = scene_with_edges(&[EdgeId::between(VertexId(0), VertexId(1))]);
+
+        scene
+            .bevel_selected_edge()
+            .expect("the bevel should cut cleanly");
+        assert_ne!(scene.mesh(), &before, "the cube changed");
+
+        assert!(scene.undo(), "one step back");
+        assert_eq!(
+            scene.mesh(),
+            &before,
+            "undo returns the whole cube, not a half-trimmed edge"
+        );
+        assert!(!scene.can_undo(), "and no half-step is left to unwind");
+    }
+
+    #[test]
+    fn a_bevel_refusal_changes_nothing_and_lands_no_history_step() {
+        let mut scene = scene_with_edges(&[
+            EdgeId::between(VertexId(0), VertexId(1)),
+            EdgeId::between(VertexId(2), VertexId(3)),
+        ]);
+
+        let errors = scene
+            .bevel_selected_edge()
+            .expect_err("two edges cannot be trimmed at once");
+        expect_reason(&errors, "one edge at a time");
+
+        assert_eq!(scene.mesh(), &HalfEdgeMesh::create_cube());
+        assert!(
+            !scene.can_undo(),
+            "a refused command must not appear in the undo chain"
+        );
+        assert_eq!(
+            scene.selection().edges().len(),
+            2,
+            "and must not move the selection"
+        );
+    }
+
+    #[test]
+    fn a_bevel_in_another_mode_says_which_mode_it_wants() {
+        let mut scene = Scene::new();
+        scene.set_mode(EditMode::Face);
+        scene.selection.faces_mut().insert(FaceId(0));
+
+        let errors = scene
+            .bevel_selected_edge()
+            .expect_err("a face cannot be trimmed by an edge bevel");
+        expect_reason(&errors, "switch to Edge mode");
+    }
+
+    #[test]
+    fn a_bevel_ignores_a_selection_left_stale_by_another_edit() {
+        // Same hazard the loop cut test documents: an id from a mesh that no longer exists, which is what a
+        // selection looks like after an undo or a load. Refused as nothing selected rather than answered with
+        // a facet the user cannot see.
+        let mut scene = edge_mode_scene();
+        scene
+            .selection
+            .edges_mut()
+            .insert(EdgeId::between(VertexId(200), VertexId(201)));
+
+        assert!(!scene.can_bevel());
+        let errors = scene
+            .bevel_selected_edge()
+            .expect_err("a dead edge names nothing to trim");
         expect_reason(&errors, "needs one edge selected");
     }
 }

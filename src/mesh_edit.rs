@@ -57,6 +57,15 @@ pub struct SplitEdge {
 /// refusal arrive as "an extrusion needs a non-zero offset" instead of a list of faces with no area.
 const MIN_EXTRUDE_OFFSET: f32 = 1e-6;
 
+/// How far two faces must tilt apart for [`HalfEdgeMesh::bevel_edge`] to find a facet worth opening.
+///
+/// Compared against the magnitude of the cross product of their unit normals, which is the sine of the
+/// angle between them - so unlike an area threshold it does not care how big the model is, and it refuses
+/// a hinge that is flat rather than a bevel that is small. A generous fraction of a degree: a corner that
+/// visibly creased is a corner the user can see they are beveling, and the thin facet it produces is real
+/// geometry they can still select and undo.
+const MIN_BEVEL_DIHEDRAL_SINE: f32 = 1e-4;
+
 /// What [`HalfEdgeMesh::split_face`] created: `face` cut in two along one new edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SplitFace {
@@ -99,6 +108,26 @@ pub struct Extruded {
     pub side_faces: Vec<FaceId>,
     /// The translated copy of every corner the region touched, in the order they were created.
     pub new_vertices: Vec<VertexId>,
+}
+
+/// What [`HalfEdgeMesh::bevel_edge`] created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Beveled {
+    /// The flat facet that now sits where the edge did.
+    pub face: FaceId,
+    /// Its corners in the order they are wound: the two cut points on the near face, then the two on the
+    /// far face, so the order reads around the facet rather than jumping across it.
+    pub corners: [VertexId; 4],
+    /// The two faces the edge bounded. Each keeps its corner count, having surrendered a strip of itself
+    /// to the facet.
+    pub shortened_faces: [FaceId; 2],
+    /// The two faces that met the edge at its endpoints. Each gained a corner, taking the shape of the
+    /// cut: a cube's neighbour becomes a pentagon.
+    pub trimmed_faces: [FaceId; 2],
+    /// The two vertices that were created, one at each end of the edge, on the far side of it. The two on
+    /// the near side are the edge's own endpoints, relocated - see the note on reuse in
+    /// [`HalfEdgeMesh::bevel_edge`].
+    pub new_vertices: [VertexId; 2],
 }
 
 impl HalfEdgeMesh {
@@ -346,8 +375,9 @@ impl HalfEdgeMesh {
     /// the geometry the user asked for, and they are live.
     ///
     /// Quads only, deliberately. "The edge opposite this one" is not a well-defined notion on an n-gon,
-    /// and guessing - nearest corner, halfway round - would place cuts the user did not ask for, so a
-    /// non-quad face is refused by number instead.
+    /// and guessing - nearest corner, halfway round - would place cuts the user did not ask for. The ring
+    /// therefore stops at a non-quad face, cutting everything it reached on the way, exactly as it stops at
+    /// an open boundary. Only a loop that cannot start at all is refused, and it says which face stopped it.
     ///
     /// Returns what was created, or every reason the ring cannot be cut, having changed nothing. A ring
     /// that runs off an open boundary is cut as far as it goes rather than refused: that is what a loop on
@@ -1087,6 +1117,378 @@ impl HalfEdgeMesh {
             })
     }
 
+    /// Trims one edge, sliding the two faces that bounded it apart and filling the gap with a new flat
+    /// facet - Maya's *Bevel*. `amount` is the fraction of each adjoining edge the cut runs, so `0.25`
+    /// leaves the facet a quarter of the way out from where the edge was, at both ends and on both sides.
+    ///
+    /// Four faces are involved and none is removed, which is what keeps this on append-only storage like
+    /// extrude and edge loop: the facet is new, the two faces that bounded the edge keep their corner
+    /// counts, and the two that met the edge at its endpoints gain one corner each. Beveling a cube edge
+    /// takes the solid from 8 vertices, 12 edges and 6 faces to 10, 15 and 7, leaving two neighbours as
+    /// pentagons.
+    ///
+    /// Every id survives, which sounds like the good news and is the opposite. The `EdgeId` handed in is
+    /// reused: both of its endpoints become corners of the new facet, so the very same pair still resolves,
+    /// but to the facet's near edge, offset from where the original ran. A stale `EdgeId` after a
+    /// `split_edge` at least refuses to resolve; a stale one after a bevel answers with different geometry,
+    /// so a selection held across this operation must be rebuilt from `corners` rather than trusted.
+    ///
+    /// The edge's own endpoints are relocated rather than replaced, each sliding into the face called the
+    /// near one below, and the far face gains a fresh vertex in place of each. That is why only two
+    /// vertices appear in `new_vertices` where four corners are cut.
+    ///
+    /// Three things are refused before a pointer moves, each naming what it refused:
+    ///
+    /// - an edge the mesh does not have, or one with only one face behind it. Beveling a boundary edge
+    ///   means building a rim around the opening, which is a different construction from this one.
+    /// - an endpoint where more than one other face also meets, which is any corner of degree four or
+    ///   higher. Maya splits such a corner once per diverging face; here it would strand vertices, so the
+    ///   corner is refused by number along with its degree.
+    /// - an `amount` outside `(0, 1)`, or one small enough that the facet would enclose no area.
+    ///
+    /// Returns what was created, or every reason the bevel cannot happen, having changed nothing.
+    pub fn bevel_edge(&mut self, edge: EdgeId, amount: f32) -> Result<Beveled, TopologyErrors> {
+        let setup = self.bevel_setup(edge, amount)?;
+
+        let mut candidate = self.clone();
+        let shape = candidate.install_bevel(setup);
+        install_if_valid(
+            candidate,
+            self,
+            format!(
+                "beveling the edge between vertex {} and vertex {} produced topology that does not validate",
+                edge.0, edge.1
+            ),
+        )?;
+        Ok(shape)
+    }
+
+    /// Reads a mesh for [`HalfEdgeMesh::bevel_edge`], refusing by name whatever the bevel cannot use.
+    ///
+    /// Every pointer read is `Option`-safe, as elsewhere on the write path: a mesh that arrives broken has
+    /// to be refused with its damage listed, not crashed on while the bevel is still looking for corners.
+    fn bevel_setup(&self, edge: EdgeId, amount: f32) -> Result<ResolvedBevel, TopologyErrors> {
+        let mut reasons = TopologyErrors::new();
+
+        if !amount.is_finite() || amount <= 0.0 || amount >= 1.0 {
+            reasons.push(format!(
+                "a bevel cuts {} of the way along each edge meeting the one it trims, so the amount has to \
+                 sit between 0 and 1",
+                amount
+            ));
+        }
+
+        // Both directions of the edge, since the facet has to be wound against each of them. Scanning for
+        // one of each rather than taking the first match is what makes this agree with the mesh whichever
+        // way round it happens to run the pair.
+        let a = VertexId(edge.0);
+        let b = VertexId(edge.1);
+        let (mut near, mut far) = (None, None);
+        for index in 0..self.half_edges.len() {
+            let found = HalfEdgeId(index);
+            if self.edge_id_of(found) != Some(edge) {
+                continue;
+            }
+            if self.half_edges[index].origin == a {
+                near = Some(found);
+            } else {
+                far = Some(found);
+            }
+        }
+        let (Some(near), Some(far)) = (near, far) else {
+            // Worth splitting: a boundary edge really does have a half-edge running it, and telling the
+            // user there is no such edge would send them looking for a selection bug that isn't there.
+            let one_side_open = near.is_some() || far.is_some();
+            return Err(vec![if one_side_open {
+                format!(
+                    "only one face bounds the edge between vertex {} and vertex {}, so there is nothing to \
+                     slide apart; beveling an edge at the rim of an opening has to build a rim around it, \
+                     which is not implemented",
+                    edge.0, edge.1
+                )
+            } else {
+                format!(
+                    "no half edge runs between vertex {} and vertex {}, so there is nothing to bevel",
+                    edge.0, edge.1
+                )
+            }]);
+        };
+
+        // The four corners the cut runs along, each one link round its own loop from the edge. A link that
+        // is missing or names nothing means the mesh is damaged, and there is no direction to cut without
+        // guessing at it.
+        let damaged = |where_: &str| -> TopologyErrors {
+            vec![format!(
+                "the {where_} does not continue round past this edge, so the mesh needs repairing before it \
+                 can be beveled"
+            )]
+        };
+        let leaving_for = |from: HalfEdgeId| -> Option<VertexId> {
+            let onward = self.half_edges[from.0].next?;
+            self.half_edges.get(onward.0).map(|edge| edge.origin)
+        };
+        let arriving_from = |into: HalfEdgeId| -> Option<VertexId> {
+            let back = self.half_edges[into.0].prev?;
+            self.half_edges.get(back.0).map(|edge| edge.origin)
+        };
+
+        let Some(near_face) = self.half_edges[near.0].face else {
+            return Err(damaged("near side of this edge"));
+        };
+        let Some(far_face) = self.half_edges[far.0].face else {
+            return Err(damaged("far side of this edge"));
+        };
+        let Some(d) = arriving_from(near) else {
+            return Err(damaged("near face"));
+        };
+        // Two links round from `near`, not one: `origin(near.next)` is merely `near`'s destination, which
+        // is `b`, and the cut at `b` runs towards the corner *after* it. The far face's `x` below reads the
+        // same shape correctly, which is what makes this one easy to miss by symmetry.
+        let Some(c) = self.half_edges[near.0].next.and_then(leaving_for) else {
+            return Err(damaged("near face"));
+        };
+        let Some(far_from_a) = self.half_edges[far.0].next else {
+            return Err(damaged("far face"));
+        };
+        let Some(x) = leaving_for(far_from_a) else {
+            return Err(damaged("far face"));
+        };
+        let Some(y) = arriving_from(far) else {
+            return Err(damaged("far face"));
+        };
+
+        if near_face == far_face {
+            reasons.push(format!(
+                "both sides of the edge between vertex {} and vertex {} belong to face {}, which is not a \
+                 solid this bevel can trim",
+                edge.0, edge.1, near_face.0
+            ));
+        }
+
+        // What actually collapses a facet is the angle between the two faces, not the amount: at any amount
+        // whatever, two faces lying in one plane produce a strip folded shut. Unit normals make the cross
+        // product's magnitude the sine of that angle, so this is scale-free - it refuses the same flat pair
+        // whether the model is in millimetres or kilometres - and unlike an area test it cannot be satisfied
+        // by pushing a small bevel along a long edge. It runs here rather than once the corners have been
+        // resolved because a flat seam is usually also a busy corner, and the hinge is the reason that
+        // applies; `validate` judges topology, so nothing downstream would ever report a folded facet.
+        let dihedral_sine = self
+            .face_normal(near_face)
+            .cross(self.face_normal(far_face))
+            .magnitude();
+        if dihedral_sine < MIN_BEVEL_DIHEDRAL_SINE {
+            reasons.push(format!(
+                "faces {} and {} lie flat against each other, so a bevel between them has no corner to open \
+                 into a facet",
+                near_face.0, far_face.0
+            ));
+        }
+
+        let neighbour_at_a = self.bevel_neighbour(a, near_face, far_face, &mut reasons);
+        let neighbour_at_b = self.bevel_neighbour(b, near_face, far_face, &mut reasons);
+
+        // The three links to open, each found by the edge it runs rather than by stepping round a loop: the
+        // neighbour faces are reached from their corner, not from the edge being trimmed, so nothing here
+        // depends on which way round either of them happens to be stored.
+        let mut openings: [Option<(FaceId, HalfEdgeId)>; 3] = [None; 3];
+        for (slot, face, between) in [
+            (0usize, neighbour_at_a, EdgeId::between(a, x)),
+            (1, neighbour_at_b, EdgeId::between(b, c)),
+            (2, neighbour_at_b, EdgeId::between(b, y)),
+        ] {
+            let Some(face) = face else { continue };
+            match self.face_edge_in(face, between) {
+                Some(found) => openings[slot] = Some((face, found)),
+                None => reasons.push(format!(
+                    "face {} does not bound the edge between vertex {} and vertex {}, so the mesh needs \
+                     repairing before this bevel can open it",
+                    face.0, between.0, between.1
+                )),
+            }
+        }
+        // Carrying the face alongside each opening is what proves both neighbours exist: an opening is only
+        // filled for a face that was found, so this one check covers all three links and both corners, and
+        // anything the two `bevel_neighbour` calls objected to is already in `reasons`.
+        let (
+            Some((neighbour_at_a, open_before_a)),
+            Some((neighbour_at_b, open_before_b)),
+            Some((_, hand_over_b)),
+        ) = (openings[0], openings[1], openings[2])
+        else {
+            return Err(reasons);
+        };
+
+        let at = |corner: VertexId| self.vertices[corner.0].position;
+        let moved = [slide(at(a), at(d), amount), slide(at(b), at(c), amount)];
+        let created = [slide(at(a), at(x), amount), slide(at(b), at(y), amount)];
+
+        // The flat-hinge check ran above, before any corner was resolved.
+
+        if !reasons.is_empty() {
+            return Err(reasons);
+        }
+
+        Ok(ResolvedBevel {
+            a,
+            b,
+            near_face,
+            far_face,
+            far_from_a,
+            far_from_b: far,
+            neighbour_at_a,
+            open_before_a,
+            neighbour_at_b,
+            open_before_b,
+            hand_over_b,
+            moved,
+            created,
+        })
+    }
+
+    /// The one face meeting `corner` besides the two the bevel is separating, refusing the corner when that
+    /// is not exactly one face.
+    ///
+    /// A corner of degree three leaves a single neighbour to trim and one unambiguous edge to cut along.
+    /// More than that is a corner where several faces diverge, which Maya handles by splitting the vertex
+    /// once per face - a construction this build does not have, so picking one neighbour to trim would move
+    /// geometry nobody asked for. None is a boundary: the bevel would have to close a hole rather than open
+    /// a facet, and that is a different operation again.
+    fn bevel_neighbour(
+        &self,
+        corner: VertexId,
+        near_face: FaceId,
+        far_face: FaceId,
+        reasons: &mut TopologyErrors,
+    ) -> Option<FaceId> {
+        let mut others: Vec<FaceId> = Vec::new();
+        for edge in self.half_edges.iter().filter(|edge| edge.origin == corner) {
+            let Some(face) = edge.face else { continue };
+            if face != near_face && face != far_face && !others.contains(&face) {
+                others.push(face);
+            }
+        }
+
+        match others.as_slice() {
+            [only] => Some(*only),
+            [] => {
+                reasons.push(format!(
+                    "vertex {} sits on the boundary with no third face to trim, and a bevel of an edge that \
+                     ends at an opening has to build a rim around it, which is not implemented",
+                    corner.0
+                ));
+                None
+            }
+            many => {
+                reasons.push(format!(
+                    "vertex {} is shared by {} faces, so the bevel cannot tell which neighbour to trim; \
+                     Maya splits a corner of that degree once per face, which is not implemented",
+                    corner.0,
+                    many.len() + 2
+                ));
+                None
+            }
+        }
+    }
+
+    /// Performs the bevel [`HalfEdgeMesh::bevel_setup`] resolved, on the clone it will be validated on.
+    ///
+    /// Nothing here can fail: every id and position was checked in the read pass, and each link written is
+    /// one that pass promised existed. Order matters in exactly one place - the facet goes on last, because
+    /// [`HalfEdgeMesh::push_face`] finds a twin by looking for the reverse-directed edge already in the
+    /// mesh, and those four only come into being as the three faces around it are rewritten.
+    fn install_bevel(&mut self, bevel: ResolvedBevel) -> Beveled {
+        let ResolvedBevel {
+            a,
+            b,
+            near_face,
+            far_face,
+            far_from_a,
+            far_from_b,
+            neighbour_at_a,
+            open_before_a,
+            neighbour_at_b,
+            open_before_b,
+            hand_over_b,
+            moved,
+            created,
+        } = bevel;
+
+        let a_far = self.add_vertex(created[0]);
+        let b_far = self.add_vertex(created[1]);
+        self.vertices[a.0].position = moved[0];
+        self.vertices[b.0].position = moved[1];
+
+        // The far face gives up both its corners, and two origins are the whole of it: a half-edge carries
+        // no destination, so rewriting the pair turns `b -> a` into `b_far -> a_far` without that half-edge
+        // itself being touched, and every edge it shares with its own neighbours follows along.
+        self.half_edges[far_from_a.0].origin = a_far;
+        self.half_edges[far_from_b.0].origin = b_far;
+
+        // The neighbour at `a` gains its corner on the far side of the cut, which also turns the edge that
+        // arrived at `a` from `x` into the one arriving at `a_far`.
+        self.insert_corner(open_before_a, a_far);
+
+        // At `b` the neighbour keeps the original corner and hands `y` across instead, so the half-edge
+        // leaving `b` is rewritten first and the new corner opened behind it. That mirror is why the facet
+        // cannot simply be wound the other way at one end.
+        self.half_edges[hand_over_b.0].origin = b_far;
+        self.insert_corner(open_before_b, b);
+
+        // The facet, and the only face the operation adds. All four of its twins now exist, so one
+        // `push_face` fuses it to the near face, the far face and both neighbours.
+        let face = self.push_face(&[b, a, a_far, b_far]);
+
+        // Relocating `a` and `b` can leave either naming the half-edge that just moved to `b_far`, and the
+        // new corners need naming too, so all four are re-pointed once the facet is on.
+        self.repair_outgoing_edges(&HashSet::from([a, b, a_far, b_far]));
+
+        Beveled {
+            face,
+            corners: [b, a, a_far, b_far],
+            shortened_faces: [near_face, far_face],
+            trimmed_faces: [neighbour_at_a, neighbour_at_b],
+            new_vertices: [a_far, b_far],
+        }
+    }
+
+    /// Opens `arriving` to take one more corner: it keeps its own origin and gains a new destination, the
+    /// half-edge inserted carries `origin` on to wherever `arriving` was heading, and both belong to
+    /// `arriving`'s face.
+    ///
+    /// The twin is left unset for the caller to fuse, which is how a facet's four edges get linked in a
+    /// single [`HalfEdgeMesh::push_face`] instead of four separate passes - and why this belongs to a
+    /// primitive that finishes the job rather than standing alone as an edit.
+    fn insert_corner(&mut self, arriving: HalfEdgeId, origin: VertexId) -> HalfEdgeId {
+        let face = self.half_edges[arriving.0].face;
+        let onward = self.half_edges[arriving.0].next;
+        let inserted = HalfEdgeId(self.half_edges.len());
+
+        self.half_edges.push(HalfEdge {
+            origin,
+            twin: None,
+            next: onward,
+            prev: Some(arriving),
+            face,
+        });
+        self.half_edges[arriving.0].next = Some(inserted);
+        if let Some(following) = onward.and_then(|onward| self.half_edges.get_mut(onward.0)) {
+            following.prev = Some(inserted);
+        }
+
+        inserted
+    }
+
+    /// The half-edge bounding `face` that runs `between`, whichever way round, for a mesh that may not have
+    /// been validated yet.
+    fn face_edge_in(&self, face: FaceId, between: EdgeId) -> Option<HalfEdgeId> {
+        (0..self.half_edges.len())
+            .map(HalfEdgeId)
+            .find(|&half_edge| {
+                self.half_edges[half_edge.0].face == Some(face)
+                    && self.edge_id_of(half_edge) == Some(between)
+            })
+    }
+
     /// Gives every corner the operation moved a recorded outgoing edge that actually starts at it.
     ///
     /// `MeshVertex::half_edge` is only a cached entry point - any outgoing edge is a legal one - and
@@ -1114,6 +1516,53 @@ impl HalfEdgeMesh {
             }
         }
     }
+}
+
+/// Everything [`HalfEdgeMesh::bevel_edge`] needs to know before it touches a pointer.
+///
+/// The names follow one picture: the edge runs `a -> b` along the near face, so the far face runs
+/// `b -> a`; `d` and `c` are the near face's corners beyond `a` and `b`, and `x` and `y` are the far
+/// face's. The facet is wound `b -> a -> a_far -> b_far`, which runs against the near face on the edge
+/// it straddles and against the far face on the edge it replaces - the only cyclic order that does
+/// both, and the reason the two ends of the cut are mirror images rather than twins.
+struct ResolvedBevel {
+    a: VertexId,
+    b: VertexId,
+    near_face: FaceId,
+    far_face: FaceId,
+    /// The far face's half-edge leaving each end. Rewriting these two origins is all that face needs,
+    /// because a destination is read from the successor's origin rather than stored.
+    far_from_a: HalfEdgeId,
+    far_from_b: HalfEdgeId,
+    /// The face meeting the edge at `a`, and the half-edge in it arriving from `x`. Opening that one
+    /// turns `x -> a` into `x -> a_far` and starts the new `a_far -> a`.
+    neighbour_at_a: FaceId,
+    open_before_a: HalfEdgeId,
+    /// The face meeting the edge at `b`, the half-edge in it arriving from `c`, and the one leaving for
+    /// `y`. This end mirrors `a`: the neighbour keeps `b` and hands `y` over, so `hand_over_b` starts at
+    /// `b_far` before `open_before_b` is opened behind it.
+    neighbour_at_b: FaceId,
+    open_before_b: HalfEdgeId,
+    hand_over_b: HalfEdgeId,
+    /// Where `a` and `b` move to, into the near face.
+    moved: [Point3<f32>; 2],
+    /// Where the two new corners go, into the far face.
+    created: [Point3<f32>; 2],
+}
+
+/// The point `amount` of the way from `from` toward `toward`, with `amount` a fraction of the distance
+/// rather than a distance itself.
+///
+/// A fraction is what makes one bevel amount behave on a cube and on a house alike: Maya's bevel slider
+/// is width, but width against an edge of unknown length needs the edge measured first, and every edge
+/// meeting the one being trimmed has its own length. Fractions keep the four corners of a bevel coplanar
+/// on any box, which absolute widths do not.
+fn slide(from: Point3<f32>, toward: Point3<f32>, amount: f32) -> Point3<f32> {
+    Point3::new(
+        from.x + (toward.x - from.x) * amount,
+        from.y + (toward.y - from.y) * amount,
+        from.z + (toward.z - from.z) * amount,
+    )
 }
 
 /// Why `offset` cannot drive an extrusion, if it cannot.
@@ -1153,9 +1602,10 @@ struct Crossing {
 /// back at a face already crossed; an open mesh simply runs out of twins, which ends the walk without an
 /// objection because a loop that stops at a boundary is what a loop on an unfinished mesh means.
 ///
-/// Quads only. "The edge opposite this one" is not a thing an n-gon has - nearest corner and halfway round
-/// give different answers as soon as there are five corners - and a cut placed on a guess is worse than no
-/// cut, so the face is refused by number.
+/// Quads only, and a ring stops where the quads stop. "The edge opposite this one" is not a thing an n-gon
+/// has - nearest corner and halfway round give different answers as soon as there are five corners - so the
+/// walk ends there rather than guessing, exactly as it ends at an open boundary. A ring that cannot even
+/// start is the exception and is refused: cutting nothing is indistinguishable from a dead key.
 fn edge_loop_crossings(mesh: &HalfEdgeMesh, seed: EdgeId) -> Result<Vec<Crossing>, TopologyErrors> {
     let Some(mut entering) = mesh.face_half_edge_on(seed) else {
         return Err(vec![format!(
@@ -1186,12 +1636,24 @@ fn edge_loop_crossings(mesh: &HalfEdgeMesh, seed: EdgeId) -> Result<Vec<Crossing
             )]);
         };
         if loop_edges.len() != 4 {
-            return Err(vec![format!(
-                "an edge loop cuts quad faces, and face {} has {} corners; the edge opposite another is \
-                 not a thing an n-gon has, so refusing beats guessing where the cut would land",
-                face.0,
-                loop_edges.len()
-            )]);
+            // A ring that runs into an n-gon stops there, exactly as one that runs off an open boundary
+            // does: the cut is laid down as far as it can be measured, and where it stopped is visible.
+            // Refusing the whole ring instead would make a single n-gon anywhere on a mesh turn the tool
+            // dead, and "the loop ended here" is a better answer than "nothing happened".
+            //
+            // The face the user aimed at is the exception. A loop that cannot start has produced nothing at
+            // all, which is indistinguishable from a dead key unless it says so - hence the refusal when
+            // nothing has been crossed yet, naming the seed face and its corner count.
+            if crossings.is_empty() {
+                return Err(vec![format!(
+                    "an edge loop cuts quad faces, and the face it starts on is face {} with {} corners; \
+                     the edge opposite another is not a thing an n-gon has, so there is no cut to begin \
+                     with here",
+                    face.0,
+                    loop_edges.len()
+                )]);
+            }
+            break;
         }
 
         let exits = loop_edges[(index_in_loop(&loop_edges, entering) + 2) % loop_edges.len()];
@@ -2252,15 +2714,73 @@ mod tests {
     }
 
     #[test]
-    fn an_edge_loop_refuses_a_face_that_is_not_a_quad() {
+    fn an_edge_loop_refuses_when_the_face_it_starts_on_is_not_a_quad() {
+        // The one case where stopping is not an answer: nothing at all would be cut, which a user could
+        // only read as a dead key. The face they aimed at is named with its corner count.
         let mut mesh = lone_pentagon();
         let before = mesh.clone();
 
         let errors = mesh
             .insert_edge_loop(EdgeId::between(VertexId(0), VertexId(1)))
             .expect_err("an n-gon has no edge opposite another");
-        expect_reason(&errors, "face 0 has 5 corners");
+        expect_reason(&errors, "face 0 with 5 corners");
         assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn an_edge_loop_stops_at_a_face_that_is_not_a_quad() {
+        // Two quads running into a pentagon. The ring is measurable across the quads and stops dead at the
+        // pentagon's edge, which is what Maya's Insert Edge Loop does where the quads give out - so the cut
+        // the user asked for lands, and where it ended is visible rather than reported as a failure.
+        let positions = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+            Point3::new(2.0, 1.0, 0.0),
+            Point3::new(3.0, 0.0, 0.0),
+            Point3::new(3.6, 0.5, 0.0),
+            Point3::new(3.0, 1.0, 0.0),
+        ];
+        let mut mesh = HalfEdgeMesh::from_faces(
+            &positions,
+            &[vec![0, 1, 2, 3], vec![1, 4, 5, 2], vec![4, 6, 7, 8, 5]],
+        );
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("the test patch should validate: {errors:?}"));
+
+        // The hull edge of the first quad, so the walk starts there rather than on the far side of it.
+        let loop_cut = mesh
+            .insert_edge_loop(EdgeId::between(VertexId(0), VertexId(3)))
+            .unwrap_or_else(|errors| {
+                panic!("the ring should cut the quads it reaches: {errors:?}")
+            });
+
+        assert_eq!(
+            loop_cut.new_edges.len(),
+            2,
+            "one ring segment per face crossed - the pentagon contributes none, which is what stopping means"
+        );
+        assert_eq!(
+            loop_cut.new_vertices.len(),
+            3,
+            "both edges the ring passed through, plus the pentagon's own border edge, so the cut has a \
+             visible end where it halted"
+        );
+        assert_eq!(mesh.faces.len(), 5, "each quad reached was split in two");
+        assert_eq!(
+            mesh.face_vertices(FaceId(2)).len(),
+            6,
+            "the pentagon is not cut, but the ring ends on its border edge and that edge is shared, so \
+             splitting it hands the n-gon one extra corner - which is what Maya does here too"
+        );
+        assert!(
+            mesh.face_normal(FaceId(2)).z > 0.99,
+            "the pentagon still faces +z: it was given a corner on the edge the ring stopped at, nothing more"
+        );
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("the part-cut patch should validate: {errors:?}"));
     }
 
     #[test]
@@ -2298,5 +2818,370 @@ mod tests {
             .expect_err("with no face to cross, there is no ring to walk");
         expect_reason(&errors, "bounds no face");
         assert_identical(&mesh, &before);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Bevel. Nothing here was covered when the primitive first landed, which is how a construction as
+    // link-heavy as this one hides an unwound facet until a user selects the wrong edge.
+    // ---------------------------------------------------------------------------------------------
+
+    /// A square pyramid: five faces, and a corner where four of them meet. That apex is the smallest mesh
+    /// that gives bevel a degree-four corner to refuse, and its base edges are ordinary degree-three ones
+    /// to compare against, so a refusal there cannot be mistaken for a refusal everywhere.
+    ///
+    /// Wound outward on purpose. `from_faces` links twins by directed vertex pair, so one face wound the
+    /// other way would leave two half-edges running the same pair the same way and the mesh would arrive
+    /// already invalid - which every test below would report as a bevel bug.
+    fn square_pyramid() -> HalfEdgeMesh {
+        let positions = vec![
+            Point3::new(-1.0, -1.0, 0.0),
+            Point3::new(1.0, -1.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(-1.0, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 1.0),
+        ];
+        HalfEdgeMesh::from_faces(
+            &positions,
+            &[
+                vec![0, 3, 2, 1], // base, facing down
+                vec![0, 1, 4],
+                vec![1, 2, 4],
+                vec![2, 3, 4],
+                vec![3, 0, 4],
+            ],
+        )
+    }
+
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
+    }
+
+    #[test]
+    fn beveling_a_cube_edge_opens_a_facet_between_the_two_faces_it_bounded() {
+        let mut mesh = HalfEdgeMesh::create_cube();
+        let before = shape(&mesh);
+
+        let bevel = mesh
+            .bevel_edge(EdgeId::between(VertexId(0), VertexId(1)), 0.25)
+            .unwrap_or_else(|errors| {
+                panic!("a cube edge is the easiest bevel there is: {errors:?}")
+            });
+
+        assert_eq!(before, (8, 24, 6), "the cube starts where the digest says");
+        assert_eq!(
+            shape(&mesh),
+            (10, 30, 7),
+            "two corners and one facet, taking half-edges from 24 to 30 (three edges net, since each \
+             inserted corner replaces one)"
+        );
+        // Euler written as V + F - E so the middle term cannot go negative: `edges()` is 15 here, and in
+        // usize `10 - 15` wrapped into a huge number long before the assertion could report the truth.
+        assert_eq!(
+            10 + 7 - mesh.edges().len(),
+            2,
+            "V - E + F = 2 for a closed genus-zero shell, so every half-edge found a twin"
+        );
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("the beveled solid should validate: {errors:?}"));
+        assert!(
+            mesh.boundary_edges().is_empty(),
+            "a bevel opens a facet inside the solid, never a hole in it"
+        );
+
+        assert_eq!(
+            bevel.face,
+            FaceId(6),
+            "the facet is the one face the op appends"
+        );
+        assert_eq!(bevel.new_vertices, [VertexId(8), VertexId(9)]);
+        assert_eq!(mesh.face_vertices(bevel.face).len(), 4);
+    }
+
+    #[test]
+    fn bevel_shortens_the_two_faces_it_split_and_trims_the_two_it_met() {
+        let mut mesh = HalfEdgeMesh::create_cube();
+        let counts_before: Vec<usize> = (0..mesh.faces.len())
+            .map(|index| mesh.face_vertices(FaceId(index)).len())
+            .collect();
+
+        let bevel = mesh
+            .bevel_edge(EdgeId::between(VertexId(0), VertexId(1)), 0.25)
+            .expect("beveling a cube edge should succeed");
+
+        assert_eq!(counts_before, vec![4; 6], "a cube is six quads");
+        for &face in bevel.shortened_faces.iter() {
+            assert_eq!(
+                mesh.face_vertices(face).len(),
+                4,
+                "a face that gave up a strip of itself keeps its corner count"
+            );
+        }
+        for &face in bevel.trimmed_faces.iter() {
+            assert_eq!(
+                mesh.face_vertices(face).len(),
+                5,
+                "a face that met the edge end-on gains the cut point, so a quad becomes a pentagon"
+            );
+        }
+        assert_ne!(
+            bevel.shortened_faces[0], bevel.shortened_faces[1],
+            "the edge has two distinct sides on a solid"
+        );
+        assert_ne!(
+            bevel.trimmed_faces[0], bevel.trimmed_faces[1],
+            "and two distinct neighbours at its ends"
+        );
+    }
+
+    #[test]
+    fn bevel_lands_every_cut_point_the_amount_says_along_its_edge() {
+        // The only check here about geometry rather than links, and the one that would catch the two ends
+        // of the cut being built off the wrong neighbours: on a unit cube each adjacent corner is exactly
+        // one unit away, so an amount of a quarter puts every new point a quarter of the way out.
+        let mut mesh = HalfEdgeMesh::create_cube();
+        let before: Vec<Point3<f32>> = mesh.vertices.iter().map(|vertex| vertex.position).collect();
+        let amount = 0.25;
+
+        let bevel = mesh
+            .bevel_edge(EdgeId::between(VertexId(0), VertexId(1)), amount)
+            .expect("beveling a cube edge should succeed");
+
+        let fraction_along = |from: Point3<f32>, to: Point3<f32>| {
+            (to - from).magnitude() / (before[0] - before[1]).magnitude()
+        };
+        assert_eq!(
+            bevel.corners,
+            [
+                bevel.corners[0],
+                bevel.corners[1],
+                bevel.new_vertices[0],
+                bevel.new_vertices[1]
+            ],
+            "the facet is wound through the two near corners then the two new ones, so the order reads \
+             around it instead of jumping across"
+        );
+        for (corner, relocated) in [
+            (VertexId(0), bevel.corners[1]),
+            (VertexId(1), bevel.corners[0]),
+        ] {
+            assert_eq!(
+                relocated, corner,
+                "the near corners are the edge's own endpoints, moved"
+            );
+            let travelled = fraction_along(before[corner.0], mesh.vertices[corner.0].position);
+            assert!(
+                near(travelled, amount),
+                "vertex {} slid {travelled} of the way along its edge, not {amount}",
+                corner.0
+            );
+        }
+        for (&fresh, &corner) in bevel
+            .new_vertices
+            .iter()
+            .zip([VertexId(0), VertexId(1)].iter())
+        {
+            let out = fraction_along(before[corner.0], mesh.vertices[fresh.0].position);
+            assert!(
+                near(out, amount),
+                "the new vertex beside vertex {} sits {out} out, not {amount}",
+                corner.0
+            );
+        }
+
+        let corners: Vec<Point3<f32>> = bevel
+            .corners
+            .iter()
+            .map(|&corner| mesh.vertices[corner.0].position)
+            .collect();
+        assert!(
+            face_area(&corners) > MIN_FACE_AREA,
+            "the facet the four cut points enclose has a real area"
+        );
+    }
+
+    #[test]
+    fn a_beveled_edge_is_reused_as_the_facet_rather_than_removed() {
+        // The caveat a bevel leaves for selection, and it is a different one from `split_edge`'s. There the
+        // vertex pair vanishes; here it survives, because the two corners on the near side of the cut ARE
+        // the original pair, moved. So an [`EdgeId`] held across a bevel stays legal while naming something
+        // else - the facet's own edge instead of the corner it used to be. An operation that reports or
+        // highlights what it acted on has to take what the primitive returned, not keep the selection.
+        let mut mesh = HalfEdgeMesh::create_cube();
+        let chosen = EdgeId::between(VertexId(0), VertexId(1));
+        let before = mesh.vertices[0].position;
+
+        let bevel = mesh
+            .bevel_edge(chosen, 0.25)
+            .expect("beveling a cube edge should succeed");
+
+        let present: Vec<EdgeId> = mesh.edges().into_iter().map(|(edge, _)| edge).collect();
+        assert!(
+            present.contains(&chosen),
+            "the pair still runs, now as the near side of the facet"
+        );
+
+        let (first, second) = mesh.edge_faces(chosen);
+        let bounded: Vec<FaceId> = [first, second].into_iter().flatten().collect();
+        assert_eq!(bounded.len(), 2, "the reused edge still bounds two faces");
+        assert!(
+            bounded.contains(&bevel.face),
+            "one of them is the facet it was repurposed as: {bounded:?}"
+        );
+        assert!(
+            bounded.contains(&bevel.shortened_faces[0])
+                || bounded.contains(&bevel.shortened_faces[1]),
+            "and the other is whichever side kept its own corners: {bounded:?}"
+        );
+        assert!(
+            !mesh.is_boundary_edge(chosen),
+            "a reused edge on a closed solid is not on the hull"
+        );
+
+        // The geometry moved even though the id did, which is the half of the caveat a count cannot show.
+        assert_ne!(
+            mesh.vertices[0].position, before,
+            "the vertex the selection named is no longer where it was"
+        );
+    }
+
+    #[test]
+    fn bevel_refuses_an_edge_the_mesh_does_not_have() {
+        let before = HalfEdgeMesh::create_cube();
+        let mut mesh = before.clone();
+
+        let errors = mesh
+            .bevel_edge(EdgeId::between(VertexId(0), VertexId(6)), 0.25)
+            .expect_err("that pair is a face diagonal, not an edge");
+        expect_reason(&errors, "no half edge runs between vertex 0 and vertex 6");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn bevel_refuses_an_edge_that_only_one_face_bounds() {
+        let before = open_quad();
+        let mut mesh = before.clone();
+
+        let errors = mesh
+            .bevel_edge(EdgeId::between(VertexId(0), VertexId(1)), 0.25)
+            .expect_err("one side of the edge is open air");
+        expect_reason(&errors, "only one face");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn bevel_refuses_a_corner_where_four_faces_meet_and_names_it() {
+        let mut mesh = square_pyramid();
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("the pyramid itself must be sound: {errors:?}"));
+
+        let apex = EdgeId::between(VertexId(4), VertexId(0));
+        let errors = mesh
+            .bevel_edge(apex, 0.25)
+            .expect_err("four faces meet at the apex, so the cut has no single neighbour to trim");
+        expect_reason(&errors, "vertex 4 is shared by 4 faces");
+        assert_eq!(
+            shape(&mesh),
+            (5, 16, 5),
+            "five faces of a pyramid is 4 + 3x4 half-edges, and nothing moved"
+        );
+    }
+
+    #[test]
+    fn bevel_takes_a_base_edge_of_the_same_pyramid() {
+        // The control for the refusal above: same mesh, degree-three ends, and the bevel works - so a
+        // future "this shape is always refused" regression cannot hide behind the apex test.
+        let mut mesh = square_pyramid();
+
+        mesh.bevel_edge(EdgeId::between(VertexId(0), VertexId(1)), 0.25)
+            .unwrap_or_else(|errors| panic!("a base edge has degree-three ends: {errors:?}"));
+
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("the beveled pyramid should validate: {errors:?}"));
+        assert!(mesh.boundary_edges().is_empty());
+        assert_eq!(
+            shape(&mesh),
+            (7, 22, 6),
+            "same arithmetic as the cube: eleven edges, so Euler still gives a closed shell"
+        );
+    }
+
+    #[test]
+    fn bevel_refuses_an_amount_outside_the_open_unit_interval() {
+        let before = HalfEdgeMesh::create_cube();
+        let mut mesh = before.clone();
+
+        for amount in [0.0f32, -0.25, 1.0, 2.0, f32::NAN, f32::INFINITY] {
+            let errors = mesh
+                .bevel_edge(EdgeId::between(VertexId(0), VertexId(1)), amount)
+                .expect_err("{amount} is not a fraction of an edge");
+            expect_reason(&errors, "between 0 and 1");
+        }
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn bevel_refuses_two_faces_that_lie_flat_against_each_other() {
+        // A loop cut leaves a seam where two halves of one face still share a plane. Beveling that edge
+        // folds a facet shut along it: geometry that renders as a crease, cannot be picked, and about which
+        // `validate` has no opinion, since nothing in it breaks a topology rule. The angle is checked before
+        // the corners are resolved because a seam like this also lands on a corner of degree four, and the
+        // flat hinge is the reason that actually applies to it.
+        let mut mesh = HalfEdgeMesh::create_cube();
+        mesh.insert_edge_loop(EdgeId::between(VertexId(0), VertexId(1)))
+            .expect("a cube takes a loop cut around its four sides");
+        let settled = mesh.clone();
+
+        let flat = mesh
+            .edges()
+            .into_iter()
+            .find(|&(edge, _)| {
+                let (first, second) = mesh.edge_faces(edge);
+                matches!((first, second), (Some(a), Some(b))
+                    if mesh.face_normal(a).cross(mesh.face_normal(b)).magnitude()
+                        < MIN_BEVEL_DIHEDRAL_SINE)
+            })
+            .map(|(edge, _)| edge)
+            .expect("a loop cut leaves two halves of one face lying in the same plane");
+
+        let errors = mesh
+            .bevel_edge(flat, 0.25)
+            .expect_err("a hinge with no angle has no facet to open");
+        expect_reason(&errors, "lie flat against each other");
+        assert_identical(&mesh, &settled);
+    }
+
+    #[test]
+    fn bevel_refuses_to_build_on_a_mesh_that_is_already_broken() {
+        let mut mesh = HalfEdgeMesh::create_cube();
+        mesh.half_edges[9].face = None;
+        let before = mesh.clone();
+
+        let errors = mesh
+            .bevel_edge(EdgeId::between(VertexId(0), VertexId(1)), 0.25)
+            .expect_err("damage elsewhere must stop this edit");
+        expect_reason(&errors, "belongs to no face");
+        expect_reason(&errors, "nothing was installed");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn beveling_two_edges_that_share_a_corner_keeps_the_solid_closed() {
+        // The sequence a user reaches for immediately: chamfer one edge, then the next. Each bevel turns
+        // the faces it trimmed into pentagons, so the second reads links the first wrote rather than the
+        // cube it started from - and both ends stay degree three, which is what lets it work at all.
+        let mut mesh = HalfEdgeMesh::create_cube();
+
+        mesh.bevel_edge(EdgeId::between(VertexId(0), VertexId(1)), 0.2)
+            .expect("the first bevel should succeed");
+        mesh.bevel_edge(EdgeId::between(VertexId(0), VertexId(3)), 0.2)
+            .expect("the second bevel, which shares vertex 0 with the first, should also succeed");
+
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("two chamfers should still be a solid: {errors:?}"));
+        assert_eq!(mesh.faces.len(), 8, "one facet per bevel");
+        assert!(
+            mesh.boundary_edges().is_empty(),
+            "still closed after both chamfers"
+        );
     }
 }

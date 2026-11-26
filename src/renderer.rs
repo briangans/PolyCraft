@@ -327,6 +327,7 @@ enum Hotkey {
     Redo,
     Extrude,
     EdgeLoop,
+    Bevel,
     CycleSpace,
 }
 
@@ -343,6 +344,9 @@ enum Hotkey {
 /// `Shift+L` carries the same reasoning for Maya's *Insert Edge Loop Tool*, which is toolbox-only there
 /// as well: `L` for loop, sitting beside `Shift+E` so the two modelling commands stay together instead of
 /// being scattered across the map by whichever letter happened to be free.
+///
+/// `Shift+B` is bevel, on the same convention and for the same reason - Maya puts *Bevel* on the shelf and
+/// leaves the bare letter to Paint Effects, so `B` is free and the `Shift` keeps it that way.
 ///
 /// `X` is a deliberate divergence rather than a Maya keymap copy: bare `x` is Maya's press-and-release
 /// "snap to grids", and this app has no snapping of any kind yet, so there is nothing here for it to
@@ -365,6 +369,7 @@ fn hotkey_for(key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> Option<
         return match key {
             Key::KeyE => Some(Hotkey::Extrude),
             Key::KeyL => Some(Hotkey::EdgeLoop),
+            Key::KeyB => Some(Hotkey::Bevel),
             Key::Escape => Some(Hotkey::CancelDrag),
             _ => None,
         };
@@ -728,6 +733,10 @@ impl<'a> State<'a> {
                 self.insert_edge_loop();
                 true
             }
+            Some(Hotkey::Bevel) => {
+                self.bevel_selected_edge();
+                true
+            }
             Some(Hotkey::CycleSpace) => {
                 self.scene.cycle_space();
                 // Echoed because the only other signal is the handle reorienting, which is easy to miss on
@@ -802,6 +811,27 @@ impl<'a> State<'a> {
                 self.notice = Some(format!(
                     "Inserted an edge loop through {} faces, adding {} vertices",
                     cut.faces_cut, cut.new_vertices
+                ));
+            }
+            Err(errors) => self.notice = Some(errors.join(" ")),
+        }
+    }
+
+    /// Trims the selected edge, opening a facet where it ran, and echoes what the bevel did.
+    ///
+    /// The gesture in flight is closed first for the reason `insert_edge_loop` documents: a bevel moves
+    /// corners, and an armed extrude previews from the snapshot taken the instant it was armed, so leaving
+    /// one open underneath a bevel would have its click restore geometry the bevel has already cut away.
+    /// Like the loop there is nothing to drag - a facet appears on the press - so no follow-up state of its
+    /// own, and a refusal arrives as a notice rather than silence.
+    pub fn bevel_selected_edge(&mut self) {
+        self.cancel_active_drag();
+
+        match self.scene.bevel_selected_edge() {
+            Ok(bevel) => {
+                self.notice = Some(format!(
+                    "Beveled the edge, opening facet {} between the faces it joined",
+                    bevel.facet.0
                 ));
             }
             Err(errors) => self.notice = Some(errors.join(" ")),
@@ -1221,6 +1251,9 @@ impl<'a> State<'a> {
         if response.edge_loop {
             self.insert_edge_loop();
         }
+        if response.bevel {
+            self.bevel_selected_edge();
+        }
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -1251,6 +1284,7 @@ impl<'a> State<'a> {
                 can_extrude: self.scene.can_extrude(),
                 extruding: self.scene.is_extruding(),
                 can_insert_edge_loop: self.scene.can_insert_edge_loop(),
+                can_bevel: self.scene.can_bevel(),
                 space: self.scene.space(),
                 notice: self.notice.as_deref(),
             },
@@ -1463,6 +1497,26 @@ mod tests {
         // instead of doing nothing at all.
         assert_eq!(hotkey_for(Key::KeyX, true, false), None);
         assert_eq!(hotkey_for(Key::KeyX, false, true), None);
+    }
+
+    #[test]
+    fn the_modelling_chords_fire_and_bare_letters_do_not() {
+        // The three commands that edit the mesh rather than the selection, all on the `Shift` + letter
+        // convention. `Shift` is load-bearing twice over here: it keeps them off the tool keys (`E` alone is
+        // Rotate), and a bare `B` must stay unbound so a stray press does not cut a facet into the mesh.
+        assert_eq!(hotkey_for(Key::KeyE, false, true), Some(Hotkey::Extrude));
+        assert_eq!(hotkey_for(Key::KeyL, false, true), Some(Hotkey::EdgeLoop));
+        assert_eq!(hotkey_for(Key::KeyB, false, true), Some(Hotkey::Bevel));
+
+        assert_eq!(
+            hotkey_for(Key::KeyB, false, false),
+            None,
+            "bare B is not a bevel, and must not quietly trim an edge"
+        );
+        // Ctrl wins: `Ctrl+B` is bold in every other application, and here it must simply do nothing rather
+        // than bevel behind a menu mnemonic.
+        assert_eq!(hotkey_for(Key::KeyB, true, false), None);
+        assert_eq!(hotkey_for(Key::KeyL, true, false), None);
     }
 
     #[test]

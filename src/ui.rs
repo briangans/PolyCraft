@@ -27,6 +27,9 @@ pub struct UiResponse {
     /// The Insert Edge Loop button was clicked. The command lands on the press, so there is no second
     /// press to settle it the way an extrude has.
     pub edge_loop: bool,
+    /// The Bevel button was clicked, to trim the selected edge and open a facet where it ran. Lands on the
+    /// press like an edge loop.
+    pub bevel: bool,
 }
 
 /// Everything the UI displays for this frame, handed to [`UiState::draw`].
@@ -54,6 +57,8 @@ pub struct UiContext<'a> {
     /// Whether an edge loop can be run right now, for the same reason `can_extrude` exists: the button
     /// greys out for exactly the reason the hotkey does nothing.
     pub can_insert_edge_loop: bool,
+    /// Whether an edge can be bevelled right now, for the same reason again.
+    pub can_bevel: bool,
     /// Which orientation the transform gizmo is currently drawn and dragged in, so the button beside it can
     /// show the one that is live.
     pub space: Space,
@@ -94,6 +99,18 @@ fn edge_loop_button_text(available: bool) -> &'static str {
         "Insert Edge Loop  (Shift+L)"
     } else {
         "Insert Edge Loop"
+    }
+}
+
+/// Button text for the bevel command, following the rule the extrude and loop buttons established: name
+/// the key when the key works, stay plain when it does not. `B` for bevel sits with the other two modelling
+/// keys, and Maya is the reason it needs a `Shift` at all - bare `b` there is the paint effects toggle, and
+/// Maya itself puts bevel on the shelf rather than the keyboard.
+fn bevel_button_text(available: bool) -> &'static str {
+    if available {
+        "Bevel  (Shift+B)"
+    } else {
+        "Bevel"
     }
 }
 
@@ -155,6 +172,7 @@ impl UiState {
             can_extrude,
             extruding,
             can_insert_edge_loop,
+            can_bevel,
             space: current_space,
             notice,
         } = current;
@@ -300,6 +318,13 @@ impl UiState {
                 if ui.add_enabled(can_insert_edge_loop, loop_button).clicked() {
                     response.edge_loop = true;
                 }
+                // And the bevel beside those two: the third command that edits the mesh rather than the
+                // selection, and the one that turns the sharp box extrude and loop leave behind into a
+                // rounded solid.
+                let bevel_button = egui::Button::new(bevel_button_text(can_bevel));
+                if ui.add_enabled(can_bevel, bevel_button).clicked() {
+                    response.bevel = true;
+                }
                 ui.separator();
                 ui.label(format!("Mode: {}", current_mode.label()));
                 let count_str = match current_mode {
@@ -408,6 +433,7 @@ mod tests {
             can_extrude: false,
             extruding: false,
             can_insert_edge_loop: false,
+            can_bevel: false,
             notice: None,
             space: Space::World,
         }
@@ -761,6 +787,7 @@ mod tests {
             can_extrude: false,
             extruding: false,
             can_insert_edge_loop: false,
+            can_bevel: false,
             notice: None,
             space: Space::World,
         }
