@@ -67,6 +67,78 @@ fn create_mesh_buffers(device: &wgpu::Device, scene: &Scene) -> (wgpu::Buffer, w
     (vertex_buffer, index_buffer, raw_indices.len() as u32)
 }
 
+/// Coverage samples per pixel for the viewport's colour and depth buffers.
+///
+/// The wireframe is a `LineList`, so a 3D edge lands on one row of pixel centres. Face-on that reads as a
+/// clean line; tilt the model and a long edge climbs through the grid in a staircase, and wherever a
+/// segment misses every centre in a column the line goes away for a pixel or two - which is what makes the
+/// same edge look solid from one angle and dotted from another. Four samples per pixel replace that
+/// on/off decision with a partial blend, and because the depth buffer is sampled too, the edges keep
+/// their own antialiasing instead of gaining a hard jagged silhouette.
+///
+/// Every pipeline that draws into these buffers has to ask for the same count, so the number lives here
+/// rather than being spelled out at each `MultisampleState`.
+pub const VIEWPORT_SAMPLE_COUNT: u32 = 4;
+
+/// The colour buffer the scene is drawn into, before it is resolved onto the surface.
+///
+/// A surface texture cannot be multisampled itself, so the scene renders here and the render pass resolves
+/// it into the surface in the same pass - which is why the pipelines name `VIEWPORT_SAMPLE_COUNT` while the
+/// UI pass, drawing straight to the surface afterwards, stays at one.
+fn create_msaa_color_texture(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        size: wgpu::Extent3d {
+            width: config.width.max(1),
+            height: config.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: VIEWPORT_SAMPLE_COUNT,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        label: Some("Viewport MSAA Texture"),
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+/// The depth buffer, sized and sampled to match the colour buffer it is paired with.
+///
+/// wgpu requires both attachments of a render pass to agree on their sample count, so the two are created
+/// from one place and `resize` refreshes them together - a depth buffer left at one sample while the
+/// colour buffer moves to four fails at the first draw call rather than at the call that set it up.
+///
+/// `RENDER_ATTACHMENT` alone, not `TEXTURE_BINDING`: picking is done by ray-triangles against the mesh on
+/// the CPU (`picking.rs`), so nothing ever samples depth, and a multisampled texture can only be sampled
+/// with an explicit per-sample load anyway.
+fn create_depth_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: VIEWPORT_SAMPLE_COUNT,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        label: Some("Depth Texture"),
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
 /// Builds an unlit `LineList` render pipeline (used for wireframe overlay and transform gizmo).
 fn create_line_pipeline(
     device: &wgpu::Device,
@@ -106,7 +178,7 @@ fn create_line_pipeline(
         },
         depth_stencil,
         multisample: wgpu::MultisampleState {
-            count: 1,
+            count: VIEWPORT_SAMPLE_COUNT,
             mask: !0,
             alpha_to_coverage_enabled: false,
         },
@@ -272,6 +344,9 @@ pub struct State<'a> {
     gizmo_buffer: wgpu::Buffer,
     num_gizmo_vertices: u32,
     depth_texture_view: wgpu::TextureView,
+    /// The multisampled colour buffer the scene renders into, resolved onto the surface at the end of the
+    /// same pass. Rebuilt with the depth buffer whenever the window changes size.
+    msaa_view: wgpu::TextureView,
     camera: Camera,
     camera_controller: CameraController,
     camera_uniform: CameraUniform,
@@ -461,21 +536,10 @@ impl<'a> State<'a> {
             }],
         });
 
-        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
-            size: wgpu::Extent3d {
-                width: config.width,
-                height: config.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            label: Some("Depth Texture"),
-            view_formats: &[],
-        });
-        let depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let (_, depth_texture_view) = create_depth_texture(&device, config.width, config.height);
+        // Dropping the texture handle here is deliberate, and follows the depth buffer beside it: the view
+        // keeps its buffer alive, which is all the render pass needs.
+        let (_, msaa_view) = create_msaa_color_texture(&device, &config);
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -520,7 +584,7 @@ impl<'a> State<'a> {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: 1,
+                count: VIEWPORT_SAMPLE_COUNT,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -601,7 +665,7 @@ impl<'a> State<'a> {
                 },
             }),
             multisample: wgpu::MultisampleState {
-                count: 1,
+                count: VIEWPORT_SAMPLE_COUNT,
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -653,6 +717,7 @@ impl<'a> State<'a> {
             gizmo_buffer,
             num_gizmo_vertices: 0,
             depth_texture_view,
+            msaa_view,
             camera,
             camera_controller,
             camera_uniform,
@@ -937,23 +1002,14 @@ impl<'a> State<'a> {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
 
-            let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                size: wgpu::Extent3d {
-                    width: self.config.width,
-                    height: self.config.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Depth32Float,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                label: Some("Depth Texture"),
-                view_formats: &[],
-            });
-            self.depth_texture_view =
-                depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            // Both attachments are rebuilt at the new size and have to agree on their sample count, so
+            // they come from the same helpers that created them. The texture handles are dropped on
+            // purpose, as they are in `new`: a wgpu view holds its texture alive, and nothing here ever
+            // needs the texture itself again.
+            let (_, depth) = create_depth_texture(&self.device, new_size.width, new_size.height);
+            let (_, msaa) = create_msaa_color_texture(&self.device, &self.config);
+            self.depth_texture_view = depth;
+            self.msaa_view = msaa;
 
             self.update_camera_matrix();
         }
@@ -1320,11 +1376,15 @@ impl<'a> State<'a> {
 
         // 2. Render 3D Scene
         {
+            // Draws into the multisampled buffer and resolves onto the surface as the pass closes, in one
+            // command - the surface itself cannot hold samples, so this is the only place the two views
+            // meet. `Discard` rather than `Store`: the resolved surface is what survives, and keeping the
+            // individual samples around would cost a full extra colour buffer per frame for nothing.
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("3D Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: &self.msaa_view,
+                    resolve_target: Some(&view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.196,
@@ -1332,14 +1392,17 @@ impl<'a> State<'a> {
                             b: 0.196,
                             a: 1.0,
                         }),
-                        store: wgpu::StoreOp::Store,
+                        store: wgpu::StoreOp::Discard,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_texture_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
+                        // Nothing reads depth once this pass closes - the UI pass has no depth attachment
+                        // and picking is done on the CPU - so the four samples never need writing back to
+                        // memory they would be cleared from next frame anyway.
+                        store: wgpu::StoreOp::Discard,
                     }),
                     stencil_ops: None,
                 }),
