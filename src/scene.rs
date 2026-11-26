@@ -5,10 +5,9 @@
 
 use crate::history::HistoryStack;
 use crate::mesh::{FaceId, HalfEdgeMesh, TopologyErrors};
-use crate::mesh_edit::Extruded;
 use crate::picking::{self, Ray};
 use crate::selection::Selection;
-use cgmath::{InnerSpace, Vector3};
+use cgmath::{InnerSpace, Point3, Vector3};
 use std::collections::HashSet;
 
 pub use crate::edit_mode::EditMode;
@@ -22,10 +21,45 @@ pub const EDGE_PICK_RADIUS_PIXELS: f32 = 6.0;
 /// (a snapshot is a few hundred KB at most), so they stay cheap enough to keep a deep stack.
 pub const HISTORY_DEPTH: usize = 64;
 
-/// How far one extrude moves a face, in model units. The document opens on a unit cube, so a quarter of
-/// it is clearly visible at the default zoom without needing a drag distance to feel right - and pressing
-/// again accumulates, since the walls an extrude leaves behind are what Maya keeps selected.
-pub const EXTRUDE_FACE_DISTANCE: f32 = 0.25;
+/// The depth below which an extrude preview counts as "has not started yet", in model units.
+///
+/// [`crate::mesh_edit`] refuses an extrude whose offset has no length, because every wall it would grow
+/// collapses onto its own base edge - so without this, a cursor sitting exactly on the handle would ask
+/// for that refusal every frame and fill the command echo with an error for doing nothing. Matching the
+/// primitive's own floor keeps the two from disagreeing about when movement begins.
+const MIN_EXTRUDE_DEPTH: f32 = 1e-6;
+
+/// The handle an armed extrude will travel along, handed back so the caller can project the cursor
+/// without holding the document: where the faces sit, and the unit direction they will move.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ExtrudeGuide {
+    pub pivot: Point3<f32>,
+    pub direction: Vector3<f32>,
+}
+
+/// What a committed extrude moved, for the command echo.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ExtrudeCommit {
+    /// How many faces the user had selected.
+    pub faces: usize,
+    /// How many walls the extrude grew - zero when the depth never left the surface.
+    pub walls: usize,
+    /// Whether a step landed in history, which is false exactly when `walls` is zero.
+    pub recorded: bool,
+}
+
+/// An extrude awaiting the depth the mouse is giving it.
+#[derive(Clone, Debug)]
+struct ActiveExtrude {
+    /// The document as it was the instant the extrude was armed. Every preview is measured from here, so
+    /// the depth is a position rather than a running total of mouse movement.
+    snapshot: HalfEdgeMesh,
+    /// Frozen with the guide, so the region cannot drift if the selection changes mid-drag.
+    faces: Vec<FaceId>,
+    direction: Vector3<f32>,
+    /// Walls in the preview currently installed, for the command echo.
+    walls: usize,
+}
 
 /// The state undo/redo version: the geometry plus what was selected on it.
 ///
@@ -45,6 +79,8 @@ pub struct Scene {
     tool: Tool,
     selection: Selection,
     history: HistoryStack<DocumentSnapshot>,
+    /// An extrude waiting for the mouse to give it a depth. `None` the rest of the time.
+    extrude: Option<ActiveExtrude>,
 }
 
 impl Scene {
@@ -56,6 +92,7 @@ impl Scene {
             tool: Tool::default(),
             selection: Selection::new(),
             history: HistoryStack::new(HISTORY_DEPTH),
+            extrude: None,
         }
     }
 
@@ -63,23 +100,21 @@ impl Scene {
         &self.mesh
     }
 
-    /// Mutable access to the mesh. Flags the document dirty so the renderer re-uploads it next
-    /// frame. Wrap calls in `begin_action` / `end_action` if the change should be undoable.
-    pub fn mesh_mut(&mut self) -> &mut HalfEdgeMesh {
-        self.dirty = true;
-        &mut self.mesh
-    }
-
     pub fn mode(&self) -> EditMode {
         self.mode
     }
 
     /// Switches modes, dropping the selections the new mode cannot hold (as Maya does).
+    ///
+    /// An armed extrude is abandoned rather than carried: it moves the faces the old mode selected, and
+    /// those ids are gone the moment the selection is. Leaving it open would let a later click settle a
+    /// lump the user can no longer point at, previewing under a mode that has no handle on it.
     pub fn set_mode(&mut self, mode: EditMode) {
         if mode == self.mode {
             return;
         }
 
+        self.abandon_extrude();
         self.mode = mode;
         self.selection.retain_mode(mode);
         self.dirty = true;
@@ -90,7 +125,12 @@ impl Scene {
     }
 
     /// Sets the active manipulation or selection tool. Does not alter the current selection.
+    ///
+    /// Abandons an armed extrude the way [`Scene::set_mode`] does, for a different reason: while the drag
+    /// is open its travel arm owns the handle and the translate gizmo is not drawn, so taking a tool
+    /// change without closing it would look like a button that does nothing.
     pub fn set_tool(&mut self, tool: Tool) {
+        self.abandon_extrude();
         self.tool = tool;
     }
 
@@ -139,18 +179,118 @@ impl Scene {
                 .any(|&face| face.0 < self.mesh.faces.len())
     }
 
-    /// Pushes every selected face outward along `distance` times the average of their own normals,
-    /// growing a wall behind each edge of the selection nothing else bounds. One undoable step, landed in
-    /// history as "Extrude Face" or "Extrude Faces".
+    /// Whether an extrude drag is open, awaiting its depth.
+    pub fn is_extruding(&self) -> bool {
+        self.extrude.is_some()
+    }
+
+    /// Arms an extrude of the selected faces and returns the handle it will travel along: the pivot the
+    /// faces sit around and the unit direction, which is the average of their own normals.
     ///
-    /// The faces that moved stay selected rather than the walls that were created. That keeps the
-    /// highlight on the geometry the user pointed at, and it is also what makes the direction work: the
-    /// moved face carries the same normal it had before, so pressing again pushes the same lump further,
-    /// while a wall the user goes on to pick travels along its own normal instead of inheriting one.
+    /// Nothing moves yet. The depth arrives later from [`Scene::preview_extrude`], because the user sets
+    /// it by moving the mouse - so the direction is decided now, while the selection is definitely what
+    /// the user pointed at, and stays fixed for the gesture even as the preview moves the faces.
     ///
-    /// Returns how the region moved, or every reason nothing happened - the mesh is untouched either way,
-    /// because [`crate::mesh_edit`] primitives refuse before they change anything.
-    pub fn extrude_selected_faces(&mut self, distance: f32) -> Result<Extruded, TopologyErrors> {
+    /// Opening the history step here is what makes the whole drag one undo: [`Scene::begin_action`]
+    /// records the document as it is at this instant, before a single wall exists.
+    pub fn begin_extrude_drag(&mut self) -> Result<ExtrudeGuide, TopologyErrors> {
+        if self.extrude.is_some() {
+            return Err(vec![
+                "an extrude is already in progress; click to set its depth or press Escape to abandon it"
+                    .to_string(),
+            ]);
+        }
+
+        let (faces, direction) = self.extrude_request()?;
+        let pivot = self.extrude_pivot();
+
+        self.begin_action(&extrude_label(faces.len()));
+        self.extrude = Some(ActiveExtrude {
+            snapshot: self.mesh.clone(),
+            faces,
+            direction,
+            walls: 0,
+        });
+
+        Ok(ExtrudeGuide { pivot, direction })
+    }
+
+    /// Installs the extrude at `depth` units along the armed direction, positive being the way the faces
+    /// point, and returns how many walls it has grown.
+    ///
+    /// Every preview is measured from the snapshot taken when the extrude was armed, never from the mesh
+    /// as it currently stands, so depth is a position rather than a delta: bringing the cursor back always
+    /// brings the faces back, however far they have been pushed. A depth too small to move anything shows
+    /// the document exactly as it was before the extrude was armed.
+    ///
+    /// A depth that produces geometry the validator refuses leaves the *previous* preview standing. That
+    /// is deliberate: snapping back to the snapshot would blink the whole lump out of existence every time
+    /// the cursor crossed an impossible depth, which reads as a bug rather than as the limit it is.
+    pub fn preview_extrude(&mut self, depth: f32) -> Result<usize, TopologyErrors> {
+        let mut drag = match self.extrude.take() {
+            Some(drag) => drag,
+            None => return Err(vec!["no extrude is in progress".to_string()]),
+        };
+
+        let mut candidate = drag.snapshot.clone();
+        let outcome = if depth.is_finite() && depth.abs() >= MIN_EXTRUDE_DEPTH {
+            candidate
+                .extrude_faces(&drag.faces, drag.direction * depth)
+                .map(|shape| shape.side_faces.len())
+        } else {
+            Ok(0)
+        };
+
+        match outcome {
+            Ok(walls) => {
+                drag.walls = walls;
+                self.mesh = candidate;
+                self.dirty = true;
+                self.extrude = Some(drag);
+                Ok(walls)
+            }
+            Err(errors) => {
+                self.extrude = Some(drag);
+                Err(errors)
+            }
+        }
+    }
+
+    /// Settles the armed extrude at whatever depth was last previewed, recording one history step if the
+    /// faces actually moved. Returns what moved for the command echo, or `None` when nothing was armed.
+    ///
+    /// The selection is left exactly as it was, which is the settled precedent for where a command leaves
+    /// the highlight: the faces the user pointed at stay selected, and their ids remain valid because the
+    /// primitive appends and re-points rather than replacing them. An extrude that never moved anything
+    /// lands no step at all, so a stray keypress cannot pollute the undo chain.
+    pub fn commit_extrude(&mut self) -> Option<ExtrudeCommit> {
+        let drag = self.extrude.take()?;
+        let recorded = self.end_action();
+        Some(ExtrudeCommit {
+            faces: drag.faces.len(),
+            walls: drag.walls,
+            recorded,
+        })
+    }
+
+    /// Gives up the armed extrude, putting the document back exactly as it was when it was armed. Returns
+    /// false when there was nothing to abandon.
+    pub fn abandon_extrude(&mut self) -> bool {
+        let Some(drag) = self.extrude.take() else {
+            return false;
+        };
+        self.mesh = drag.snapshot;
+        self.dirty = true;
+        self.cancel_action();
+        true
+    }
+
+    /// The faces to move and the direction to move them, or every reason the selection cannot extrude.
+    ///
+    /// The direction is the average of the selection's own normals and nothing else, always recomputed
+    /// from the live mesh: averaging is what sends a two-face corner diagonally out the way Maya does, and
+    /// refusing when the normals cancel is what stops opposite faces being pushed into each other.
+    fn extrude_request(&self) -> Result<(Vec<FaceId>, Vector3<f32>), TopologyErrors> {
         if !self.can_extrude() {
             return Err(vec![
                 "extrude moves faces, so it needs at least one face selected in Face mode"
@@ -167,9 +307,6 @@ impl Scene {
             .collect();
         faces.sort_by_key(|face| face.0);
 
-        // The average of the selection's own normals and nothing else, always recomputed from the live
-        // mesh: averaging is what sends a two-face corner diagonally out the way Maya does, and refusing
-        // when the normals cancel is what stops opposite faces being pushed into each other.
         let Some(direction) = extrude_direction(&self.mesh, &faces) else {
             return Err(vec![
                 "the selected faces point in opposite directions, so there is no single way to push them; \
@@ -178,23 +315,15 @@ impl Scene {
             ]);
         };
 
-        self.begin_action(&extrude_label(faces.len()));
-        let outcome = self.mesh_mut().extrude_faces(&faces, direction * distance);
+        Ok((faces, direction))
+    }
 
-        match outcome {
-            // Selection deliberately untouched: the ids of the faces that moved are unchanged, because
-            // the primitive appends and re-points rather than replacing them.
-            Ok(shape) => {
-                self.end_action();
-                Ok(shape)
-            }
-            Err(errors) => {
-                // Nothing reached the mesh, so there is no step worth recording - and leaving an action
-                // open would file the *next* edit under this one.
-                self.cancel_action();
-                Err(errors)
-            }
-        }
+    /// Where the extrude handle sits: the centroid of the selected faces, which is where the user is
+    /// looking and the point the depth is measured from. The fallback covers a selection that was just
+    /// emptied underneath us, which the callers already refuse to extrude.
+    fn extrude_pivot(&self) -> Point3<f32> {
+        crate::gizmo::pivot(&self.mesh, self.mode, &self.selection)
+            .unwrap_or(Point3::new(0.0, 0.0, 0.0))
     }
 
     /// Selects whatever the ray hits, in the current mode. `additive` keeps what was already
@@ -272,7 +401,12 @@ impl Scene {
     /// Steps one action back, restoring the geometry and selection and flagging the document dirty.
     /// Returns false when there was nothing to undo. The action reverted is still named by
     /// [`Scene::redo_label`] once this returns, so the UI can read "Redo - Move Vertex" off it.
+    ///
+    /// An armed extrude is abandoned first, and before the current state is captured: its preview lives
+    /// in the mesh, so snapshotting it would file the half-finished lump as a real step, and its frozen
+    /// snapshot would then restore geometry that this undo has just rolled back.
     pub fn undo(&mut self) -> bool {
+        self.abandon_extrude();
         let current = self.snapshot();
         match self.history.undo(&current) {
             Some(state) => {
@@ -283,8 +417,10 @@ impl Scene {
         }
     }
 
-    /// Re-applies the last undone action. Returns false when there was nothing to redo.
+    /// Re-applies the last undone action. Returns false when there was nothing to redo. Abandons an armed
+    /// extrude for the same reason [`Scene::undo`] does.
     pub fn redo(&mut self) -> bool {
+        self.abandon_extrude();
         let current = self.snapshot();
         match self.history.redo(&current) {
             Some(state) => {
@@ -720,6 +856,23 @@ mod tests {
         );
     }
 
+    /// The depth the extrude tests push a face by, in model units - what a short drag reaches on the
+    /// unit cube the document opens on.
+    const DEPTH: f32 = 0.25;
+
+    /// Drives a whole extrude gesture - arm, preview, settle - standing in for the mouse.
+    ///
+    /// Tests that only care where the faces end up ask for the gesture here rather than repeating three
+    /// calls at every site. Tests about the gesture itself drive the three steps by hand.
+    fn extrude(scene: &mut Scene, depth: f32) -> Result<usize, TopologyErrors> {
+        scene.begin_extrude_drag()?;
+        scene.preview_extrude(depth)?;
+        Ok(scene
+            .commit_extrude()
+            .expect("an armed extrude always settles")
+            .walls)
+    }
+
     /// Selects the front face by ray, the way a click in Face mode would.
     fn select_front_face(scene: &mut Scene) {
         scene.select_at(&front_ray(), false, VIEWPORT_HEIGHT);
@@ -756,9 +909,7 @@ mod tests {
         scene.take_dirty();
         let before = scene.mesh().clone();
 
-        let errors = scene
-            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
-            .expect_err("vertices do not extrude");
+        let errors = extrude(&mut scene, DEPTH).expect_err("vertices do not extrude");
         expect_reason(&errors, "needs at least one face selected in Face mode");
         assert_eq!(scene.mesh(), &before);
         assert!(
@@ -773,11 +924,9 @@ mod tests {
         select_front_face(&mut scene);
         let before = scene.mesh().clone();
 
-        let shape = scene
-            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
-            .expect("a selected face of the cube should extrude");
+        let walls = extrude(&mut scene, DEPTH).expect("a selected face of the cube should extrude");
 
-        assert_eq!(shape.side_faces.len(), 4);
+        assert_eq!(walls, 4);
         assert_eq!(scene.mesh().faces.len(), 10);
         assert!(scene.can_undo());
         assert_eq!(
@@ -809,9 +958,7 @@ mod tests {
         let mut scene = face_mode_scene();
         select_front_face(&mut scene);
 
-        scene
-            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
-            .expect("a selected face of the cube should extrude");
+        extrude(&mut scene, DEPTH).expect("a selected face of the cube should extrude");
 
         assert_eq!(
             scene.selection.faces().len(),
@@ -824,7 +971,7 @@ mod tests {
         );
         assert_near(
             scene.mesh().face_center(FaceId(0)),
-            Point3::new(0.0, 0.0, 0.5 + EXTRUDE_FACE_DISTANCE),
+            Point3::new(0.0, 0.0, 0.5 + DEPTH),
             "and it is the cap that travelled, not the hole it left behind",
         );
     }
@@ -834,16 +981,12 @@ mod tests {
         let mut scene = face_mode_scene();
         select_front_face(&mut scene);
 
-        scene
-            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
-            .expect("the first press should extrude");
-        scene
-            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
-            .expect("the second press should extrude the cap again");
+        extrude(&mut scene, DEPTH).expect("the first press should extrude");
+        extrude(&mut scene, DEPTH).expect("the second press should extrude the cap again");
 
         assert_near(
             scene.mesh().face_center(FaceId(0)),
-            Point3::new(0.0, 0.0, 0.5 + 2.0 * EXTRUDE_FACE_DISTANCE),
+            Point3::new(0.0, 0.0, 0.5 + 2.0 * DEPTH),
             "two presses travel along +z with no sideways drift, since the cap still faces +z",
         );
         assert!(
@@ -859,9 +1002,7 @@ mod tests {
         // that wall along the *original* face's normal - through the prism - instead of out of the wall.
         let mut scene = face_mode_scene();
         select_front_face(&mut scene);
-        scene
-            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
-            .expect("a selected face of the cube should extrude");
+        extrude(&mut scene, DEPTH).expect("a selected face of the cube should extrude");
 
         let walls: Vec<FaceId> = (6..scene.mesh().faces.len()).map(FaceId).collect();
         let right_wall = walls
@@ -872,20 +1013,28 @@ mod tests {
 
         scene.selection.faces_mut().clear();
         scene.selection.faces_mut().insert(right_wall);
-        scene
-            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
-            .expect("a single wall should extrude on its own");
+        extrude(&mut scene, DEPTH).expect("a single wall should extrude on its own");
 
         assert_near(
             scene.mesh().face_center(right_wall),
-            Point3::new(before.x + EXTRUDE_FACE_DISTANCE, before.y, before.z),
+            Point3::new(before.x + DEPTH, before.y, before.z),
             "the wall moves out along +x, its own normal, and not along the front face's +z",
         );
     }
 
-    /// Point equality with the tolerance floating-point accumulation deserves, so a test failure means
+    /// Position equality with the tolerance floating-point accumulation deserves, so a test failure means
     /// the geometry moved wrong rather than that an addition rounded.
     fn assert_near(actual: Point3<f32>, expected: Point3<f32>, note: &str) {
+        let drift = (actual - expected).magnitude();
+        assert!(
+            drift < 1e-5,
+            "{note}: expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    /// The same for a direction. Kept separate rather than generic because `Point3` and `Vector3` share
+    /// no subtraction trait in cgmath that a single bound could name.
+    fn assert_dir_near(actual: Vector3<f32>, expected: Vector3<f32>, note: &str) {
         let drift = (actual - expected).magnitude();
         assert!(
             drift < 1e-5,
@@ -906,8 +1055,7 @@ mod tests {
         scene.take_dirty();
         let before = scene.mesh().clone();
 
-        let errors = scene
-            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
+        let errors = extrude(&mut scene, DEPTH)
             .expect_err("opposite faces have no common direction to travel");
         expect_reason(&errors, "no single way to push them");
         assert_eq!(scene.mesh(), &before);
@@ -926,9 +1074,7 @@ mod tests {
         // Reached the way a user reaches it: grow a lump, then Ctrl+A the result.
         let mut scene = face_mode_scene();
         select_front_face(&mut scene);
-        scene
-            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
-            .expect("a selected face of the cube should extrude");
+        extrude(&mut scene, DEPTH).expect("a selected face of the cube should extrude");
 
         let faces = scene.mesh().faces.len();
         scene.selection.faces_mut().clear();
@@ -937,14 +1083,284 @@ mod tests {
         }
         let before = scene.mesh().clone();
 
-        let errors = scene
-            .extrude_selected_faces(EXTRUDE_FACE_DISTANCE)
-            .expect_err("a closed solid has nothing to grow from");
+        let errors =
+            extrude(&mut scene, DEPTH).expect_err("a closed solid has nothing to grow from");
         expect_reason(&errors, "no single way to push them");
         assert_eq!(
             scene.mesh(),
             &before,
             "the refusal must not have cut into the solid"
         );
+    }
+
+    /// The z of every corner of the front face, which is the one the extrude pushes. A drag that drifted
+    /// sideways or grew unevenly would not leave all four equal.
+    fn front_depth(scene: &Scene) -> f32 {
+        let mesh = scene.mesh();
+        let depths: Vec<f32> = mesh
+            .face_vertices(FaceId(0))
+            .iter()
+            .map(|&corner| mesh.vertices[corner.0].position.z)
+            .collect();
+        assert_eq!(
+            depths.len(),
+            4,
+            "the front face of the cube has four corners"
+        );
+        let first = depths[0];
+        assert!(
+            depths.iter().all(|&z| (z - first).abs() < 1e-5),
+            "the face must move rigidly, got {depths:?}"
+        );
+        first
+    }
+
+    #[test]
+    fn arming_reports_the_travel_axis_and_moves_nothing() {
+        // The guide is what the handle is drawn from and what the cursor is projected onto, so its
+        // direction has to be the selected face's own normal - and arming must stay side-effect free, or
+        // pressing the key would already have grown geometry the user never dragged for.
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        let before = scene.mesh().clone();
+
+        let guide = scene
+            .begin_extrude_drag()
+            .expect("a selected face of the cube should arm");
+
+        assert_dir_near(
+            guide.direction,
+            Vector3::new(0.0, 0.0, 1.0),
+            "the front face points along +z, so that is the axis the depth is measured along",
+        );
+        assert_near(
+            guide.pivot,
+            Point3::new(0.0, 0.0, 0.5),
+            "the handle sits on the face the user is looking at",
+        );
+        assert_eq!(scene.mesh(), &before, "arming alone must not move a corner");
+        assert!(scene.is_extruding());
+    }
+
+    #[test]
+    fn the_depth_is_a_position_so_courting_the_cursor_back_moves_the_faces_back() {
+        // Depth measured from the armed snapshot rather than summed from mouse deltas. Were it a running
+        // total, pulling the cursor back over the handle would keep growing the lump instead of shrinking
+        // it, and a drag that crossed zero would extrude the wrong way with no way to see it happening.
+        let mut wandered = face_mode_scene();
+        select_front_face(&mut wandered);
+        wandered
+            .begin_extrude_drag()
+            .expect("arming should succeed");
+        wandered
+            .preview_extrude(0.9)
+            .expect("a long preview should apply");
+        wandered
+            .preview_extrude(0.25)
+            .expect("a shorter preview should apply");
+
+        let mut direct = face_mode_scene();
+        select_front_face(&mut direct);
+        direct.begin_extrude_drag().expect("arming should succeed");
+        direct
+            .preview_extrude(0.25)
+            .expect("the same depth applied once");
+
+        assert!(
+            (front_depth(&wandered) - front_depth(&direct)).abs() < 1e-5,
+            "0.9 then 0.25 must land where 0.25 alone lands"
+        );
+        assert_eq!(
+            wandered.mesh(),
+            direct.mesh(),
+            "and the whole document must match, not just the face that moved"
+        );
+    }
+
+    #[test]
+    fn bringing_the_drag_back_onto_the_surface_restores_the_cube_exactly() {
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        let before = scene.mesh().clone();
+        scene.begin_extrude_drag().expect("arming should succeed");
+        scene.preview_extrude(0.6).expect("a preview should apply");
+        assert!(front_depth(&scene) > 0.5, "and it should have moved");
+
+        scene
+            .preview_extrude(0.0)
+            .expect("zero depth is the surface");
+
+        assert_eq!(
+            scene.mesh(),
+            &before,
+            "a drag returned to where it started must leave no trace"
+        );
+    }
+
+    #[test]
+    fn a_negative_depth_pushes_the_face_inward_through_the_solid() {
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        scene.begin_extrude_drag().expect("arming should succeed");
+        scene
+            .preview_extrude(-0.25)
+            .expect("dragging the other way is a legitimate extrude");
+
+        assert!(
+            (front_depth(&scene) - 0.25).abs() < 1e-5,
+            "the front face travels inward, into the cube"
+        );
+    }
+
+    #[test]
+    fn abandoning_puts_the_document_back_and_lands_no_history_step() {
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        let before = scene.mesh().clone();
+        scene.take_dirty();
+        scene.begin_extrude_drag().expect("arming should succeed");
+        scene.preview_extrude(0.4).expect("a preview should apply");
+
+        assert!(scene.abandon_extrude(), "an open drag says it closed");
+
+        assert_eq!(scene.mesh(), &before, "Escape removes the preview lump");
+        assert!(
+            !scene.can_undo(),
+            "an abandoned drag is not an edit, so Undo still belongs to what came before"
+        );
+        assert!(!scene.is_extruding());
+        assert!(
+            !scene.abandon_extrude(),
+            "and with nothing open there is nothing to abandon"
+        );
+    }
+
+    #[test]
+    fn settling_a_drag_that_never_left_the_surface_records_nothing() {
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        let before = scene.mesh().clone();
+        scene.begin_extrude_drag().expect("arming should succeed");
+
+        let commit = scene
+            .commit_extrude()
+            .expect("an armed drag always settles");
+
+        assert_eq!(commit.walls, 0, "no depth was ever previewed");
+        assert!(
+            !commit.recorded,
+            "so there is no step, and the undo chain is undisturbed"
+        );
+        assert_eq!(scene.mesh(), &before);
+        assert!(!scene.can_undo());
+    }
+
+    #[test]
+    fn switching_modes_abandons_an_extrude_awaiting_its_depth() {
+        // The drag moves the faces Face mode had selected, and `set_mode` drops that selection, so
+        // carrying the drag across the switch would leave a previewed lump in the mesh that nothing can
+        // finish or point at any more.
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        let before = scene.mesh().clone();
+        scene.begin_extrude_drag().expect("arming should succeed");
+        scene.preview_extrude(0.4).expect("a preview should apply");
+        assert_ne!(
+            scene.mesh(),
+            &before,
+            "the preview is live before the switch"
+        );
+
+        scene.set_mode(EditMode::Vertex);
+
+        assert_eq!(
+            scene.mesh(),
+            &before,
+            "the switch restores what it interrupted"
+        );
+        assert!(!scene.is_extruding());
+        assert!(
+            scene.commit_extrude().is_none(),
+            "and the click that would have settled it now selects instead"
+        );
+        assert!(
+            !scene.can_undo(),
+            "an abandoned drag is no step, so Undo still belongs to whatever came before"
+        );
+    }
+
+    #[test]
+    fn switching_tools_releases_the_handle_an_extrude_was_holding() {
+        // While the drag is open its travel arm replaces the translate gizmo, so accepting a tool change
+        // without closing the drag would make the panel look dead. Restoring the mesh is what lets the
+        // freshly selected tool act on the cube the user can see, not on a lump that is no longer there.
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        let before = scene.mesh().clone();
+        scene.begin_extrude_drag().expect("arming should succeed");
+        scene.preview_extrude(0.4).expect("a preview should apply");
+
+        scene.set_tool(Tool::Rotate);
+
+        assert_eq!(scene.tool(), Tool::Rotate);
+        assert_eq!(scene.mesh(), &before);
+        assert!(!scene.is_extruding());
+    }
+
+    #[test]
+    fn a_second_extrude_is_refused_while_one_is_awaiting_its_depth() {
+        // Nesting would take its snapshot of a mesh that is already a preview, and abandoning the inner
+        // drag would then restore the outer drag's lump as though it were original geometry.
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        scene.begin_extrude_drag().expect("arming should succeed");
+        scene.preview_extrude(0.3).expect("a preview should apply");
+        let previewed = scene.mesh().clone();
+
+        let errors = scene
+            .begin_extrude_drag()
+            .expect_err("a second extrude cannot open on top of the first");
+        expect_reason(&errors, "already in progress");
+        assert_eq!(
+            scene.mesh(),
+            &previewed,
+            "and the refusal leaves the drag mid-flight, still draggable"
+        );
+
+        scene
+            .preview_extrude(0.5)
+            .expect("the first drag still accepts depth after the refusal");
+        assert!(
+            (front_depth(&scene) - 1.0).abs() < 1e-5,
+            "0.5 out from the original surface"
+        );
+    }
+
+    #[test]
+    fn one_whole_drag_is_one_undo_step_however_many_previews_it_had() {
+        let mut scene = face_mode_scene();
+        select_front_face(&mut scene);
+        let before = scene.mesh().clone();
+        scene.begin_extrude_drag().expect("arming should succeed");
+        for depth in [0.1, 0.2, 0.35, 0.3, 0.45] {
+            scene
+                .preview_extrude(depth)
+                .expect("each preview should apply");
+        }
+
+        let commit = scene
+            .commit_extrude()
+            .expect("an armed drag always settles");
+        assert!(commit.recorded, "the faces did move, so a step landed");
+        assert_eq!(commit.faces, 1);
+        assert_eq!(commit.walls, 4);
+
+        assert!(scene.undo(), "one step back");
+        assert_eq!(
+            scene.mesh(),
+            &before,
+            "returns the untouched cube, not the shape from some earlier preview"
+        );
+        assert!(!scene.can_undo(), "and no half-step is left to unwind");
     }
 }

@@ -85,6 +85,17 @@ impl CameraController {
         }
     }
 
+    /// Whether the camera is being navigated right now, which is Alt held with a button down - the same
+    /// condition [`CameraController::process_mouse_motion`] orbits, pans or zooms on.
+    ///
+    /// Tools need this because a drag that reads the cursor cannot tell a stroke from a swing around the
+    /// model. Extruding a face while orbiting for a better look at it would otherwise take the swing as
+    /// depth, and a vertex drag would move the geometry as a side effect of moving the view.
+    pub fn is_navigating(&self) -> bool {
+        self.alt_pressed
+            && (self.is_left_clicked || self.is_middle_clicked || self.is_right_clicked)
+    }
+
     pub fn process_scroll(&mut self, delta: &MouseScrollDelta, camera: &mut Camera) {
         let scroll_amount = match delta {
             MouseScrollDelta::LineDelta(_, y) => *y * 0.5,

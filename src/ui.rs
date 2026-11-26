@@ -17,7 +17,9 @@ pub struct UiResponse {
     pub undo: bool,
     /// The Redo button was clicked; the caller performs the redo.
     pub redo: bool,
-    /// The Extrude button was clicked; the caller performs it and decides how far the faces travel.
+    /// The Extrude button was clicked. While nothing is in flight the caller arms an extrude; while one
+    /// is already open the same press settles it at the depth the mouse reached, so the panel can finish
+    /// the gesture without the viewport.
     pub extrude: bool,
 }
 
@@ -39,6 +41,10 @@ pub struct UiContext<'a> {
     /// Whether an extrude is possible right now, so the button greys out for the same reason the hotkey
     /// does nothing rather than looking live and then refusing quietly.
     pub can_extrude: bool,
+    /// Whether an extrude is mid-gesture, waiting on the mouse for its depth. While one is open the faces
+    /// are already moving and a second one cannot start, so the button shows what the next click will do
+    /// instead of offering the command again.
+    pub extruding: bool,
     /// The outcome of the last command, echoed under the buttons the way Maya's command line does it.
     pub notice: Option<&'a str>,
 }
@@ -52,11 +58,15 @@ fn history_button_text(prefix: &str, label: Option<&str>) -> String {
     }
 }
 
-/// Button text for the extrude command. Greyed out it reads as a disabled "Extrude"; live it names the
-/// key that does the same thing, so the panel teaches the binding the way the history buttons teach
-/// theirs.
-fn extrude_button_text(can_extrude: bool) -> &'static str {
-    if can_extrude {
+/// Button text for the extrude command, which has three states worth telling apart: nothing to extrude,
+/// ready, or already travelling. Greyed out it reads as a plain disabled "Extrude"; live it names the key
+/// that does the same thing, so the panel teaches the binding the way the history buttons teach theirs;
+/// and mid-gesture it says what the next press means, since from there the command settles the faces
+/// wherever they have been dragged instead of starting a new extrude.
+fn extrude_button_text(can_extrude: bool, extruding: bool) -> &'static str {
+    if extruding {
+        "Click to set depth"
+    } else if can_extrude {
         "Extrude  (Shift+E)"
     } else {
         "Extrude"
@@ -119,6 +129,7 @@ impl UiState {
             undo_label,
             redo_label,
             can_extrude,
+            extruding,
             notice,
         } = current;
         let mut response = UiResponse::default();
@@ -236,8 +247,11 @@ impl UiState {
                 // Extrude sits with the history buttons rather than the tool row: it is a command that
                 // changes the mesh, not a mode the gizmo can be in, and Maya keeps it on the mesh
                 // toolbar for the same reason.
-                let extrude_button = egui::Button::new(extrude_button_text(can_extrude));
-                if ui.add_enabled(can_extrude, extrude_button).clicked() {
+                let extrude_button = egui::Button::new(extrude_button_text(can_extrude, extruding));
+                if ui
+                    .add_enabled(can_extrude || extruding, extrude_button)
+                    .clicked()
+                {
                     response.extrude = true;
                 }
                 ui.separator();
@@ -333,6 +347,7 @@ mod tests {
             undo_label: None,
             redo_label: None,
             can_extrude: false,
+            extruding: false,
             notice: None,
         }
     }
@@ -683,6 +698,7 @@ mod tests {
             undo_label: Some("Move Vertex"),
             redo_label: None,
             can_extrude: false,
+            extruding: false,
             notice: None,
         }
     }

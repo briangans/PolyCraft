@@ -1,15 +1,18 @@
 //! Transform gizmo math, independent of the GPU and of windowing.
 //!
-//! The gizmo is a set of three coloured axes drawn at the current selection, used later to drag
-//! components along an axis. This module answers the questions the drawing and dragging steps
-//! will need, and nothing else: where the handle sits, how long its arms should be, and which
-//! axis a pointer is nearest. Keeping it pure means all of it is testable without a window, and
+//! The gizmo is a set of three coloured axes drawn at the current selection and dragged to move
+//! components along one of them. This module answers the questions the drawing and dragging steps
+//! need, and nothing else: where the handle sits, how long its arms should be, and which axis a
+//! pointer is nearest. Keeping it pure means all of it is testable without a window, and
 //! matches the project rule that picking/selection/camera math never touch `wgpu` or `winit`.
 //!
-//! Two choices from the architecture shape the API here:
+//! Three choices from the architecture shape the API here:
 //! - The gizmo stays a constant size on screen (unlike the mesh). Its world length is therefore
 //!   derived from a pixel length, using the same `world_per_pixel` the picker uses, so picking
 //!   and drawing agree on what a "pixel" means.
+//! - Orientation is a [`Frame`], never a hardcoded triple of world axes: the translate handle uses
+//!   [`Frame::world`], the extrude handle builds one from the faces it will move. A world / object /
+//!   component space toggle is therefore a choice of frame at one call site, not a second gizmo.
 //! - The active tool is separate from `EditMode` (move/rotate/scale, bound to W/E/R in a later step). `gizmo::pivot` takes
 //!   a mode and a selection because where the handle sits depends on what is selected, not on
 //!   whether we are moving, rotating or scaling.
@@ -155,7 +158,7 @@ pub fn axis_world_length(pivot: Point3<f32>, camera_eye: Point3<f32>, viewport_h
     world_per_pixel(distance, viewport_height) * AXIS_LENGTH_PIXELS
 }
 
-/// One gizmo arm: a line segment from the pivot along a world axis, in that axis's colour.
+/// One gizmo arm: a line segment from the pivot along a direction, in that axis's colour.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Arm {
     pub start: Point3<f32>,
@@ -163,9 +166,99 @@ pub struct Arm {
     pub color: [f32; 3],
 }
 
-/// The translate gizmo's arms for the current selection and camera: one per axis, anchored at
-/// `pivot`, each world-long enough to measure `AXIS_LENGTH_PIXELS` at the pivot's depth. Empty
-/// with no selection. If an axis is active (hovered or dragged), it is highlighted in bright yellow.
+/// The orientation a gizmo is drawn and dragged in: an origin plus three orthonormal directions.
+///
+/// [`Frame::world`] is the orientation the translate gizmo has always used. [`Frame::from_axis`]
+/// takes it from the geometry instead - the extrude drag points its third axis along the face normal,
+/// which is what turns the mouse into a depth control and keeps the handle visually explaining the
+/// direction the faces will travel. Everything downstream - arm drawing, arm picking, projecting the
+/// cursor - reads the frame rather than `GizmoAxis::unit_vector`, so a world/object/component space
+/// toggle later becomes a choice of frame at one call site rather than a second copy of the gizmo.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Frame {
+    pub origin: Point3<f32>,
+    /// Right-handed orthonormal set, indexed by [`GizmoAxis::index`] so the slot colours line up.
+    pub axes: [Vector3<f32>; 3],
+}
+
+impl Frame {
+    /// The world axes, at `origin`.
+    pub fn world(origin: Point3<f32>) -> Self {
+        Frame {
+            origin,
+            axes: [
+                GizmoAxis::X.unit_vector(),
+                GizmoAxis::Y.unit_vector(),
+                GizmoAxis::Z.unit_vector(),
+            ],
+        }
+    }
+
+    /// A frame whose third axis runs along `axis`, with the other two spanning the plane across it.
+    ///
+    /// `None` for a zero-length or non-finite axis: there is no plane across a vector that has no
+    /// direction, and inventing one would draw a handle pointing somewhere the geometry never said.
+    ///
+    /// The helper axis is whichever world axis is furthest from `axis`, which is what keeps the first
+    /// cross product well conditioned - crossing with a near-parallel vector would give a tangent of no
+    /// length and, after normalising, a frame pointing at nothing.
+    pub fn from_axis(origin: Point3<f32>, axis: Vector3<f32>) -> Option<Frame> {
+        let magnitude = axis.magnitude();
+        if !magnitude.is_finite() || magnitude <= 0.0 {
+            return None;
+        }
+        let forward = axis / magnitude;
+        let helper = if forward.z.abs() < 0.9 {
+            Vector3::unit_z()
+        } else {
+            Vector3::unit_x()
+        };
+        let side = helper.cross(forward).normalize();
+        let up = forward.cross(side);
+
+        Some(Frame {
+            origin,
+            axes: [side, up, forward],
+        })
+    }
+
+    /// The direction of one slot.
+    pub fn direction(&self, axis: GizmoAxis) -> Vector3<f32> {
+        self.axes[axis.index()]
+    }
+
+    /// Where the tip of one arm sits at world `length`.
+    pub fn arm_end(&self, axis: GizmoAxis, length: f32) -> Point3<f32> {
+        self.origin + self.direction(axis) * length
+    }
+}
+
+/// The three arms of a frame at world `length`, with `active_axis` highlighted in bright yellow.
+///
+/// This is the only place arm endpoints are computed, so drawing and picking cannot drift apart - a
+/// gizmo drawn from one formula and picked with another silently moves the click target away from the
+/// line the user aimed at.
+pub fn arms(frame: &Frame, length: f32, active_axis: Option<GizmoAxis>) -> Vec<Arm> {
+    GizmoAxis::ALL
+        .iter()
+        .map(|&axis| {
+            let color = if active_axis == Some(axis) {
+                COLOR_AXIS_ACTIVE
+            } else {
+                axis.color()
+            };
+            Arm {
+                start: frame.origin,
+                end: frame.arm_end(axis, length),
+                color,
+            }
+        })
+        .collect()
+}
+
+/// The translate gizmo's arms for the current selection and camera, in world space: anchored at the
+/// selection's pivot, each world-long enough to measure `AXIS_LENGTH_PIXELS` at the pivot's depth.
+/// Empty with no selection, or for a degenerate view where an arm would have no size.
 pub fn translate_arms(
     mesh: &HalfEdgeMesh,
     mode: EditMode,
@@ -182,46 +275,31 @@ pub fn translate_arms(
     if length <= 0.0 {
         return Vec::new();
     }
-    GizmoAxis::ALL
-        .iter()
-        .map(|&axis| {
-            let color = if active_axis == Some(axis) {
-                COLOR_AXIS_ACTIVE
-            } else {
-                axis.color()
-            };
-            Arm {
-                start: pivot,
-                end: pivot + axis.unit_vector() * length,
-                color,
-            }
-        })
-        .collect()
+    arms(&Frame::world(pivot), length, active_axis)
 }
 
-/// Tests if a ray passes within `tolerance_pixels` of any gizmo axis arm.
+/// Tests if a ray passes within `tolerance_pixels` of any arm of `frame`.
 ///
 /// Depth testing is intentionally skipped (Always-pass), matching how the gizmo is rendered on top
-/// of the mesh. Returns the axis closest to the ray within tolerance.
-pub fn pick_gizmo_axis(
-    pivot: Point3<f32>,
-    camera_eye: Point3<f32>,
-    viewport_height: f32,
+/// of the mesh. Returns the axis whose arm is closest to the ray within tolerance.
+pub fn pick_frame_axis(
+    frame: &Frame,
+    length: f32,
     ray: &Ray,
     tolerance_pixels: f32,
+    viewport_height: f32,
 ) -> Option<GizmoAxis> {
-    let length = axis_world_length(pivot, camera_eye, viewport_height);
     if length <= 0.0 {
         return None;
     }
 
     let mut best: Option<(f32, GizmoAxis)> = None;
 
-    for axis in GizmoAxis::ALL {
-        let arm_start = pivot;
-        let arm_end = pivot + axis.unit_vector() * length;
+    for &axis in GizmoAxis::ALL.iter() {
+        let arm_end = frame.arm_end(axis, length);
 
-        let Some((offset, distance)) = crate::picking::ray_segment(ray, arm_start, arm_end) else {
+        let Some((offset, distance)) = crate::picking::ray_segment(ray, frame.origin, arm_end)
+        else {
             continue;
         };
 
@@ -239,6 +317,24 @@ pub fn pick_gizmo_axis(
     }
 
     best.map(|(_, axis)| axis)
+}
+
+/// Tests if a ray passes within `tolerance_pixels` of any arm of the world-space gizmo at `pivot`.
+pub fn pick_gizmo_axis(
+    pivot: Point3<f32>,
+    camera_eye: Point3<f32>,
+    viewport_height: f32,
+    ray: &Ray,
+    tolerance_pixels: f32,
+) -> Option<GizmoAxis> {
+    let length = axis_world_length(pivot, camera_eye, viewport_height);
+    pick_frame_axis(
+        &Frame::world(pivot),
+        length,
+        ray,
+        tolerance_pixels,
+        viewport_height,
+    )
 }
 
 /// Calculates the scalar parameter `t` along the axis line `L(t) = pivot + t * axis_direction`
@@ -468,6 +564,131 @@ mod tests {
         obj_selection.apply_object_click(true, false);
         let obj_verts = selected_vertices(&mesh, EditMode::Object, &obj_selection);
         assert_eq!(obj_verts.len(), 8);
+    }
+
+    /// Asserts two directions coincide, in the tolerance that f32 vector maths deserves.
+    fn same_direction(a: Vector3<f32>, b: Vector3<f32>) -> bool {
+        (a - b).magnitude() < 1e-6
+    }
+
+    #[test]
+    fn a_frame_from_an_axis_is_right_handed_and_points_where_the_geometry_said() {
+        // The extrude drag reads its travel out of the third slot and draws its handle from the same
+        // three directions, so a frame that skewed them would move faces somewhere the drawing never
+        // pointed. Includes the axis-aligned cases, which are where a helper-axis shortcut usually breaks.
+        let origin = Point3::new(1.0, 2.0, 3.0);
+        for axis in [
+            Vector3::new(0.0, 0.0, 1.0),
+            Vector3::new(0.0, 0.0, -1.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.5773, 0.5773, 0.5773),
+            Vector3::new(3.0, -4.0, 12.0),
+        ] {
+            let frame =
+                Frame::from_axis(origin, axis).expect("any finite non-zero axis defines a frame");
+
+            assert_eq!(frame.origin, origin);
+            assert!(
+                same_direction(frame.direction(GizmoAxis::Z), axis.normalize()),
+                "{axis:?} has to be the travel axis unchanged, got {:?}",
+                frame.direction(GizmoAxis::Z)
+            );
+            for &slot in GizmoAxis::ALL.iter() {
+                assert!(
+                    (frame.direction(slot).magnitude() - 1.0).abs() < 1e-6,
+                    "every slot must be unit length or the constant on-screen arm size goes wrong: {slot:?}"
+                );
+            }
+
+            let [side, up, forward] = frame.axes;
+            assert!(
+                same_direction(side.cross(up), forward),
+                "right-handed, so the third slot is the normal and not its negation for {axis:?}"
+            );
+            assert!(
+                same_direction(forward.cross(side), up),
+                "and the three must be mutually orthogonal for {axis:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_refuses_an_axis_with_no_direction() {
+        for axis in [
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(f32::NAN, 1.0, 1.0),
+            Vector3::new(0.0, f32::INFINITY, 0.0),
+        ] {
+            assert_eq!(
+                Frame::from_axis(Point3::new(0.0, 0.0, 0.0), axis),
+                None,
+                "there is no plane across a vector with no direction: {axis:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_arms_of_a_frame_reach_along_its_own_directions() {
+        // Drawing follows the frame, which is what lets the extrude handle be one tilted arm instead of a
+        // second copy of the world gizmo bolted alongside it - and it is why the highlight has to be
+        // resolved from the frame too, since a tilted handle is the only thing the drag offers.
+        let frame =
+            Frame::from_axis(Point3::new(0.0, 0.0, 0.0), Vector3::new(1.0, 1.0, 1.0)).unwrap();
+        let drawn = arms(&frame, 2.0, Some(GizmoAxis::Z));
+
+        assert_eq!(drawn.len(), GizmoAxis::ALL.len());
+        for (slot, arm) in GizmoAxis::ALL.iter().zip(&drawn) {
+            assert_eq!(arm.start, frame.origin);
+            let tip = frame.origin + frame.direction(*slot) * 2.0;
+            assert!(
+                (arm.end - tip).magnitude() < 1e-6,
+                "the {slot:?} arm must end one arm's length along its own direction"
+            );
+            let expected = if *slot == GizmoAxis::Z {
+                COLOR_AXIS_ACTIVE
+            } else {
+                slot.color()
+            };
+            assert_eq!(arm.color, expected);
+        }
+    }
+
+    #[test]
+    fn picking_follows_the_frame_rather_than_the_world_axes() {
+        // A tilted frame is what an armed extrude draws, so the arm under the cursor must be found from
+        // that frame's directions. Picking the world axes instead would grab an axis that is not there.
+        let eye = Point3::new(0.0, 0.0, 3.0);
+        let viewport_height = 600.0;
+        let frame =
+            Frame::from_axis(Point3::new(0.0, 0.0, 0.0), Vector3::new(0.0, 1.0, 1.0)).unwrap();
+        let length = axis_world_length(frame.origin, eye, viewport_height);
+        assert!(length > 0.0);
+
+        let midway = frame.arm_end(GizmoAxis::Z, length * 0.5);
+        let ray = Ray::new(eye, midway - eye);
+        assert_eq!(
+            pick_frame_axis(
+                &frame,
+                length,
+                &ray,
+                GIZMO_PICK_TOLERANCE_PIXELS,
+                viewport_height,
+            ),
+            Some(GizmoAxis::Z)
+        );
+
+        assert_eq!(
+            pick_frame_axis(
+                &frame,
+                0.0,
+                &ray,
+                GIZMO_PICK_TOLERANCE_PIXELS,
+                viewport_height,
+            ),
+            None,
+            "an arm of no length is not a target"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::mesh::VertexId;
 use crate::overlay;
 use crate::picking::Ray;
 use crate::render_types::{CameraUniform, GpuVertex};
-use crate::scene::{Scene, EXTRUDE_FACE_DISTANCE};
+use crate::scene::{ExtrudeCommit, Scene};
 use crate::tool::Tool;
 use crate::ui::{UiContext, UiState};
 use std::sync::Arc;
@@ -151,12 +151,99 @@ fn create_overlay_buffers(
     )
 }
 
+/// Cursor bookkeeping a drag shares, so moving the view mid-gesture does not fling the geometry.
+///
+/// Projecting a cursor ray onto an axis says something about position only while the eye stays put, and
+/// navigation does not end a tool drag: Alt+drag orbits, and the wheel zooms with no modifier at all.
+/// Measured from a new sight line, the next projection reports a parameter that has nothing to do with
+/// where the user's hand moved, so the lump lurches by however far the camera travelled.
+///
+/// `needs_reanchor` absorbs that. A camera swing marks the anchor, and the next event re-baselines
+/// instead of moving anything - the drag continues from the distance it had already reached. Until a swing
+/// happens the arithmetic is exactly the cursor's travel along the axis, so ordinary drags are unaffected.
+struct DragAnchor {
+    /// Where the cursor projected onto the drag axis at the previous event.
+    last_param: f32,
+    /// Total travel along the axis since the drag began, which is what the geometry is offset by.
+    applied: f32,
+    /// Set when a camera change swallowed events, so the next projection re-baselines.
+    needs_reanchor: bool,
+}
+
+impl DragAnchor {
+    fn new(first_param: f32) -> Self {
+        Self {
+            last_param: first_param,
+            applied: 0.0,
+            needs_reanchor: false,
+        }
+    }
+
+    /// Starts an anchor from whatever projection the cursor offers when the drag is armed, if any.
+    ///
+    /// A cursor outside the window, or a sight line running down the axis, projects to nothing. Anchoring
+    /// on an arbitrary zero in that case would read the first mouse move as travel, so the anchor is
+    /// flagged to re-baseline on the next event instead.
+    fn at(first_param: Option<f32>) -> Self {
+        let mut anchor = Self::new(first_param.unwrap_or(0.0));
+        anchor.needs_reanchor = first_param.is_none();
+        anchor
+    }
+
+    /// Folds in one cursor event. The drag's geometry is then offset by [`DragAnchor::applied`] along its
+    /// axis, relative to what was captured when the drag began.
+    ///
+    /// `limit` caps a single step as a distance in model units. Extrude passes one because a sight line
+    /// running nearly parallel to the travel axis turns a one-pixel move into a wild projection; translate
+    /// has no such problem and passes [`f32::MAX`].
+    fn advance(&mut self, param: f32, limit: f32) {
+        let travel = if self.needs_reanchor {
+            self.needs_reanchor = false;
+            0.0
+        } else {
+            param - self.last_param
+        };
+        self.last_param = param;
+        self.applied += travel.clamp(-limit, limit);
+    }
+
+    /// Notes that the view moved, so the next projection cannot be compared with `last_param`.
+    fn mark_swung(&mut self) {
+        self.needs_reanchor = true;
+    }
+}
+
 struct DragState {
     axis: GizmoAxis,
     pivot: cgmath::Point3<f32>,
-    initial_param: f32,
+    anchor: DragAnchor,
     initial_positions: Vec<(VertexId, cgmath::Point3<f32>)>,
 }
+
+/// An extrude awaiting its depth from the mouse, armed by [`Hotkey::Extrude`] and settled by a click.
+///
+/// The `frame` is [`gizmo::Frame::from_axis`] about the direction the faces will travel, so the handle
+/// the user drags is oriented to the geometry rather than to the world - the same arrangement Maya calls
+/// component space, and the reason this holds a frame where [`DragState`] holds a [`GizmoAxis`].
+struct ExtrudeState {
+    frame: gizmo::Frame,
+    /// World length of the drawn arm, remembered so the step limit scales with the handle rather than
+    /// with an absolute distance the user never chose.
+    arm_length: f32,
+    /// How far the faces have travelled along the frame's Z, accumulated by [`DragAnchor`].
+    anchor: DragAnchor,
+}
+
+/// The most depth an extrude drag may gain or lose in one cursor event, as a multiple of the handle's
+/// on-screen length.
+///
+/// Projecting the cursor onto an axis only says something while the sight line differs from that axis.
+/// Extruding a face that points straight at the camera is the limit case: every cursor ray is nearly
+/// parallel to the travel axis, so the closest-approach point - and with it the depth - swings wildly for
+/// a one-pixel move. Without a limit the lump leaps across the scene; with one it moves at a pace the user
+/// can follow, catching up over the next few events, which is what a handle at that angle can honestly
+/// offer.
+const MAX_EXTRUDE_STEP_ARMS: f32 = 1.0;
 
 pub struct State<'a> {
     surface: wgpu::Surface<'a>,
@@ -193,10 +280,26 @@ pub struct State<'a> {
     shift_pressed: bool,
     ctrl_pressed: bool,
     drag_state: Option<DragState>,
+    extrude_state: Option<ExtrudeState>,
     hovered_axis: Option<GizmoAxis>,
     /// One-line outcome of the last command, shown in the Tools panel. Maya's command echo is what tells
     /// a user a hotkey was received; without it a refused extrude is indistinguishable from a dead key.
     notice: Option<String>,
+}
+
+/// The command echo for a settled extrude, worded so a drag that never left the surface reads as the
+/// no-op it was rather than as a growth of zero walls.
+fn describe_extrude(commit: ExtrudeCommit) -> String {
+    if commit.walls == 0 {
+        return "Extrude cancelled - the faces never left the surface".to_string();
+    }
+    format!(
+        "Extruded {} {} into {} wall{}",
+        commit.faces,
+        if commit.faces == 1 { "face" } else { "faces" },
+        commit.walls,
+        if commit.walls == 1 { "" } else { "s" }
+    )
 }
 
 /// The name a gizmo drag records into history, Maya-style: the tool plus the component being moved
@@ -539,6 +642,7 @@ impl<'a> State<'a> {
             shift_pressed: false,
             ctrl_pressed: false,
             drag_state: None,
+            extrude_state: None,
             hovered_axis: None,
             notice: None,
         }
@@ -598,39 +702,112 @@ impl<'a> State<'a> {
                 true
             }
             Some(Hotkey::Extrude) => {
-                self.extrude_selected_faces();
+                self.begin_extrude_drag();
                 true
             }
             None => false,
         }
     }
 
-    /// Pushes the selected faces out by the fixed step, reporting the outcome in the Tools panel.
+    /// Arms an extrude of the selected faces and waits for the mouse to give it a depth.
     ///
-    /// A seam rather than a `main.rs` call into `Scene` for the same reason `undo` is: a drag in flight
-    /// holds vertex ids and initial positions from the state an extrude invalidates, so it has to be
-    /// abandoned first. A refusal leaves the mesh alone and is shown instead, because a hotkey that
+    /// A seam rather than a `main.rs` call into `Scene` for the same reason `undo` is: a translate drag in
+    /// flight holds vertex ids and initial positions from the state an extrude invalidates, so it has to be
+    /// abandoned first. A refusal leaves the document untouched and is echoed instead, because a hotkey that
     /// silently did nothing reads as a dead key.
-    pub fn extrude_selected_faces(&mut self) {
+    ///
+    /// The handle is drawn in the frame the faces define - [`gizmo::Frame::from_axis`] about the direction
+    /// they will travel - so the user drags along the geometry's own axis, which is what Maya calls
+    /// component space, rather than guessing which world axis points out of a tilted face.
+    pub fn begin_extrude_drag(&mut self) {
         self.cancel_active_drag();
-        self.notice = Some(
-            match self.scene.extrude_selected_faces(EXTRUDE_FACE_DISTANCE) {
-                Ok(shape) => format!(
-                    "Extruded {} {} into {} wall{}",
-                    shape.source_faces.len(),
-                    if shape.source_faces.len() == 1 {
-                        "face"
-                    } else {
-                        "faces"
-                    },
-                    shape.side_faces.len(),
-                    if shape.side_faces.len() == 1 { "" } else { "s" }
-                ),
-                // The reasons already read as sentences naming the components involved, so they go up
-                // as given rather than being paraphrased into something less specific.
-                Err(errors) => errors.join(" "),
-            },
+
+        let guide = match self.scene.begin_extrude_drag() {
+            Ok(guide) => guide,
+            Err(errors) => {
+                self.notice = Some(errors.join(" "));
+                return;
+            }
+        };
+
+        let height = self.config.height as f32;
+        let arm_length = gizmo::axis_world_length(guide.pivot, self.camera.eye(), height);
+        let Some(frame) = gizmo::Frame::from_axis(guide.pivot, guide.direction) else {
+            // Unreachable while `Scene` hands back a unit normal, but an axis with no direction would draw
+            // a handle pointing nowhere, so the drag is abandoned rather than invented.
+            self.scene.abandon_extrude();
+            self.notice = Some("the selected faces have no direction to extrude along".to_string());
+            return;
+        };
+
+        let travel = frame.direction(GizmoAxis::Z);
+        let anchor = DragAnchor::at(
+            self.cursor_ray()
+                .and_then(|ray| gizmo::project_ray_onto_axis(frame.origin, travel, &ray)),
         );
+
+        self.extrude_state = Some(ExtrudeState {
+            frame,
+            arm_length,
+            anchor,
+        });
+        self.notice = Some(
+            "Extruding - move the mouse to set the depth, click to set it, Escape to cancel"
+                .to_string(),
+        );
+    }
+
+    /// Moves the cursor along the armed extrude's travel axis, re-previewing the lump where it now stands.
+    fn track_extrude_drag(&mut self, ray: &Ray) {
+        // `Scene` is the authority on whether a drag is open. A mode or tool switch arriving from the
+        // panel closes one inside `Scene` without passing through this state, and previewing on against
+        // a snapshot it has already rolled back would resurrect geometry the user has let go of.
+        if !self.scene.is_extruding() {
+            self.extrude_state = None;
+            return;
+        }
+
+        let Some(extrude) = self.extrude_state.as_mut() else {
+            return;
+        };
+        let travel = extrude.frame.direction(GizmoAxis::Z);
+
+        // A cursor ray running parallel to the travel axis says nothing about depth, so the drag holds the
+        // last depth it knew rather than inventing one.
+        if let Some(param) = gizmo::project_ray_onto_axis(extrude.frame.origin, travel, ray) {
+            let limit = extrude.arm_length * MAX_EXTRUDE_STEP_ARMS;
+            extrude.anchor.advance(param, limit);
+        }
+
+        let depth = extrude.anchor.applied;
+        let _ = self.scene.preview_extrude(depth);
+    }
+
+    /// Marks whichever drag is in flight that the view has moved, so its next cursor event re-baselines
+    /// rather than reading a projection measured from a different sight line.
+    fn mark_drag_swung(&mut self) {
+        if let Some(extrude) = self.extrude_state.as_mut() {
+            extrude.anchor.mark_swung();
+        }
+        if let Some(drag) = self.drag_state.as_mut() {
+            drag.anchor.mark_swung();
+        }
+    }
+
+    /// Settles an armed extrude wherever the mouse left it, echoing what landed. Returns false when no
+    /// extrude was armed, so the caller knows the click was the user selecting rather than committing.
+    fn commit_extrude_drag(&mut self) -> bool {
+        if self.extrude_state.take().is_none() {
+            return false;
+        }
+        // `Scene` may have closed the drag first - a mode or tool switch on the same frame - and there is
+        // nothing to settle then. Reporting false lets the click be read as the selection it also is,
+        // rather than vanishing into a commit of nothing.
+        let Some(commit) = self.scene.commit_extrude() else {
+            return false;
+        };
+        self.notice = Some(describe_extrude(commit));
+        true
     }
 
     /// Steps the document one action back. A seam rather than a `main.rs` call into `Scene`, because
@@ -663,10 +840,17 @@ impl<'a> State<'a> {
         self.camera_controller
             .process_scroll(delta, &mut self.camera);
         self.update_camera_matrix();
+        // The wheel needs no modifier, so it is the one camera change a user can make without lifting a
+        // drag or releasing a key - zooming to see a wall better mid-extrude would otherwise be read as
+        // depth the moment the cursor moves again.
+        self.mark_drag_swung();
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
+            // A different window height changes what the same cursor position projects to, so a drag in
+            // flight has to re-baseline before its next event.
+            self.mark_drag_swung();
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
@@ -722,6 +906,26 @@ impl<'a> State<'a> {
     }
 
     fn upload_gizmo(&mut self) {
+        // An armed extrude owns the handle: the axis it will travel along is the depth control, so it
+        // replaces the translate gizmo for as long as the drag is open, whatever tool is selected. Only
+        // that one arm is drawn, because the drag has one degree of freedom - showing the two axes across
+        // it would offer handles that do nothing.
+        if let Some(extrude) = &self.extrude_state {
+            let travel = extrude.frame.direction(GizmoAxis::Z);
+            let arms = vec![gizmo::Arm {
+                start: extrude.frame.origin,
+                end: extrude.frame.origin + travel * extrude.arm_length,
+                color: gizmo::COLOR_AXIS_ACTIVE,
+            }];
+            let vertices = overlay::gizmo_line_vertices(&arms);
+            self.num_gizmo_vertices = vertices.len() as u32;
+            if self.num_gizmo_vertices > 0 {
+                self.queue
+                    .write_buffer(&self.gizmo_buffer, 0, bytemuck::cast_slice(&vertices));
+            }
+            return;
+        }
+
         if self.scene.tool() != Tool::Translate {
             self.num_gizmo_vertices = 0;
             return;
@@ -763,14 +967,27 @@ impl<'a> State<'a> {
         self.cursor_pos = position;
         let height = self.config.height as f32;
 
+        // Alt with a button down is the camera's gesture, and `process_mouse_motion` has already spent
+        // this event orbiting. Every branch below reads the cursor as tool input instead, so orbiting for
+        // a better look at the face being extruded would be banked as depth, and orbiting mid vertex-drag
+        // would move geometry as a side effect of moving the view. Hover is cleared rather than left
+        // standing, which is what an Alt-held cursor used to do.
+        if self.camera_controller.is_navigating() {
+            self.mark_drag_swung();
+            self.hovered_axis = None;
+            return;
+        }
+
         if let Some(ray) = self.cursor_ray() {
-            if let Some(ref drag) = self.drag_state {
+            if self.extrude_state.is_some() {
+                self.track_extrude_drag(&ray);
+            } else if let Some(drag) = self.drag_state.as_mut() {
                 let axis_dir = drag.axis.unit_vector();
                 if let Some(current_param) =
                     gizmo::project_ray_onto_axis(drag.pivot, axis_dir, &ray)
                 {
-                    let delta_t = current_param - drag.initial_param;
-                    let delta_vec = axis_dir * delta_t;
+                    drag.anchor.advance(current_param, f32::MAX);
+                    let delta_vec = axis_dir * drag.anchor.applied;
                     self.scene
                         .translate_vertices(&drag.initial_positions, delta_vec);
                 }
@@ -808,6 +1025,12 @@ impl<'a> State<'a> {
         }
 
         if button_state == winit::event::ElementState::Pressed {
+            // An armed extrude claims this click as its depth, so it has to be settled before the click
+            // can be read as a selection or as the start of a gizmo drag.
+            if self.commit_extrude_drag() {
+                return;
+            }
+
             if !self.camera_controller.alt_pressed
                 && !self.ui_state.pie_menu_active
                 && !self.egui_ctx.wants_pointer_input()
@@ -836,9 +1059,11 @@ impl<'a> State<'a> {
                             self.scene.selection(),
                         )
                         .unwrap();
-                        let initial_param =
-                            gizmo::project_ray_onto_axis(pivot, axis.unit_vector(), &ray)
-                                .unwrap_or(0.0);
+                        let anchor = DragAnchor::at(gizmo::project_ray_onto_axis(
+                            pivot,
+                            axis.unit_vector(),
+                            &ray,
+                        ));
                         let initial_positions: Vec<(VertexId, cgmath::Point3<f32>)> = self
                             .scene
                             .selected_vertices()
@@ -849,7 +1074,7 @@ impl<'a> State<'a> {
                         self.drag_state = Some(DragState {
                             axis,
                             pivot,
-                            initial_param,
+                            anchor,
                             initial_positions,
                         });
                         // Opens the history step for this drag. Nothing has been moved yet, so this
@@ -871,7 +1096,16 @@ impl<'a> State<'a> {
         }
     }
 
+    /// Gives up whatever gesture is in flight: an extrude awaiting its depth, then a translate drag.
+    ///
+    /// Both live here rather than at the call sites because every path that moves the document underneath
+    /// a gesture has to close it first - Escape, yes, but also undo, redo and arming an extrude while a
+    /// translate drag is open. Leaving an extrude armed across one of those would have it preview from a
+    /// snapshot that no longer matches, and its click would land on unrelated geometry.
     pub fn cancel_active_drag(&mut self) {
+        if self.extrude_state.take().is_some() {
+            self.scene.abandon_extrude();
+        }
         if let Some(drag) = self.drag_state.take() {
             self.scene
                 .translate_vertices(&drag.initial_positions, cgmath::Vector3::new(0.0, 0.0, 0.0));
@@ -905,6 +1139,7 @@ impl<'a> State<'a> {
                 undo_label: self.scene.undo_label(),
                 redo_label: self.scene.redo_label(),
                 can_extrude: self.scene.can_extrude(),
+                extruding: self.scene.is_extruding(),
                 notice: self.notice.as_deref(),
             },
         );
@@ -921,7 +1156,15 @@ impl<'a> State<'a> {
             self.redo();
         }
         if ui_response.extrude {
-            self.extrude_selected_faces();
+            // The panel button means two different things depending on whether a drag is open, which is
+            // what its label says: arm a new extrude, or settle the one already travelling at the depth
+            // the mouse reached. Routing both through here keeps the viewport click and the button in
+            // agreement rather than each holding their own idea of the gesture's second half.
+            if self.scene.is_extruding() {
+                self.commit_extrude_drag();
+            } else {
+                self.begin_extrude_drag();
+            }
         }
 
         if self.scene.take_dirty() {
@@ -1135,5 +1378,70 @@ mod tests {
             "Move Face"
         );
         assert_eq!(drag_action_label(EditMode::Object, Tool::Translate), "Move");
+    }
+
+    #[test]
+    fn an_undisturbed_drag_tracks_the_cursor_exactly() {
+        // The re-anchoring must not cost anything ordinary: with the camera still, travel along the axis is
+        // simply the cursor's movement, so the handle sits where the hand put it. The parameters below are
+        // all exactly representable in f32, which is what lets these assert equality rather than a range.
+        let mut anchor = DragAnchor::at(Some(10.5));
+        anchor.advance(11.0, f32::MAX);
+        anchor.advance(12.0, f32::MAX);
+        anchor.advance(10.0, f32::MAX);
+        assert_eq!(anchor.applied, -0.5);
+    }
+
+    #[test]
+    fn swinging_the_camera_mid_drag_absorbs_the_jump() {
+        // Alt+drag orbits without ending the tool drag, and the wheel zooms with no modifier at all. The
+        // projection measured from the new sight line has nothing to do with the user's hand, so without a
+        // re-baseline the next cursor event moves the geometry by however far the camera travelled - the
+        // lump leaps, and on an extrude that depth is committed to the mesh.
+        let mut anchor = DragAnchor::at(Some(10.5));
+        anchor.advance(10.75, f32::MAX);
+        anchor.mark_swung();
+        anchor.advance(80.0, f32::MAX);
+        assert_eq!(
+            anchor.applied, 0.25,
+            "the swing itself must contribute nothing"
+        );
+
+        anchor.advance(80.25, f32::MAX);
+        assert_eq!(
+            anchor.applied, 0.5,
+            "and the drag resumes from the depth it had already reached"
+        );
+    }
+
+    #[test]
+    fn a_drag_armed_without_a_projection_waits_for_the_cursor() {
+        // A cursor outside the window, or a sight line running down the travel axis, projects to nothing.
+        // Anchoring that on zero would read the first move as travel and jump the moment the mouse stirred.
+        let mut anchor = DragAnchor::at(None);
+        anchor.advance(37.0, f32::MAX);
+        assert_eq!(anchor.applied, 0.0);
+
+        anchor.advance(37.5, f32::MAX);
+        assert_eq!(anchor.applied, 0.5);
+    }
+
+    #[test]
+    fn a_single_step_is_limited_but_the_drag_catches_up() {
+        // Nearly parallel to the travel axis, a one-pixel move projects wildly. The limit is what keeps the
+        // lump moving at a pace the user can follow; it is per event rather than total, so several steady
+        // events cover the distance.
+        let mut anchor = DragAnchor::at(Some(0.0));
+        anchor.advance(100.0, 1.0);
+        assert_eq!(anchor.applied, 1.0, "one event cannot outrun the handle");
+
+        anchor.advance(101.0, 1.0);
+        assert_eq!(anchor.applied, 2.0, "steady tracking keeps gaining");
+
+        anchor.advance(-50.0, 1.0);
+        assert_eq!(
+            anchor.applied, 1.0,
+            "and the same limit holds on the way back"
+        );
     }
 }
