@@ -397,6 +397,8 @@ fn drag_action_label(mode: EditMode, tool: Tool) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Hotkey {
     SetTool(Tool),
+    SetMode(EditMode),
+    ToggleObjectComponent,
     CancelDrag,
     Undo,
     Redo,
@@ -411,17 +413,25 @@ enum Hotkey {
 /// A free function rather than inline event-loop matching so the bindings - including the modifier
 /// rules below - are unit-testable without a window or a GPU context.
 ///
+/// # Bound exactly as Maya binds them
+///
+/// `Q` / `W` / `E` / `R` are Select / Move / Rotate / Scale, `Ctrl+Z` and `Ctrl+Y` (or
+/// `Ctrl+Shift+Z`) are undo / redo, and the four selection-mode keys are Maya's own: **`F8`** toggles
+/// object and component editing, **`F9` / `F10` / `F11`** pick Vertex / Edge / Face. `F12` is Maya's UV
+/// key and is deliberately unbound, since there is no UV layer here to switch to.
+///
 /// The tool keys only fire with Ctrl released: `Ctrl+Z` sends `KeyZ`, and without that guard a
-/// `Ctrl+E` intended as a menu mnemonic would silently switch to Rotate. They also require Shift
-/// released, which is what frees `Shift+E` for extrude - Maya binds extrude to a shelf button rather
-/// than a key, so this follows the `Shift` + letter convention the rest of the map already uses.
+/// `Ctrl` chord would silently switch tools. They also require Shift released, which frees the
+/// `Shift` + letter block below.
 ///
-/// `Shift+L` carries the same reasoning for Maya's *Insert Edge Loop Tool*, which is toolbox-only there
-/// as well: `L` for loop, sitting beside `Shift+E` so the two modelling commands stay together instead of
-/// being scattered across the map by whichever letter happened to be free.
+/// # Ours, because Maya leaves these on the shelf
 ///
-/// `Shift+B` is bevel, on the same convention and for the same reason - Maya puts *Bevel* on the shelf and
-/// leaves the bare letter to Paint Effects, so `B` is free and the `Shift` keeps it that way.
+/// `Ctrl+E` matches Maya's *Edit Mesh > Extrude* and is the chord to prefer; `Shift+E` is kept as a
+/// neighbour so the three modelling commands can be hit from one hand. Maya binds no default key to the
+/// *Insert Edge Loop Tool* or to *Bevel*, so `Shift+L` (loop) and `Shift+B` are ours by the same
+/// convention - chosen to sit together rather than scattered by whichever letter was free. Both collide
+/// with Maya's animation hotkeys (`Shift+E` sets a rotate key), which is acceptable in a modelling-only
+/// tool and worth revisiting if animation ever lands.
 ///
 /// `X` is a deliberate divergence rather than a Maya keymap copy: bare `x` is Maya's press-and-release
 /// "snap to grids", and this app has no snapping of any kind yet, so there is nothing here for it to
@@ -436,6 +446,7 @@ fn hotkey_for(key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> Option<
             Key::KeyZ if shift => Some(Hotkey::Redo),
             Key::KeyZ => Some(Hotkey::Undo),
             Key::KeyY => Some(Hotkey::Redo),
+            Key::KeyE => Some(Hotkey::Extrude),
             _ => None,
         };
     }
@@ -456,6 +467,10 @@ fn hotkey_for(key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> Option<
         Key::KeyE => Some(Hotkey::SetTool(Tool::Rotate)),
         Key::KeyR => Some(Hotkey::SetTool(Tool::Scale)),
         Key::KeyX => Some(Hotkey::CycleSpace),
+        Key::F8 => Some(Hotkey::ToggleObjectComponent),
+        Key::F9 => Some(Hotkey::SetMode(EditMode::Vertex)),
+        Key::F10 => Some(Hotkey::SetMode(EditMode::Edge)),
+        Key::F11 => Some(Hotkey::SetMode(EditMode::Face)),
         Key::Escape => Some(Hotkey::CancelDrag),
         _ => None,
     }
@@ -776,6 +791,18 @@ impl<'a> State<'a> {
         match hotkey_for(key, self.ctrl_pressed, self.shift_pressed) {
             Some(Hotkey::SetTool(tool)) => {
                 self.scene.set_tool(tool);
+                true
+            }
+            Some(Hotkey::SetMode(mode)) => {
+                self.scene.set_mode(mode);
+                // Echoed like the space cycle: the mode is shown in the panel title, which is easy to miss
+                // mid-task, and a mode switch also drops the selection that no longer applies.
+                self.notice = Some(format!("Selection mode: {}", mode.label()));
+                true
+            }
+            Some(Hotkey::ToggleObjectComponent) => {
+                self.scene.toggle_object_component();
+                self.notice = Some(format!("Selection mode: {}", self.scene.mode().label()));
                 true
             }
             Some(Hotkey::CancelDrag) => {
@@ -1518,9 +1545,10 @@ mod tests {
 
     #[test]
     fn tool_keys_do_not_fire_while_ctrl_is_held() {
-        // Otherwise `Ctrl+E` would quietly switch to Rotate, and `Ctrl+W` would close nothing but
-        // change the tool.
-        assert_eq!(hotkey_for(Key::KeyE, true, false), None);
+        // `Ctrl+W` closes a window in every other application and `Ctrl+Q` quits it; neither must quietly
+        // change the tool here. `E` is the exception, and deliberately so - Maya binds *Edit Mesh > Extrude*
+        // to `Ctrl+E`, so the chord is taken by a real command rather than falling through to Rotate.
+        assert_eq!(hotkey_for(Key::KeyE, true, false), Some(Hotkey::Extrude));
         assert_eq!(hotkey_for(Key::KeyW, true, false), None);
         assert_eq!(hotkey_for(Key::KeyQ, true, false), None);
     }
@@ -1580,6 +1608,38 @@ mod tests {
         // than bevel behind a menu mnemonic.
         assert_eq!(hotkey_for(Key::KeyB, true, false), None);
         assert_eq!(hotkey_for(Key::KeyL, true, false), None);
+    }
+
+    #[test]
+    fn the_selection_mode_keys_match_maya_exactly() {
+        // Autodesk's own list puts component selection on F9/F10/F11 with F8 toggling object and component
+        // editing - not on F2/F3/F4, which are its *menu set* keys. Getting this wrong is worse than not
+        // binding it at all: a key that switches to the wrong mode is a bug a Maya user cannot name.
+        assert_eq!(
+            hotkey_for(Key::F8, false, false),
+            Some(Hotkey::ToggleObjectComponent)
+        );
+        assert_eq!(
+            hotkey_for(Key::F9, false, false),
+            Some(Hotkey::SetMode(EditMode::Vertex))
+        );
+        assert_eq!(
+            hotkey_for(Key::F10, false, false),
+            Some(Hotkey::SetMode(EditMode::Edge))
+        );
+        assert_eq!(
+            hotkey_for(Key::F11, false, false),
+            Some(Hotkey::SetMode(EditMode::Face))
+        );
+
+        // F12 is Maya's UV key. There is no UV layer here, so it must stay unbound rather than be pressed
+        // into service as something else - a borrowed key is indistinguishable from a broken one.
+        assert_eq!(hotkey_for(Key::F12, false, false), None);
+        assert_eq!(hotkey_for(Key::F1, false, false), None);
+        // Held down, the mode keys do nothing: Maya has no Ctrl/Shift variant of them, and inventing one
+        // would shadow a chord another application already owns.
+        assert_eq!(hotkey_for(Key::F9, true, false), None);
+        assert_eq!(hotkey_for(Key::F8, false, true), None);
     }
 
     #[test]

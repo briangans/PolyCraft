@@ -104,6 +104,9 @@ pub struct Scene {
     mesh: HalfEdgeMesh,
     dirty: bool,
     mode: EditMode,
+    /// The most recent component mode, so Maya's `F8` can toggle back into it rather than guessing.
+    /// Only ever holds a component mode, which is why it is separate from `mode`.
+    last_component_mode: EditMode,
     tool: Tool,
     /// Which orientation the transform gizmo is drawn and dragged in. Maya's "reference system".
     space: Space,
@@ -119,6 +122,7 @@ impl Scene {
             mesh: HalfEdgeMesh::create_cube(),
             dirty: false,
             mode: EditMode::Object,
+            last_component_mode: EditMode::Vertex,
             tool: Tool::default(),
             space: Space::default(),
             selection: Selection::new(),
@@ -147,8 +151,25 @@ impl Scene {
 
         self.abandon_extrude();
         self.mode = mode;
+        if mode.is_component_mode() {
+            self.last_component_mode = mode;
+        }
         self.selection.retain_mode(mode);
         self.dirty = true;
+    }
+
+    /// Maya's `F8`: switch between object and component editing.
+    ///
+    /// Returns to whichever component mode was last in use rather than always the same one, so a user
+    /// working edges all session gets edges back instead of vertices. That remembered mode starts at
+    /// Vertex, which is what Maya's own selection mask opens on.
+    pub fn toggle_object_component(&mut self) {
+        let target = if self.mode.is_component_mode() {
+            EditMode::Object
+        } else {
+            self.last_component_mode
+        };
+        self.set_mode(target);
     }
 
     pub fn tool(&self) -> Tool {
@@ -813,6 +834,38 @@ mod tests {
         scene.set_mode(EditMode::Face);
         assert_eq!(scene.selected_count(), 0);
         assert!(!scene.selection().is_vertex_selected(VertexId(0)));
+    }
+
+    #[test]
+    fn the_component_toggle_returns_to_the_mode_last_in_use() {
+        // Maya's `F8`. Remembering is the whole point: someone editing edges all session who steps out to
+        // object mode and back expects edges, not whatever mode the document opens on.
+        let mut scene = Scene::new();
+        assert_eq!(scene.mode(), EditMode::Object);
+
+        scene.toggle_object_component();
+        assert_eq!(
+            scene.mode(),
+            EditMode::Vertex,
+            "before any component mode has been used, the toggle lands where Maya's mask opens"
+        );
+
+        scene.set_mode(EditMode::Edge);
+        scene.toggle_object_component();
+        assert_eq!(scene.mode(), EditMode::Object);
+        scene.toggle_object_component();
+        assert_eq!(
+            scene.mode(),
+            EditMode::Edge,
+            "and back to edges, not to vertices"
+        );
+
+        // Stepping into object mode must not overwrite what is remembered, or toggling out and in twice
+        // would drift back to the default.
+        scene.set_mode(EditMode::Object);
+        scene.set_mode(EditMode::Object);
+        scene.toggle_object_component();
+        assert_eq!(scene.mode(), EditMode::Edge);
     }
 
     #[test]
