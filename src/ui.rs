@@ -2,6 +2,7 @@
 //! the user asked for (for example a new `EditMode`) and the caller applies it.
 
 use crate::gizmo::Space;
+use crate::menu::Command;
 use crate::scene::EditMode;
 use crate::tool::Tool;
 use egui::{Color32, Pos2, Rect, Vec2};
@@ -30,6 +31,17 @@ pub struct UiResponse {
     /// The Bevel button was clicked, to trim the selected edge and open a facet where it ran. Lands on the
     /// press like an edge loop.
     pub bevel: bool,
+    /// `Select > All`. Every component of the mode in use; the count depends on the mode, which is why
+    /// this is a request rather than a set of ids - `Scene` is the only thing that can see the mesh.
+    pub select_all: bool,
+    /// `Select > None`, which Maya binds to `Ctrl+Shift+A`.
+    pub select_none: bool,
+    /// `Select > Invert`. Inverts within the mode in use, against the mesh rather than the stored
+    /// selection, so components an edit removed are shed rather than kept.
+    pub invert_selection: bool,
+    /// Ask for the next reference system rather than a named one, which is what `X` and the menu row do.
+    /// Distinct from [`UiResponse::space`]: the panel picks a specific orientation, this one advances.
+    pub cycle_space: bool,
 }
 
 /// Everything the UI displays for this frame, handed to [`UiState::draw`].
@@ -114,6 +126,144 @@ fn bevel_button_text(available: bool) -> &'static str {
     }
 }
 
+/// Which commands can act on the selection and history as they stand, so a menu row greys out for the
+/// same reason the panel button beside the viewport does.
+///
+/// Assembled from [`UiContext`] rather than recomputed here: a menu that decided availability for itself
+/// is a second opinion, and the second opinion is the one that offers a command the viewport then refuses.
+#[derive(Clone, Copy, Debug, Default)]
+struct Availability {
+    undo: bool,
+    redo: bool,
+    extrude: bool,
+    edge_loop: bool,
+    bevel: bool,
+}
+
+impl Availability {
+    /// Why `command` cannot run right now, in the words the row shows as a tooltip.
+    ///
+    /// Only the modelling commands have a "not like this" reason; undo and redo grey out because the queue
+    /// is empty, which the button labels already say by reading plain "Undo".
+    fn blocker(command: Command, available: Availability) -> Option<&'static str> {
+        use Command as C;
+        match command {
+            C::Undo if !available.undo => Some("Nothing left to undo."),
+            C::Redo if !available.redo => Some("Nothing to redo."),
+            C::Extrude if !available.extrude => {
+                Some("Needs faces selected - press F11, then click a face.")
+            }
+            C::EdgeLoop if !available.edge_loop => {
+                Some("Needs an edge selected - press F10, then click an edge.")
+            }
+            C::Bevel if !available.bevel => {
+                Some("Needs exactly one edge selected - press F10 and click one edge.")
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Draws the menu bar and records whatever was clicked into `response`.
+///
+/// The rows come from `menu::MENUS`, which is data; this only turns a row into a widget and a command into
+/// a [`UiResponse`] field. That is what makes a menu click behave exactly like the hotkey or panel button
+/// for the same command - all three end up in the same `State` method, so there is no second
+/// implementation to fall out of agreement with the first.
+fn draw_menu_bar(
+    ctx: &egui::Context,
+    current_mode: EditMode,
+    current_tool: Tool,
+    available: Availability,
+    response: &mut UiResponse,
+) {
+    egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+        egui::menu::bar(ui, |ui| {
+            for menu in crate::menu::MENUS {
+                ui.menu_button(menu.title, |ui| {
+                    for row in menu.rows {
+                        draw_menu_row(ui, row, current_mode, current_tool, available, response);
+                    }
+                });
+            }
+        });
+    });
+}
+
+/// One row: enabled and ticked where it applies, greyed with the reason where it does not.
+///
+/// Two kinds of grey mean two different things and are kept apart by their tooltip. A row with no command
+/// behind it is a feature this app does not have - Maya has it, we are reporting the gap. A row with a
+/// command that is blocked is a feature that works, on a selection it does not currently apply to.
+fn draw_menu_row(
+    ui: &mut egui::Ui,
+    row: &crate::menu::Row,
+    current_mode: EditMode,
+    current_tool: Tool,
+    available: Availability,
+    response: &mut UiResponse,
+) {
+    let (label, shortcut, command, note) = *row;
+
+    // The chord rides on the label the way Maya's does. egui has no right-aligned column inside a menu,
+    // and adding one is not worth a custom widget while every row is a single line of text.
+    let text = if shortcut.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{label}    {shortcut}")
+    };
+
+    let Some(command) = command else {
+        ui.add_enabled(false, egui::SelectableLabel::new(false, text))
+            .on_hover_text(note);
+        return;
+    };
+
+    // A mode row carries the check mark Maya puts beside the component type in use, and a tool row the
+    // light Maya puts on the active Tool Box button - the only two kinds of state a menu row can show,
+    // since everything else here is an action rather than a toggle.
+    let checked = crate::menu::mode_for(command) == Some(current_mode)
+        || crate::menu::tool_for(command) == Some(current_tool);
+    match Availability::blocker(command, available) {
+        Some(reason) => {
+            ui.add_enabled(false, egui::SelectableLabel::new(checked, text))
+                .on_hover_text(reason);
+        }
+        None => {
+            if ui
+                .add(egui::SelectableLabel::new(checked, text))
+                .on_hover_text(crate::menu::tooltip_for(row))
+                .clicked()
+            {
+                dispatch(command, response);
+                ui.close_menu();
+            }
+        }
+    }
+}
+
+/// Routes a menu command onto the intent field the panel button or hotkey for the same command would set.
+fn dispatch(command: Command, response: &mut UiResponse) {
+    use Command as C;
+    match command {
+        C::ObjectMode => response.mode = Some(EditMode::Object),
+        C::VertexMode => response.mode = Some(EditMode::Vertex),
+        C::EdgeMode => response.mode = Some(EditMode::Edge),
+        C::FaceMode => response.mode = Some(EditMode::Face),
+        C::SelectTool => response.tool = Some(Tool::Select),
+        C::MoveTool => response.tool = Some(Tool::Translate),
+        C::Undo => response.undo = true,
+        C::Redo => response.redo = true,
+        C::Extrude => response.extrude = true,
+        C::EdgeLoop => response.edge_loop = true,
+        C::Bevel => response.bevel = true,
+        C::CycleReferenceSystem => response.cycle_space = true,
+        C::SelectAll => response.select_all = true,
+        C::SelectNone => response.select_none = true,
+        C::InvertSelection => response.invert_selection = true,
+    }
+}
+
 const PIE_RADIUS: f32 = 70.0;
 
 /// How far the pointer must travel from the menu center before a slot counts as flicked toward.
@@ -177,6 +327,22 @@ impl UiState {
             notice,
         } = current;
         let mut response = UiResponse::default();
+
+        // Maya's menu bar runs across the top of the window, ahead of the panels, so it is the first thing
+        // the eye reaches, and it is where a missing command shows up as a grey row rather than a rumour.
+        draw_menu_bar(
+            ctx,
+            current_mode,
+            current_tool,
+            Availability {
+                undo: can_undo,
+                redo: can_redo,
+                extrude: can_extrude,
+                edge_loop: can_insert_edge_loop,
+                bevel: can_bevel,
+            },
+            &mut response,
+        );
 
         // 1. Check if Right Mouse Button (without Alt, Maya-style) or Spacebar is held
         let rmb_down = ctx
@@ -355,10 +521,16 @@ impl UiState {
                     );
                 }
                 ui.separator();
+                // The roadmap in Maya's own terms. The menu bar carries every entry Maya's modelling menus
+                // have, so this count is the distance left to travel - derived from the menu table rather
+                // than written out, because a hand-typed number would be wrong the moment a row goes live.
+                let (live, waiting) = crate::menu::tally();
+                ui.label(format!("Maya commands: {} live, {} greyed", live, waiting));
                 ui.label("Hold RMB or SPACE to open the Pie Menu.");
-                ui.label("Hotkeys: Q: Select | W: Move | E: Rotate | R: Scale");
-                ui.label("Ctrl+Z: Undo | Ctrl+Y / Ctrl+Shift+Z: Redo");
-                ui.label("Shift+E: Extrude selected faces");
+                ui.label("F8 Object | F9 Vertex | F10 Edge | F11 Face");
+                ui.label("Q Select | W Move | E Rotate | R Scale | X Reference System");
+                ui.label("Shift+E Extrude | Shift+L Loop Cut | Shift+B Bevel | Esc Cancel");
+                ui.label("Ctrl+A All | Ctrl+Shift+A None | Ctrl+Shift+I Invert | Ctrl+Z Undo");
             });
         }
 
@@ -498,17 +670,27 @@ mod tests {
         run_frame_full(ctx, ui_state, open, true);
     }
 
-    /// Endpoints of the first line segment among the painted shapes, if any. The swipe-tracking
-    /// line is the only line segment the pie menu paints.
-    fn tracking_line(shapes: &[egui::epaint::ClippedShape]) -> Option<[Pos2; 2]> {
-        fn find(shape: &egui::epaint::Shape) -> Option<[Pos2; 2]> {
+    /// Endpoints of the pie menu's swipe-tracking line among the painted shapes, if any.
+    ///
+    /// Filtered by position rather than by taking the first line found: the menu bar's `TopBottomPanel`
+    /// paints its own separator across the top of the window, so "the only line segment" stopped being
+    /// true the moment a panel was added, and the tests read as failures rather than as a changed world.
+    /// Both endpoints inside twice the pie radius is the tracking line and nothing else.
+    fn tracking_line(shapes: &[egui::epaint::ClippedShape], around: Pos2) -> Option<[Pos2; 2]> {
+        fn find(shape: &egui::epaint::Shape, around: Pos2) -> Option<[Pos2; 2]> {
             match shape {
-                egui::epaint::Shape::LineSegment { points, .. } => Some(*points),
-                egui::epaint::Shape::Vec(inner) => inner.iter().find_map(find),
+                egui::epaint::Shape::LineSegment { points, .. } => {
+                    let reach = PIE_RADIUS * 2.0;
+                    let near = |point: &Pos2| point.distance(around) <= reach;
+                    points.iter().all(near).then_some(*points)
+                }
+                egui::epaint::Shape::Vec(inner) => inner.iter().find_map(|s| find(s, around)),
                 _ => None,
             }
         }
-        shapes.iter().find_map(|clipped| find(&clipped.shape))
+        shapes
+            .iter()
+            .find_map(|clipped| find(&clipped.shape, around))
     }
 
     /// Opens the menu at (300, 300), moves the pointer by `flick`, then releases Space.
@@ -576,7 +758,7 @@ mod tests {
         let pointer = Pos2::new(340.0, 300.0);
         let moved = vec![egui::Event::PointerMoved(pointer)];
         let (_, shapes) = run_frame_full(&ctx, &mut ui_state, moved, true);
-        assert_eq!(tracking_line(&shapes), Some([center, pointer]));
+        assert_eq!(tracking_line(&shapes, center), Some([center, pointer]));
     }
 
     #[test]
@@ -587,7 +769,7 @@ mod tests {
 
         let gone = vec![egui::Event::PointerGone];
         let (_, shapes) = run_frame_full(&ctx, &mut ui_state, gone, true);
-        assert_eq!(tracking_line(&shapes), None);
+        assert_eq!(tracking_line(&shapes, Pos2::new(300.0, 300.0)), None);
     }
 
     #[test]

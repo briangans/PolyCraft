@@ -406,6 +406,9 @@ enum Hotkey {
     EdgeLoop,
     Bevel,
     CycleSpace,
+    SelectAll,
+    SelectNone,
+    InvertSelection,
 }
 
 /// The Maya keymap, as a pure function of the physical key and the Ctrl / Shift modifiers.
@@ -419,6 +422,14 @@ enum Hotkey {
 /// `Ctrl+Shift+Z`) are undo / redo, and the four selection-mode keys are Maya's own: **`F8`** toggles
 /// object and component editing, **`F9` / `F10` / `F11`** pick Vertex / Edge / Face. `F12` is Maya's UV
 /// key and is deliberately unbound, since there is no UV layer here to switch to.
+///
+/// The three select commands keep Maya's chords exactly: **`Ctrl+A`** All, **`Ctrl+Shift+A`** None,
+/// **`Ctrl+Shift+I`** Invert. `Ctrl+A` is the one place this app knowingly overwrites Maya, whose `Ctrl+A`
+/// opens the Attribute Editor - there is no attribute system here to displace, and `menu.rs` records the
+/// claim so it is renegotiated rather than quietly inherited if one lands.
+///
+/// All three act on the mode in use, matching Maya: `Ctrl+A` in Face mode selects every face, and a
+/// selection made in one mode is not carried into another.
 ///
 /// The tool keys only fire with Ctrl released: `Ctrl+Z` sends `KeyZ`, and without that guard a
 /// `Ctrl` chord would silently switch tools. They also require Shift released, which frees the
@@ -447,6 +458,9 @@ fn hotkey_for(key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> Option<
             Key::KeyZ => Some(Hotkey::Undo),
             Key::KeyY => Some(Hotkey::Redo),
             Key::KeyE => Some(Hotkey::Extrude),
+            Key::KeyA if shift => Some(Hotkey::SelectNone),
+            Key::KeyA => Some(Hotkey::SelectAll),
+            Key::KeyI if shift => Some(Hotkey::InvertSelection),
             _ => None,
         };
     }
@@ -830,14 +844,61 @@ impl<'a> State<'a> {
                 true
             }
             Some(Hotkey::CycleSpace) => {
-                self.scene.cycle_space();
-                // Echoed because the only other signal is the handle reorienting, which is easy to miss on
-                // a face whose normal already runs along a world axis.
-                self.notice = Some(format!("Gizmo space: {}", self.scene.space().label()));
+                self.cycle_reference_system();
+                true
+            }
+            Some(Hotkey::SelectAll) => {
+                self.select_all();
+                true
+            }
+            Some(Hotkey::SelectNone) => {
+                self.select_none();
+                true
+            }
+            Some(Hotkey::InvertSelection) => {
+                self.invert_selection();
                 true
             }
             None => false,
         }
+    }
+
+    /// Advances the transform gizmo to the next reference system and echoes it.
+    ///
+    /// Shared with the menu row because the only signal otherwise is the handle reorienting, which is easy
+    /// to miss on a face whose normal already runs along a world axis - and a menu click that echoed
+    /// something different from the key would read as two commands, not two routes to one.
+    fn cycle_reference_system(&mut self) {
+        self.scene.cycle_space();
+        self.notice = Some(format!("Gizmo space: {}", self.scene.space().label()));
+    }
+
+    /// Selects every component of the mode in use and echoes how many, so the command is visible even when
+    /// the whole mesh was already chosen and nothing on screen changes.
+    fn select_all(&mut self) {
+        let count = self.scene.select_all();
+        self.notice = Some(format!(
+            "Selected {} {}",
+            count,
+            self.scene.mode().plural_label().to_lowercase()
+        ));
+    }
+
+    /// Drops the selection. Echoed unconditionally: with nothing selected the command changes nothing, and
+    /// a key that answers nothing looks broken.
+    fn select_none(&mut self) {
+        self.scene.select_none();
+        self.notice = Some("Selection cleared".to_string());
+    }
+
+    /// Swaps the selected and unselected components of the mode in use.
+    fn invert_selection(&mut self) {
+        let count = self.scene.invert_selection();
+        self.notice = Some(format!(
+            "Inverted: {} {} selected",
+            count,
+            self.scene.mode().plural_label().to_lowercase()
+        ));
     }
 
     /// Arms an extrude of the selected faces and waits for the mouse to give it a depth.

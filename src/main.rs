@@ -2,6 +2,7 @@ mod camera;
 pub mod edit_mode;
 mod gizmo;
 mod history;
+mod menu;
 mod mesh;
 mod mesh_edit;
 mod overlay;

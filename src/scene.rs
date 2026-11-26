@@ -5,11 +5,12 @@
 
 use crate::gizmo::Space;
 use crate::history::HistoryStack;
-use crate::mesh::{EdgeId, FaceId, HalfEdgeMesh, TopologyErrors};
+use crate::mesh::{EdgeId, FaceId, HalfEdgeMesh, TopologyErrors, VertexId};
 use crate::picking::{self, Ray};
 use crate::selection::Selection;
 use cgmath::{InnerSpace, Point3, Vector3};
 use std::collections::HashSet;
+use std::hash::Hash;
 
 pub use crate::edit_mode::EditMode;
 pub use crate::tool::Tool;
@@ -594,6 +595,83 @@ impl Scene {
         std::mem::take(&mut self.dirty)
     }
 
+    /// Maya's `Select > All`: every component of the mode in use, and how many that turned out to be.
+    ///
+    /// The mode decides, not the mesh, because that is what makes the command mean something in Object
+    /// mode - there is one object here, so All selects it. Component modes take the whole mesh, which is
+    /// how all 12 edges of a cube get selected without a marquee; the marquee drag does not exist yet.
+    ///
+    /// Not an undo step. Maya's undo queue does record selection, and it is a widely complained-about
+    /// behaviour: `Ctrl+Z` steps back through selections instead of through edits. Since a
+    /// [`Scene::snapshot`] carries the selection alongside the geometry, recording one of these would
+    /// spend 64 slots of history on clicks. The selection a revert restores is therefore whatever it was
+    /// when the last real edit began.
+    pub fn select_all(&mut self) -> usize {
+        let changed = match self.mode {
+            // Object mode has one candidate, so All means "the object" - and means nothing at all while
+            // the document holds no geometry to select.
+            EditMode::Object => self.selection.apply_object_click(true, false),
+            EditMode::Vertex => fill_set(
+                self.selection.vertices_mut(),
+                (0..self.mesh.vertices.len()).map(VertexId),
+            ),
+            EditMode::Edge => fill_set(
+                self.selection.edges_mut(),
+                self.mesh.edges().into_iter().map(|(edge, _)| edge),
+            ),
+            EditMode::Face => fill_set(
+                self.selection.faces_mut(),
+                (0..self.mesh.faces.len()).map(FaceId),
+            ),
+        };
+        self.dirty |= changed;
+        self.selection.count(self.mode)
+    }
+
+    /// Maya's `Select > None`. Returns whether anything was deselected.
+    pub fn select_none(&mut self) -> bool {
+        if self.selection.count(self.mode) == 0 {
+            return false;
+        }
+        // `clear` drops every mode, which is more than the mode in hand - and that is right here, since
+        // the modes the user cannot see would otherwise come back when they switch back to them.
+        self.selection.clear();
+        self.dirty = true;
+        true
+    }
+
+    /// Maya's `Select > Invert`: the components of the current mode that were not selected now are, and
+    /// vice versa. Returns how many stand selected afterwards.
+    ///
+    /// Inverting against the live mesh rather than against the selection's own keys is the point of the
+    /// command - a selection that outlived an undo can name a component the mesh no longer has, and those
+    /// are dropped instead of being carried into the new set.
+    pub fn invert_selection(&mut self) -> usize {
+        let changed = match self.mode {
+            EditMode::Object => {
+                self.selection.apply_object_click(false, false) || {
+                    // Inverting the one object the document holds is exactly toggling it, which
+                    // `apply_object_click` does when it hits and the object is already chosen.
+                    self.selection.apply_object_click(true, true)
+                }
+            }
+            EditMode::Vertex => invert_set(
+                self.selection.vertices_mut(),
+                (0..self.mesh.vertices.len()).map(VertexId),
+            ),
+            EditMode::Edge => invert_set(
+                self.selection.edges_mut(),
+                self.mesh.edges().into_iter().map(|(edge, _)| edge),
+            ),
+            EditMode::Face => invert_set(
+                self.selection.faces_mut(),
+                (0..self.mesh.faces.len()).map(FaceId),
+            ),
+        };
+        self.dirty |= changed;
+        self.selection.count(self.mode)
+    }
+
     // ---- Undo / redo ----------------------------------------------------------------------------
 
     /// Captures everything undo/redo versions: the geometry and its selection, not the mode or tool.
@@ -735,6 +813,37 @@ fn extrude_label(face_count: usize) -> String {
     } else {
         "Extrude Faces".to_string()
     }
+}
+
+/// Replaces one mode's set with every component the mesh has, reporting whether anything changed so the
+/// caller knows to re-upload. Comparing whole sets rather than inserting one at a time is what lets a
+/// selection that outlived an edit shed the components the mesh no longer has.
+fn fill_set<T>(chosen: &mut HashSet<T>, every: impl Iterator<Item = T>) -> bool
+where
+    T: Eq + Hash,
+{
+    let all: HashSet<T> = every.collect();
+    if all == *chosen {
+        return false;
+    }
+    *chosen = all;
+    true
+}
+
+/// Maya's invert: the components that were not chosen now are. Anything chosen that is not among the
+/// candidates is dropped rather than carried over, which is the same shedding rule [`fill_set`] applies.
+fn invert_set<T>(chosen: &mut HashSet<T>, every: impl Iterator<Item = T>) -> bool
+where
+    T: Eq + Hash,
+{
+    let flipped: HashSet<T> = every
+        .filter(|candidate| !chosen.contains(candidate))
+        .collect();
+    if flipped == *chosen {
+        return false;
+    }
+    *chosen = flipped;
+    true
 }
 
 #[cfg(test)]
