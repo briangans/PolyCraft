@@ -57,6 +57,33 @@ pub struct SplitEdge {
 /// refusal arrive as "an extrusion needs a non-zero offset" instead of a list of faces with no area.
 const MIN_EXTRUDE_OFFSET: f32 = 1e-6;
 
+/// What [`HalfEdgeMesh::split_face`] created: `face` cut in two along one new edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplitFace {
+    /// The face the caller named. It keeps its id and now bounds the half that runs `b` back to `a`.
+    pub original_face: FaceId,
+    /// The appended half, holding the chain that ran `a` forward to `b`.
+    pub new_face: FaceId,
+    /// The two half-edges of the new edge, as `(b to a on new_face, a to b on original_face)`. Both
+    /// name the same [`EdgeId`], which is the edge that was inserted.
+    pub half_edges: [HalfEdgeId; 2],
+}
+
+/// What [`HalfEdgeMesh::insert_edge_loop`] created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgeLoopCut {
+    /// The edges the ring passed through, in ring order. None of them exist any more: each was split in
+    /// two, so a selection held across the cut cannot keep naming them.
+    pub cut_edges: Vec<EdgeId>,
+    /// One vertex inserted at the middle of each cut edge, in the same order as `cut_edges`.
+    pub new_vertices: Vec<VertexId>,
+    /// The ring that was inserted - one edge across each face the loop crossed. These are live, and they
+    /// are what the command leaves selected, because they are the thing the user asked for.
+    pub new_edges: Vec<EdgeId>,
+    /// The faces appended by those cuts, in the same order as `new_edges`.
+    pub new_faces: Vec<FaceId>,
+}
+
 /// What [`HalfEdgeMesh::extrude_faces`] created.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Extruded {
@@ -265,6 +292,301 @@ impl HalfEdgeMesh {
         Ok(split)
     }
 
+    /// Cuts `face` in two along a new edge joining two of its existing corners, `a` and `b`, and appends
+    /// the half that comes off the cut. This is what an edge loop uses to open a face; nothing is removed.
+    ///
+    /// The face the caller named keeps its id and bounds the half running from `b` back round to `a`; the
+    /// appended face takes the chain that ran from `a` forward to `b`. Both halves inherit the original
+    /// winding untouched, because each is a contiguous slice of one loop - which is why no corner is
+    /// reordered here, and why the renderer's back-face rule keeps agreeing with `validate` afterwards.
+    ///
+    /// The two corners must not already be joined: the distance between them along the loop, and its
+    /// complement, must both be at least 2. That one rule refuses a cut drawn on top of an edge that
+    /// exists, refuses the same cut named the other way round, and is the reason a triangle cannot be cut
+    /// at all - there is no pair of its corners that isn't already an edge.
+    ///
+    /// Returns what was created, or every reason the cut cannot happen, having changed nothing.
+    pub fn split_face(
+        &mut self,
+        face: FaceId,
+        a: VertexId,
+        b: VertexId,
+    ) -> Result<SplitFace, TopologyErrors> {
+        let (loop_edges, a_at, b_at) = self.split_face_setup(face, a, b)?;
+
+        let mut candidate = self.clone();
+        let cut = candidate.splice_face(face, &loop_edges, a_at, b_at);
+        install_if_valid(
+            candidate,
+            self,
+            format!(
+                "cutting face {} between vertex {} and vertex {} produced topology that does not validate",
+                face.0, a.0, b.0
+            ),
+        )?;
+        Ok(cut)
+    }
+
+    /// Cuts a ring of faces in two along one new edge per face - Maya's *Insert Edge Loop*. The ring is
+    /// the set of edges reached by crossing from an edge to the edge opposite it in each face it enters,
+    /// which on the quad grid this app builds means two steps round the loop and gives the parallel,
+    /// evenly-spaced cut the tool is named for.
+    ///
+    /// Nothing is deleted, so this stays on append-only storage like face extrusion: the crossed faces
+    /// keep their ids, and so does every edge that was not part of the ring.
+    ///
+    /// Two kinds of id do die, and both are reported rather than left to be discovered:
+    ///
+    /// - Each edge the ring passed through was split in two, so it names a vertex pair that no longer
+    ///   exists - the caveat [`HalfEdgeMesh::split_edge`] carries, arriving here for a whole ring at once.
+    /// - Each crossed face gains two corners, so the faces themselves are unchanged but no longer the
+    ///   quads they were until their own cut is applied.
+    ///
+    /// The new ring edges are returned as `new_edges`, which is what the command leaves selected: they are
+    /// the geometry the user asked for, and they are live.
+    ///
+    /// Quads only, deliberately. "The edge opposite this one" is not a well-defined notion on an n-gon,
+    /// and guessing - nearest corner, halfway round - would place cuts the user did not ask for, so a
+    /// non-quad face is refused by number instead.
+    ///
+    /// Returns what was created, or every reason the ring cannot be cut, having changed nothing. A ring
+    /// that runs off an open boundary is cut as far as it goes rather than refused: that is what a loop on
+    /// an unfinished mesh means, and stopping early loses nothing.
+    pub fn insert_edge_loop(&mut self, seed: EdgeId) -> Result<EdgeLoopCut, TopologyErrors> {
+        let crossings = edge_loop_crossings(self, seed)?;
+
+        // The edges to open are each crossing's entry edge, plus the final exit edge: on a closed ring that
+        // last one is already the first entry, which is why the list is deduplicated rather than counted
+        // out. Order is kept, so `cut_edges` reads as the ring.
+        let mut cut_edges: Vec<EdgeId> = Vec::new();
+        for crossing in &crossings {
+            if !cut_edges.contains(&crossing.enters) {
+                cut_edges.push(crossing.enters);
+            }
+        }
+        if let Some(last) = crossings.last() {
+            if !cut_edges.contains(&last.exits) {
+                cut_edges.push(last.exits);
+            }
+        }
+
+        // Every edge of the ring is opened before any face is cut, so each crossed face has both of its new
+        // corners in hand when its turn comes. Opening one cannot disturb another: the list has no repeats,
+        // and `split_edge` rewires only the half-edges of the edge it is given.
+        let mut candidate = self.clone();
+        let mut new_vertices = Vec::with_capacity(cut_edges.len());
+        let mut midpoints: HashMap<(usize, usize), VertexId> = HashMap::new();
+        for &edge in &cut_edges {
+            let Some(position) = candidate.midpoint(edge) else {
+                return Err(vec![format!(
+                    "the ring names the edge between vertex {} and vertex {}, but one of those vertices is \
+                     not on the mesh",
+                    edge.0, edge.1
+                )]);
+            };
+            match candidate.split_edge(edge, position) {
+                Ok(split) => {
+                    midpoints.insert((edge.0, edge.1), split.vertex);
+                    new_vertices.push(split.vertex);
+                }
+                Err(mut errors) => {
+                    errors.insert(
+                        0,
+                        format!(
+                            "the edge loop could not open the edge between vertex {} and vertex {}",
+                            edge.0, edge.1
+                        ),
+                    );
+                    return Err(errors);
+                }
+            }
+        }
+
+        // Then each crossed face is cut between the midpoints it now owns. Both are corners of that face by
+        // construction - the walk only names edges of the face it is crossing - so a refusal here means the
+        // walk and the rewiring disagree, and the message says so rather than pretending the arguments were
+        // sound.
+        let mut new_edges = Vec::with_capacity(crossings.len());
+        let mut new_faces = Vec::with_capacity(crossings.len());
+        for crossing in &crossings {
+            let (Some(a), Some(b)) = (
+                midpoints.get(&(crossing.enters.0, crossing.enters.1)),
+                midpoints.get(&(crossing.exits.0, crossing.exits.1)),
+            ) else {
+                return Err(vec![format!(
+                    "cutting face {} for the edge loop found no midpoint on the edges the ring walked \
+                     through it by; the walk and the mesh disagree about its corners",
+                    crossing.face.0
+                )]);
+            };
+
+            match candidate.split_face(crossing.face, *a, *b) {
+                Ok(cut) => {
+                    new_edges.push(EdgeId::between(*a, *b));
+                    new_faces.push(cut.new_face);
+                }
+                Err(mut errors) => {
+                    errors.insert(
+                        0,
+                        format!("the edge loop could not cut face {}", crossing.face.0),
+                    );
+                    return Err(errors);
+                }
+            }
+        }
+
+        // Every step validated its own result before accepting it, so the finished candidate is a mesh
+        // that already holds. Installing by assignment is what makes the cut visible: without it this
+        // function would report the ring it planned rather than the one it made.
+        *self = candidate;
+
+        Ok(EdgeLoopCut {
+            cut_edges,
+            new_vertices,
+            new_edges,
+            new_faces,
+        })
+    }
+
+    /// The loop of `face` together with where `a` and `b` sit in it, or the reason they name no cut.
+    ///
+    /// Each check here makes the next one measurable rather than merely unwelcome - the corner positions
+    /// cannot be looked up without a walkable loop, and the adjacency test cannot be run without two
+    /// corners that were found - so these report singly, unlike [`HalfEdgeMesh::append_face`], whose
+    /// objections are independent of one another.
+    fn split_face_setup(
+        &self,
+        face: FaceId,
+        a: VertexId,
+        b: VertexId,
+    ) -> Result<(Vec<HalfEdgeId>, usize, usize), TopologyErrors> {
+        if a == b {
+            return Err(vec![format!(
+                "a cut needs two different corners, vertex {} was named for both ends of it",
+                a.0
+            )]);
+        }
+        if face.0 >= self.faces.len() {
+            return Err(vec![format!("face {} does not exist on this mesh", face.0)]);
+        }
+        let Some(loop_edges) = self.face_walk(face) else {
+            return Err(vec![format!(
+                "face {} does not bound a closed loop of at least three corners, so it cannot be cut",
+                face.0
+            )]);
+        };
+
+        let Some(a_at) = self.corner_at(&loop_edges, a) else {
+            return Err(vec![format!(
+                "vertex {} is not a corner of face {}",
+                a.0, face.0
+            )]);
+        };
+        let Some(b_at) = self.corner_at(&loop_edges, b) else {
+            return Err(vec![format!(
+                "vertex {} is not a corner of face {}",
+                b.0, face.0
+            )]);
+        };
+
+        let count = loop_edges.len();
+        let forward = (b_at + count - a_at) % count;
+        if forward < 2 || count - forward < 2 {
+            return Err(vec![format!(
+                "vertices {} and {} are already joined by an edge of face {}, so there is nothing to cut \
+                 between them",
+                a.0, b.0, face.0
+            )]);
+        }
+
+        Ok((loop_edges, a_at, b_at))
+    }
+
+    /// Where in a face loop the half-edge leaving `corner` sits, or `None` when the loop has no such
+    /// corner. Indexing is safe because [`HalfEdgeMesh::face_walk`] only yields entries it resolved.
+    fn corner_at(&self, loop_edges: &[HalfEdgeId], corner: VertexId) -> Option<usize> {
+        loop_edges
+            .iter()
+            .position(|&edge| self.half_edges[edge.0].origin == corner)
+    }
+
+    /// The rewire [`HalfEdgeMesh::split_face`] performs on its clone once the setup has agreed the cut is
+    /// possible: two half-edges appended, one each way along the new edge, and the chain between the two
+    /// corners moved onto a freshly appended face.
+    ///
+    /// Twinship is all that fuses two faces along an edge here, so making the two new half-edges twins of
+    /// each other *is* the cut; the four links at the ends of each chain are what have to notice. That is
+    /// the whole cost, constant however many corners the face had, and no corner's own record is touched,
+    /// which is why both halves keep the winding the caller started with.
+    ///
+    /// `a_at` and `b_at` come from [`HalfEdgeMesh::split_face_setup`], which already proved both halves end
+    /// up with at least three edges. That proof is what makes the four links four *distinct* half-edges, so
+    /// no assignment below overwrites another.
+    fn splice_face(
+        &mut self,
+        face: FaceId,
+        loop_edges: &[HalfEdgeId],
+        a_at: usize,
+        b_at: usize,
+    ) -> SplitFace {
+        let count = loop_edges.len();
+        let new_face = FaceId(self.faces.len());
+        let a_to_b = HalfEdgeId(self.half_edges.len());
+        let b_to_a = HalfEdgeId(self.half_edges.len() + 1);
+
+        let a = self.half_edges[loop_edges[a_at].0].origin;
+        let b = self.half_edges[loop_edges[b_at].0].origin;
+        // The edge arriving at each corner and the one leaving it: the chord slots between the pair, once
+        // per half.
+        let into_a = loop_edges[(a_at + count - 1) % count];
+        let from_a = loop_edges[a_at];
+        let into_b = loop_edges[(b_at + count - 1) % count];
+        let from_b = loop_edges[b_at];
+
+        // Everything from `a` up to but not including `b` becomes the new face's loop; the rest of the
+        // original loop is what the face the caller named keeps.
+        let mut step = a_at;
+        while step != b_at {
+            self.half_edges[loop_edges[step].0].face = Some(new_face);
+            step = (step + 1) % count;
+        }
+
+        // The face the caller named can no longer start from the half-edge it recorded, because that one
+        // just moved. `from_b` is the first edge of the chain it keeps, so repointing the cache there is
+        // what leaves both halves walkable - and `face_walk` reads through that cache, so skipping this
+        // would strand the original face even though every one of its own links is correct.
+        self.faces[face.0].half_edge = Some(from_b);
+
+        self.faces.push(Face {
+            half_edge: Some(b_to_a),
+        });
+        self.half_edges.push(HalfEdge {
+            origin: a,
+            twin: Some(b_to_a),
+            next: Some(from_b),
+            prev: Some(into_a),
+            face: Some(face),
+        });
+        self.half_edges.push(HalfEdge {
+            origin: b,
+            twin: Some(a_to_b),
+            next: Some(from_a),
+            prev: Some(into_b),
+            face: Some(new_face),
+        });
+
+        self.half_edges[into_a.0].next = Some(a_to_b);
+        self.half_edges[from_b.0].prev = Some(a_to_b);
+        self.half_edges[into_b.0].next = Some(b_to_a);
+        self.half_edges[from_a.0].prev = Some(b_to_a);
+
+        SplitFace {
+            original_face: face,
+            new_face,
+            half_edges: [b_to_a, a_to_b],
+        }
+    }
+
     /// The vertex a half-edge points at, or `None` when its `next` link is missing or dangling.
     ///
     /// The public [`HalfEdgeMesh::half_edge_destination`] panics on such a link, which is the right
@@ -292,6 +614,29 @@ impl HalfEdgeMesh {
         (0..self.half_edges.len())
             .map(HalfEdgeId)
             .find(|&half_edge| self.edge_id_of(half_edge) == Some(edge))
+    }
+
+    /// As [`HalfEdgeMesh::half_edge_on`], but only a half-edge that actually bounds a face. An edge with no
+    /// face on either side has nothing for a loop to cross, so it cannot seed one.
+    fn face_half_edge_on(&self, edge: EdgeId) -> Option<HalfEdgeId> {
+        (0..self.half_edges.len())
+            .map(HalfEdgeId)
+            .find(|&half_edge| {
+                self.edge_id_of(half_edge) == Some(edge)
+                    && self.half_edges[half_edge.0].face.is_some()
+            })
+    }
+
+    /// The middle of `edge`, for dropping a vertex into it. `None` when either end is not on the mesh,
+    /// which is what a ring named against a stale document looks like.
+    fn midpoint(&self, edge: EdgeId) -> Option<Point3<f32>> {
+        let a = self.vertices.get(edge.0)?.position;
+        let b = self.vertices.get(edge.1)?.position;
+        Some(Point3::new(
+            (a.x + b.x) * 0.5,
+            (a.y + b.y) * 0.5,
+            (a.z + b.z) * 0.5,
+        ))
     }
 
     /// Every directed vertex pair the mesh already runs, mapped to the half-edge that runs it. Keyed
@@ -790,6 +1135,108 @@ fn offset_blocker(offset: Vector3<f32>) -> Option<String> {
         );
     }
     None
+}
+
+/// One face a ring passes through: entered by `enters`, left by `exits`. Those two share no corner, and
+/// the cut the loop makes in this face joins the middle of one to the middle of the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Crossing {
+    face: FaceId,
+    enters: EdgeId,
+    exits: EdgeId,
+}
+
+/// The faces a ring crosses, in ring order, entering at `seed`.
+///
+/// Crossing means: from the edge in hand, take the edge two steps round the face - the one sharing no
+/// corner with it - then step through that edge's twin into the next face. A ring is recognised by arriving
+/// back at a face already crossed; an open mesh simply runs out of twins, which ends the walk without an
+/// objection because a loop that stops at a boundary is what a loop on an unfinished mesh means.
+///
+/// Quads only. "The edge opposite this one" is not a thing an n-gon has - nearest corner and halfway round
+/// give different answers as soon as there are five corners - and a cut placed on a guess is worse than no
+/// cut, so the face is refused by number.
+fn edge_loop_crossings(mesh: &HalfEdgeMesh, seed: EdgeId) -> Result<Vec<Crossing>, TopologyErrors> {
+    let Some(mut entering) = mesh.face_half_edge_on(seed) else {
+        return Err(vec![format!(
+            "the edge between vertex {} and vertex {} bounds no face, so no loop can be run through it",
+            seed.0, seed.1
+        )]);
+    };
+
+    // The edge `entering` belongs to is carried alongside it rather than recomputed each turn: the first
+    // one is `seed` by the check above, and every later one is the edge the previous face exited by, so no
+    // turn has to re-derive it and no turn can meet a link it cannot resolve.
+    let mut entering_edge = seed;
+    let mut crossings = Vec::new();
+    let mut walked: HashSet<FaceId> = HashSet::new();
+
+    // The walk ends when `entering` names a half-edge that belongs to no face, which is how a loop running
+    // off an open mesh stops; the two breaks below end it when the ring comes round or a twin is missing.
+    while let Some(face) = mesh.half_edges.get(entering.0).and_then(|edge| edge.face) {
+        if !walked.insert(face) {
+            break;
+        }
+
+        let Some(loop_edges) = mesh.face_walk(face) else {
+            return Err(vec![format!(
+                "face {} does not bound a closed loop of at least three corners, so the edge loop cannot \
+                 be carried through it",
+                face.0
+            )]);
+        };
+        if loop_edges.len() != 4 {
+            return Err(vec![format!(
+                "an edge loop cuts quad faces, and face {} has {} corners; the edge opposite another is \
+                 not a thing an n-gon has, so refusing beats guessing where the cut would land",
+                face.0,
+                loop_edges.len()
+            )]);
+        }
+
+        let exits = loop_edges[(index_in_loop(&loop_edges, entering) + 2) % loop_edges.len()];
+        let Some(exiting_edge) = mesh.edge_id_of(exits) else {
+            return Err(vec![format!(
+                "face {} has a half-edge whose far corner cannot be read, so it needs repairing before \
+                 the loop can cut it",
+                face.0
+            )]);
+        };
+
+        crossings.push(Crossing {
+            face,
+            enters: entering_edge,
+            exits: exiting_edge,
+        });
+
+        let Some(twin) = mesh.half_edges.get(exits.0).and_then(|edge| edge.twin) else {
+            break;
+        };
+        entering = twin;
+        entering_edge = exiting_edge;
+
+        // A ring around a solid comes round inside as many steps as there are faces. Anything still walking
+        // at that point is following links into a cycle no closed solid has, and saying so beats spinning.
+        if crossings.len() > mesh.faces.len() {
+            return Err(vec![
+                "the edge loop kept walking without coming round, which means edges are linked into a \
+                 cycle no closed solid has"
+                    .to_string(),
+            ]);
+        }
+    }
+
+    Ok(crossings)
+}
+
+/// Where `wanted` sits in a face loop. Its presence is not in question - the walk only ever steps from a
+/// half-edge that came out of that face's own loop - so falling back to 0 keeps the walk total instead of
+/// adding a panic to a path whose whole job is to describe damage rather than crash on it.
+fn index_in_loop(loop_edges: &[HalfEdgeId], wanted: HalfEdgeId) -> usize {
+    loop_edges
+        .iter()
+        .position(|&edge| edge == wanted)
+        .unwrap_or(0)
 }
 
 /// Validate the mutated clone and install it only if it holds.
@@ -1336,6 +1783,89 @@ mod tests {
         assert_identical(&mesh, &before);
     }
 
+    /// A lone triangle, so the rule that a face with no diagonal cannot be cut has a witness.
+    fn lone_triangle() -> HalfEdgeMesh {
+        let positions = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ];
+        HalfEdgeMesh::from_faces(&positions, &[vec![0, 1, 2]])
+    }
+
+    /// A flat five-cornered face, the smallest shape where a cut can come out uneven.
+    fn lone_pentagon() -> HalfEdgeMesh {
+        let positions: Vec<Point3<f32>> = (0..5)
+            .map(|step| {
+                let angle = std::f32::consts::TAU * step as f32 / 5.0;
+                Point3::new(angle.cos(), angle.sin(), 0.0)
+            })
+            .collect();
+        HalfEdgeMesh::from_faces(&positions, &[vec![0, 1, 2, 3, 4]])
+    }
+
+    #[test]
+    fn cutting_a_quad_across_a_diagonal_makes_two_triangles() {
+        let mut mesh = open_quad();
+        let cut = mesh
+            .split_face(FaceId(0), VertexId(0), VertexId(2))
+            .unwrap_or_else(|errors| panic!("a diagonal is exactly what a cut is for: {errors:?}"));
+
+        assert_eq!(cut.original_face, FaceId(0), "the face named keeps its id");
+        assert_eq!(cut.new_face, FaceId(1));
+        // Both halves start at the far end of the cut, which is where their recorded edge now begins.
+        assert_eq!(mesh.face_vertices(cut.new_face), ids(&[2, 0, 1]));
+        assert_eq!(mesh.face_vertices(cut.original_face), ids(&[2, 3, 0]));
+
+        let diagonal = EdgeId::between(VertexId(0), VertexId(2));
+        let (own, neighbour) = mesh.edge_faces(diagonal);
+        assert!(
+            matches!(
+                (own, neighbour),
+                (Some(FaceId(0)), Some(FaceId(1))) | (Some(FaceId(1)), Some(FaceId(0)))
+            ),
+            "the cut must fuse the halves, got {own:?} and {neighbour:?}"
+        );
+
+        // Winding is inherited, not recomputed: each half is a contiguous slice of one loop, so the
+        // renderer's back-face rule keeps agreeing with `validate` after the cut.
+        for face in [cut.original_face, cut.new_face] {
+            assert!(
+                mesh.face_normal(face).z > 0.99,
+                "half {} should still face +z like the quad it came from",
+                face.0
+            );
+        }
+
+        assert_eq!(mesh.generate_render_buffers().indices.len(), 6);
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("the cut mesh should validate: {errors:?}"));
+    }
+
+    #[test]
+    fn cutting_a_pentagon_leaves_a_quad_and_a_triangle() {
+        // Pins which half goes where: the chain running from `a` forward to `b` is what comes off as the
+        // appended face, and the face named keeps the rest - including the corner between them.
+        let mut mesh = lone_pentagon();
+        let cut = mesh
+            .split_face(FaceId(0), VertexId(0), VertexId(3))
+            .unwrap_or_else(|errors| panic!("vertices 0 and 3 are not joined: {errors:?}"));
+
+        assert_eq!(mesh.face_vertices(cut.new_face), ids(&[3, 0, 1, 2]));
+        assert_eq!(mesh.face_vertices(cut.original_face), ids(&[3, 4, 0]));
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("the cut pentagon should validate: {errors:?}"));
+    }
+
+    /// Asserts a mesh is still a closed sphere topologically: vertices minus edges plus faces equals 2.
+    ///
+    /// Every edit here should preserve it, and it is the one check that catches a mistake none of the
+    /// individual invariants notice - a cut that closes one seam and opens another elsewhere reports
+    /// perfectly valid links while quietly turning the solid into something with a hole in it.
+    fn euler_characteristic(mesh: &HalfEdgeMesh) -> i64 {
+        mesh.vertices.len() as i64 - mesh.edges().len() as i64 + mesh.faces.len() as i64
+    }
+
     /// The unit vector the front face of the cube is pushed by, matching its outward (+z) normal.
     fn push_front() -> Vector3<f32> {
         Vector3::new(0.0, 0.0, 0.5)
@@ -1618,5 +2148,155 @@ mod tests {
             "the rim the sheet left behind is still open"
         );
         assert_eq!(mesh.half_edges.len(), 20, "four lifted, sixteen new");
+    }
+
+    #[test]
+    fn a_triangle_refuses_a_cut_because_every_pair_of_its_corners_is_already_an_edge() {
+        // The witness for the adjacency rule: three corners, three edges, no pair that is not already
+        // joined. A triangle is the smallest face there is, so "cut this face" has no meaning here and the
+        // refusal has to say so rather than invent a corner to cut to.
+        let before = lone_triangle();
+        let mut mesh = before.clone();
+
+        for (a, b) in [(0, 1), (1, 2), (2, 0)] {
+            let errors = mesh
+                .split_face(FaceId(0), VertexId(a), VertexId(b))
+                .expect_err("every pair of a triangle's corners is an edge already");
+            expect_reason(&errors, "already joined by an edge of face 0");
+        }
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn cutting_a_face_refuses_a_corner_that_belongs_to_another_face() {
+        let mut mesh = open_box();
+        let before = mesh.clone();
+
+        let errors = mesh
+            .split_face(FaceId(0), VertexId(0), VertexId(6))
+            .expect_err("vertex 6 is a back corner, not one of the front face's");
+        expect_reason(&errors, "vertex 6 is not a corner of face 0");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn cutting_a_face_refuses_the_same_corner_named_twice() {
+        let mut mesh = open_quad();
+        let before = mesh.clone();
+
+        let errors = mesh
+            .split_face(FaceId(0), VertexId(0), VertexId(0))
+            .expect_err("one corner cannot span a cut");
+        expect_reason(&errors, "a cut needs two different corners");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn an_edge_loop_across_a_cube_splits_it_into_two_layers() {
+        // The headline behaviour: a ring seeded on one edge of a cube runs all the way round it, cutting
+        // the four faces it passes and leaving the two it enters corner-first alone. Ten faces, and the
+        // solid stays closed.
+        let mut mesh = HalfEdgeMesh::create_cube();
+        let seed = EdgeId::between(VertexId(0), VertexId(1));
+
+        let loop_cut = mesh
+            .insert_edge_loop(seed)
+            .unwrap_or_else(|errors| panic!("a cube edge should seed a clean loop: {errors:?}"));
+
+        assert_eq!(
+            loop_cut.cut_edges.len(),
+            4,
+            "one ring edge per crossed face"
+        );
+        assert_eq!(loop_cut.new_vertices.len(), 4);
+        assert_eq!(
+            loop_cut.new_edges.len(),
+            4,
+            "one cut per face the ring reached"
+        );
+        assert_eq!(mesh.faces.len(), 10, "four faces became eight, two stayed");
+        assert_eq!(
+            mesh.vertices.len(),
+            12,
+            "the original eight plus one per ring edge"
+        );
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("the cut cube should validate: {errors:?}"));
+    }
+
+    #[test]
+    fn an_edge_loop_keeps_the_solid_a_closed_sphere() {
+        // Euler's formula is the one check the six validator passes cannot make between them: a cut that
+        // closes one seam while opening another elsewhere reports perfectly sound links, and this is what
+        // notices. A sphere stays at 2 however many loops are run through it.
+        let mut mesh = HalfEdgeMesh::create_cube();
+        assert_eq!(euler_characteristic(&mesh), 2, "the uncut cube");
+
+        mesh.insert_edge_loop(EdgeId::between(VertexId(0), VertexId(1)))
+            .expect("the first loop should cut cleanly");
+        assert_eq!(euler_characteristic(&mesh), 2, "after one ring");
+
+        // A second loop at right angles to the first, which is the cut most likely to disturb a link the
+        // first one set up.
+        mesh.insert_edge_loop(EdgeId::between(VertexId(8), VertexId(1)))
+            .unwrap_or_else(|errors| panic!("a second ring should cut cleanly: {errors:?}"));
+
+        assert_eq!(euler_characteristic(&mesh), 2, "after two rings");
+        assert_eq!(
+            mesh.faces.len(),
+            14,
+            "each belt crosses four faces and cuts them in half, so the second adds four - a belt is a \
+             ring round the solid, not a sweep over every face"
+        );
+        assert!(mesh.boundary_edges().is_empty(), "and still sealed");
+    }
+
+    #[test]
+    fn an_edge_loop_refuses_a_face_that_is_not_a_quad() {
+        let mut mesh = lone_pentagon();
+        let before = mesh.clone();
+
+        let errors = mesh
+            .insert_edge_loop(EdgeId::between(VertexId(0), VertexId(1)))
+            .expect_err("an n-gon has no edge opposite another");
+        expect_reason(&errors, "face 0 has 5 corners");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn an_edge_loop_stops_at_an_open_boundary_instead_of_refusing() {
+        // A ring on an unfinished mesh runs as far as the geometry does. Refusing here would make loops
+        // unusable mid-model, and nothing is lost: the faces it reached are still cut correctly.
+        let mut mesh = open_box();
+        let seed = EdgeId::between(VertexId(0), VertexId(1));
+
+        let loop_cut = mesh
+            .insert_edge_loop(seed)
+            .unwrap_or_else(|errors| panic!("a loop should run until it runs out: {errors:?}"));
+
+        assert!(
+            loop_cut.new_edges.len() < 4,
+            "the missing bottom face means the ring has nowhere to go, got {}",
+            loop_cut.new_edges.len()
+        );
+        assert!(
+            !loop_cut.new_edges.is_empty(),
+            "and it still cut what it reached"
+        );
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("the partially cut box should validate: {errors:?}"));
+    }
+
+    #[test]
+    fn an_edge_loop_refuses_an_edge_that_bounds_no_face() {
+        let mut mesh = open_quad();
+        mesh.half_edges.iter_mut().for_each(|edge| edge.face = None);
+        let before = mesh.clone();
+
+        let errors = mesh
+            .insert_edge_loop(EdgeId::between(VertexId(0), VertexId(1)))
+            .expect_err("with no face to cross, there is no ring to walk");
+        expect_reason(&errors, "bounds no face");
+        assert_identical(&mesh, &before);
     }
 }

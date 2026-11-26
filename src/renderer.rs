@@ -326,6 +326,7 @@ enum Hotkey {
     Undo,
     Redo,
     Extrude,
+    EdgeLoop,
     CycleSpace,
 }
 
@@ -338,6 +339,10 @@ enum Hotkey {
 /// `Ctrl+E` intended as a menu mnemonic would silently switch to Rotate. They also require Shift
 /// released, which is what frees `Shift+E` for extrude - Maya binds extrude to a shelf button rather
 /// than a key, so this follows the `Shift` + letter convention the rest of the map already uses.
+///
+/// `Shift+L` carries the same reasoning for Maya's *Insert Edge Loop Tool*, which is toolbox-only there
+/// as well: `L` for loop, sitting beside `Shift+E` so the two modelling commands stay together instead of
+/// being scattered across the map by whichever letter happened to be free.
 ///
 /// `X` is a deliberate divergence rather than a Maya keymap copy: bare `x` is Maya's press-and-release
 /// "snap to grids", and this app has no snapping of any kind yet, so there is nothing here for it to
@@ -359,6 +364,7 @@ fn hotkey_for(key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> Option<
     if shift {
         return match key {
             Key::KeyE => Some(Hotkey::Extrude),
+            Key::KeyL => Some(Hotkey::EdgeLoop),
             Key::Escape => Some(Hotkey::CancelDrag),
             _ => None,
         };
@@ -718,6 +724,10 @@ impl<'a> State<'a> {
                 self.begin_extrude_drag();
                 true
             }
+            Some(Hotkey::EdgeLoop) => {
+                self.insert_edge_loop();
+                true
+            }
             Some(Hotkey::CycleSpace) => {
                 self.scene.cycle_space();
                 // Echoed because the only other signal is the handle reorienting, which is easy to miss on
@@ -775,6 +785,27 @@ impl<'a> State<'a> {
             "Extruding - move the mouse to set the depth, click to set it, Escape to cancel"
                 .to_string(),
         );
+    }
+
+    /// Runs an edge loop through the single selected edge and echoes what it cut.
+    ///
+    /// The gesture in flight is closed first for the reason `cancel_active_drag` documents: an armed extrude
+    /// previews from the snapshot taken the instant it was armed, so cutting a ring underneath it and
+    /// leaving that extrude open would have its click delete the ring the user just made. Unlike extrude
+    /// there is no depth to drag here - a loop lands on the press - so this needs no follow-up state of its
+    /// own, and a refusal arrives as a notice because a hotkey that silently did nothing reads as a dead key.
+    pub fn insert_edge_loop(&mut self) {
+        self.cancel_active_drag();
+
+        match self.scene.insert_edge_loop() {
+            Ok(cut) => {
+                self.notice = Some(format!(
+                    "Inserted an edge loop through {} faces, adding {} vertices",
+                    cut.faces_cut, cut.new_vertices
+                ));
+            }
+            Err(errors) => self.notice = Some(errors.join(" ")),
+        }
     }
 
     /// Moves the cursor along the armed extrude's travel axis, re-previewing the lump where it now stands.
@@ -1187,6 +1218,9 @@ impl<'a> State<'a> {
                 self.begin_extrude_drag();
             }
         }
+        if response.edge_loop {
+            self.insert_edge_loop();
+        }
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -1216,6 +1250,7 @@ impl<'a> State<'a> {
                 redo_label: self.scene.redo_label(),
                 can_extrude: self.scene.can_extrude(),
                 extruding: self.scene.is_extruding(),
+                can_insert_edge_loop: self.scene.can_insert_edge_loop(),
                 space: self.scene.space(),
                 notice: self.notice.as_deref(),
             },

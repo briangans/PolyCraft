@@ -24,6 +24,9 @@ pub struct UiResponse {
     pub extrude: bool,
     /// A reference-system button was clicked, so the caller re-orients the transform gizmo.
     pub space: Option<Space>,
+    /// The Insert Edge Loop button was clicked. The command lands on the press, so there is no second
+    /// press to settle it the way an extrude has.
+    pub edge_loop: bool,
 }
 
 /// Everything the UI displays for this frame, handed to [`UiState::draw`].
@@ -48,6 +51,9 @@ pub struct UiContext<'a> {
     /// are already moving and a second one cannot start, so the button shows what the next click will do
     /// instead of offering the command again.
     pub extruding: bool,
+    /// Whether an edge loop can be run right now, for the same reason `can_extrude` exists: the button
+    /// greys out for exactly the reason the hotkey does nothing.
+    pub can_insert_edge_loop: bool,
     /// Which orientation the transform gizmo is currently drawn and dragged in, so the button beside it can
     /// show the one that is live.
     pub space: Space,
@@ -76,6 +82,18 @@ fn extrude_button_text(can_extrude: bool, extruding: bool) -> &'static str {
         "Extrude  (Shift+E)"
     } else {
         "Extrude"
+    }
+}
+
+/// Button text for the edge loop command. Live it names the key that does the same thing, so the panel
+/// teaches the binding the way the history and extrude buttons teach theirs; greyed out it stays plain,
+/// because a name with a key on it would advertise a binding that does nothing. There is no mid-gesture
+/// wording here because a loop has no depth to drag - it lands on the press.
+fn edge_loop_button_text(available: bool) -> &'static str {
+    if available {
+        "Insert Edge Loop  (Shift+L)"
+    } else {
+        "Insert Edge Loop"
     }
 }
 
@@ -136,6 +154,7 @@ impl UiState {
             redo_label,
             can_extrude,
             extruding,
+            can_insert_edge_loop,
             space: current_space,
             notice,
         } = current;
@@ -275,6 +294,12 @@ impl UiState {
                 {
                     response.extrude = true;
                 }
+                // The loop sits with extrude for the same reason: both change the mesh, both are refused
+                // until something is selected, and the pair is the whole modelling vocabulary so far.
+                let loop_button = egui::Button::new(edge_loop_button_text(can_insert_edge_loop));
+                if ui.add_enabled(can_insert_edge_loop, loop_button).clicked() {
+                    response.edge_loop = true;
+                }
                 ui.separator();
                 ui.label(format!("Mode: {}", current_mode.label()));
                 let count_str = match current_mode {
@@ -382,6 +407,7 @@ mod tests {
             redo_label: None,
             can_extrude: false,
             extruding: false,
+            can_insert_edge_loop: false,
             notice: None,
             space: Space::World,
         }
@@ -734,6 +760,7 @@ mod tests {
             redo_label: None,
             can_extrude: false,
             extruding: false,
+            can_insert_edge_loop: false,
             notice: None,
             space: Space::World,
         }

@@ -5,7 +5,7 @@
 
 use crate::gizmo::Space;
 use crate::history::HistoryStack;
-use crate::mesh::{FaceId, HalfEdgeMesh, TopologyErrors};
+use crate::mesh::{EdgeId, FaceId, HalfEdgeMesh, TopologyErrors};
 use crate::picking::{self, Ray};
 use crate::selection::Selection;
 use cgmath::{InnerSpace, Point3, Vector3};
@@ -47,6 +47,15 @@ pub struct ExtrudeCommit {
     pub walls: usize,
     /// Whether a step landed in history, which is false exactly when `walls` is zero.
     pub recorded: bool,
+}
+
+/// What a completed edge loop cut, for the command echo.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EdgeLoopCommit {
+    /// How many faces the ring crossed, which is also how many new edges it laid down.
+    pub faces_cut: usize,
+    /// How many vertices were dropped into the ring's edges, one per edge the loop opened.
+    pub new_vertices: usize,
 }
 
 /// An extrude awaiting the depth the mouse is giving it.
@@ -352,6 +361,81 @@ impl Scene {
     fn extrude_pivot(&self) -> Point3<f32> {
         crate::gizmo::pivot(&self.mesh, self.mode, &self.selection)
             .unwrap_or(Point3::new(0.0, 0.0, 0.0))
+    }
+
+    /// Whether an edge loop can be inserted here: one, and only one, edge selected in Edge mode.
+    ///
+    /// Shared by the hotkey seam and the Tools panel so the button greys out for the same reason the key
+    /// does nothing. One at a time is not shyness about the primitive - it is that two selected edges can
+    /// name the same ring, and the second would arrive to find its edges already split by the first. Which
+    /// of them the user meant is not something this layer can decide, so it asks instead of guessing.
+    pub fn can_insert_edge_loop(&self) -> bool {
+        self.mode == EditMode::Edge && self.live_edges().len() == 1
+    }
+
+    /// Runs Maya's *Insert Edge Loop* through the single selected edge: a ring of new edges, one across
+    /// each quad face the loop reaches, splitting every face it crosses. One undoable step.
+    ///
+    /// The new ring is left selected, which is both what Maya does and what makes pressing again useful -
+    /// the ring under the cursor is what the next cut is measured from. Returns what was cut for the
+    /// command echo, or every reason nothing happened, the document untouched.
+    pub fn insert_edge_loop(&mut self) -> Result<EdgeLoopCommit, TopologyErrors> {
+        let seed = self.edge_loop_seed()?;
+
+        self.begin_action("Insert Edge Loop");
+        let mut mesh = self.mesh.clone();
+        match mesh.insert_edge_loop(seed) {
+            Ok(cut) => {
+                let commit = EdgeLoopCommit {
+                    faces_cut: cut.new_edges.len(),
+                    new_vertices: cut.new_vertices.len(),
+                };
+                self.mesh = mesh;
+                self.dirty = true;
+                self.selection.edges_mut().clear();
+                self.selection.edges_mut().extend(cut.new_edges);
+                self.end_action();
+                Ok(commit)
+            }
+            Err(errors) => {
+                // Nothing reached the document, so there is no step worth recording - and an action left
+                // open would file the *next* edit under this one.
+                self.cancel_action();
+                Err(errors)
+            }
+        }
+    }
+
+    /// The one edge to run a loop through, or why the selection cannot name one.
+    fn edge_loop_seed(&self) -> Result<EdgeId, TopologyErrors> {
+        let edges = self.live_edges();
+        match edges.len() {
+            0 if self.mode != EditMode::Edge => Err(vec![
+                "an edge loop cuts through edges, so switch to Edge mode and select the edge to run it \
+                 through"
+                    .to_string(),
+            ]),
+            0 => Err(vec![
+                "an edge loop needs one edge selected; click an edge of the mesh first".to_string(),
+            ]),
+            1 => Ok(edges[0]),
+            count => Err(vec![format!(
+                "an edge loop runs through one edge at a time and {count} are selected; two of them can \
+                 name the same ring, so narrow the selection to the edge you want cut"
+            )]),
+        }
+    }
+
+    /// The selected edges that still name a pair of vertices on the mesh. A selection survives an undo
+    /// and a mesh load, so an id from an earlier document can be handed back here; running a ring off a
+    /// dead edge would report a cut the user cannot see.
+    fn live_edges(&self) -> Vec<EdgeId> {
+        self.selection
+            .edges()
+            .iter()
+            .copied()
+            .filter(|&edge| edge.0 < self.mesh.vertices.len() && edge.1 < self.mesh.vertices.len())
+            .collect()
     }
 
     /// Selects whatever the ray hits, in the current mode. `additive` keeps what was already
@@ -1390,5 +1474,158 @@ mod tests {
             "returns the untouched cube, not the shape from some earlier preview"
         );
         assert!(!scene.can_undo(), "and no half-step is left to unwind");
+    }
+
+    // ---- Edge loop ---------------------------------------------------------------------------
+
+    fn edge_mode_scene() -> Scene {
+        let mut scene = Scene::new();
+        scene.set_mode(EditMode::Edge);
+        scene.take_dirty();
+        scene
+    }
+
+    /// A scene in Edge mode with `edges` selected directly, which is how a selection looks that arrived
+    /// from clicks and then survived an edit - building it through `select_at` would tie every test here to
+    /// where the viewport happens to put an edge on screen.
+    fn scene_with_edges(edges: &[EdgeId]) -> Scene {
+        let mut scene = edge_mode_scene();
+        scene.selection.edges_mut().extend(edges.iter().copied());
+        scene.take_dirty();
+        scene
+    }
+
+    #[test]
+    fn an_edge_loop_needs_exactly_one_edge_selected_in_edge_mode() {
+        // The button and the hotkey both read this, so the four states here are the four the user can tell
+        // apart on screen: wrong mode, right mode nothing picked, one picked, and the ambiguous case.
+        let mut object_mode = Scene::new();
+        object_mode
+            .selection
+            .edges_mut()
+            .insert(EdgeId::between(VertexId(0), VertexId(1)));
+        assert!(
+            !object_mode.can_insert_edge_loop(),
+            "Object mode has no edge to seed a ring from"
+        );
+
+        assert!(
+            !edge_mode_scene().can_insert_edge_loop(),
+            "Edge mode with nothing selected"
+        );
+
+        let mut one = edge_mode_scene();
+        one.selection
+            .edges_mut()
+            .insert(EdgeId::between(VertexId(0), VertexId(1)));
+        assert!(
+            one.can_insert_edge_loop(),
+            "one edge is exactly what is wanted"
+        );
+
+        let two = scene_with_edges(&[
+            EdgeId::between(VertexId(0), VertexId(1)),
+            EdgeId::between(VertexId(2), VertexId(3)),
+        ]);
+        assert!(
+            !two.can_insert_edge_loop(),
+            "two edges can name the same ring, so neither is offered"
+        );
+    }
+
+    #[test]
+    fn an_edge_loop_splits_the_cube_and_hands_the_selection_to_the_ring() {
+        let mut scene = scene_with_edges(&[EdgeId::between(VertexId(0), VertexId(1))]);
+
+        let commit = scene
+            .insert_edge_loop()
+            .unwrap_or_else(|errors| panic!("one cube edge should seed a loop: {errors:?}"));
+
+        assert_eq!(commit.faces_cut, 4);
+        assert_eq!(commit.new_vertices, 4);
+        assert_eq!(scene.mesh().faces.len(), 10);
+        assert!(scene.take_dirty(), "the renderer must be told to redraw");
+
+        let selected: Vec<EdgeId> = scene.selection.edges().iter().copied().collect();
+        assert_eq!(selected.len(), 4, "the new ring is what stays highlighted");
+        assert!(
+            selected
+                .iter()
+                .all(|&edge| scene.mesh().edges().iter().any(|&(live, _)| live == edge)),
+            "every edge left selected must exist on the mesh"
+        );
+    }
+
+    #[test]
+    fn an_edge_loop_is_one_undo_step() {
+        let before = HalfEdgeMesh::create_cube();
+        let mut scene = scene_with_edges(&[EdgeId::between(VertexId(0), VertexId(1))]);
+
+        scene
+            .insert_edge_loop()
+            .expect("the loop should cut cleanly");
+        assert_ne!(scene.mesh(), &before, "the cube changed");
+
+        assert!(scene.undo(), "one step back");
+        assert_eq!(
+            scene.mesh(),
+            &before,
+            "undo returns the whole cube, not the mesh mid-cut"
+        );
+        assert!(!scene.can_undo(), "and no half-step is left to unwind");
+    }
+
+    #[test]
+    fn an_edge_loop_refusal_changes_nothing_and_lands_no_history_step() {
+        let mut scene = scene_with_edges(&[
+            EdgeId::between(VertexId(0), VertexId(1)),
+            EdgeId::between(VertexId(2), VertexId(3)),
+        ]);
+
+        let errors = scene
+            .insert_edge_loop()
+            .expect_err("two edges cannot seed one ring");
+        expect_reason(&errors, "one edge at a time");
+
+        assert_eq!(scene.mesh(), &HalfEdgeMesh::create_cube());
+        assert!(
+            !scene.can_undo(),
+            "a refused command must not appear in the undo chain"
+        );
+        assert_eq!(
+            scene.selection().edges().len(),
+            2,
+            "and must not move the selection"
+        );
+    }
+
+    #[test]
+    fn an_edge_loop_in_another_mode_says_which_mode_it_wants() {
+        let mut scene = Scene::new();
+        scene.set_mode(EditMode::Face);
+        scene.selection.faces_mut().insert(FaceId(0));
+
+        let errors = scene
+            .insert_edge_loop()
+            .expect_err("a face cannot seed an edge ring");
+        expect_reason(&errors, "switch to Edge mode");
+    }
+
+    #[test]
+    fn an_edge_loop_ignores_a_selection_left_stale_by_another_edit() {
+        // An id from a mesh that no longer exists is what a selection looks like after an undo or a load.
+        // Seeding a ring off it must be refused as "nothing selected", not answered with a cut the user
+        // cannot see or a panic on a vertex that is not there.
+        let mut scene = edge_mode_scene();
+        scene
+            .selection
+            .edges_mut()
+            .insert(EdgeId::between(VertexId(200), VertexId(201)));
+
+        assert!(!scene.can_insert_edge_loop());
+        let errors = scene
+            .insert_edge_loop()
+            .expect_err("a dead edge names nothing to cut");
+        expect_reason(&errors, "needs one edge selected");
     }
 }
