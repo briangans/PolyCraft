@@ -30,10 +30,7 @@
 //! expensive part, and these run on an edit - once per user gesture, not once per frame.
 
 use cgmath::{InnerSpace, Point3, Vector3};
-use std::collections::{
-    hash_map::Entry::{Occupied, Vacant},
-    HashMap, HashSet,
-};
+use std::collections::{HashMap, HashSet};
 
 use crate::mesh::{
     face_area, EdgeId, Face, FaceId, HalfEdge, HalfEdgeId, HalfEdgeMesh, MeshVertex,
@@ -1797,44 +1794,29 @@ impl HalfEdgeMesh {
     /// instead of walking. Corner-to-corner chaining needs no fan and lands on the opening.
     ///
     /// Two half-edges leaving the same corner along the boundary means two openings meeting at a single
-    /// vertex. Which rim continues there is not something a walk can decide - guessing would merge two
-    /// holes into one figure-eight rim - so it is refused rather than resolved. A chain that runs out of
-    /// boundary edges before arriving home is reported the same way; neither is reachable from the
-    /// operations this app has, and both are stated so the next operation does not assume them.
+    /// vertex, so the chain has a choice to make there - and the choice decides whether each opening gets
+    /// its own cap or one face is laid figure-eight across both. [`HalfEdgeMesh::rim_continuation`]
+    /// resolves it the way a walker does, by keeping this opening on its right. Refusing was the earlier
+    /// behaviour; it rested on a claim that turns out to be false, that a walk cannot tell two rims apart
+    /// at a shared corner, and its price was that one shared corner blocked *both* holes from closing.
+    ///
+    /// A chain that runs out of boundary edges before arriving home is reported; it is not reachable from
+    /// the operations this app has, and it is stated so the next operation does not assume it.
     ///
     /// Rims come back in the order their first half-edge is scanned, each starting at that half-edge, so
     /// two calls on one mesh agree and anything built on them is deterministic.
     pub fn boundary_rims(&self) -> Result<Vec<Vec<HalfEdgeId>>, TopologyErrors> {
-        // Which boundary half-edge leaves each corner. A second one at the same corner is recorded as a
-        // pinch and reported below rather than overwritten: which of the two to take decides the rim.
-        let mut leaving: HashMap<usize, HalfEdgeId> = HashMap::new();
-        let mut pinched: Vec<VertexId> = Vec::new();
+        // Which boundary half-edges leave each corner. Most corners bound one opening and hold exactly
+        // one, which is the case [`HalfEdgeMesh::rim_continuation`] costs nothing for; a corner holding two
+        // is where two openings meet, and the turn rule there decides which chain continues.
+        let mut leaving: HashMap<usize, Vec<HalfEdgeId>> = HashMap::new();
         for (index, edge) in self.half_edges.iter().enumerate() {
-            if edge.twin.is_some() {
-                continue;
+            if edge.twin.is_none() {
+                leaving
+                    .entry(edge.origin.0)
+                    .or_default()
+                    .push(HalfEdgeId(index));
             }
-            match leaving.entry(edge.origin.0) {
-                Vacant(slot) => {
-                    slot.insert(HalfEdgeId(index));
-                }
-                Occupied(_) => {
-                    if !pinched.contains(&edge.origin) {
-                        pinched.push(edge.origin);
-                    }
-                }
-            }
-        }
-        if !pinched.is_empty() {
-            return Err(pinched
-                .iter()
-                .map(|corner| {
-                    format!(
-                        "two openings meet at vertex {}, so their rims cannot be told apart; close the \
-                         corner between them before filling",
-                        corner.0
-                    )
-                })
-                .collect());
         }
 
         let mut rims: Vec<Vec<HalfEdgeId>> = Vec::new();
@@ -1853,15 +1835,13 @@ impl HalfEdgeMesh {
                 if destination == self.half_edges[start.0].origin {
                     break;
                 }
-                let Some(&next) = leaving.get(&destination.0) else {
+                // Stopping rather than revisiting a half-edge is what keeps this total on a mesh whose
+                // twins arrived mislinked; the closure check below is what turns the stop into a report.
+                let Some(next) = self.rim_continuation(current, destination, &leaving, &claimed)
+                else {
                     break;
                 };
-                // Reaching a half-edge already on another rim needs a pinch, which was refused above;
-                // stopping here rather than looping is what keeps this total on a mesh whose twins
-                // arrived mislinked.
-                if !claimed.insert(next) {
-                    break;
-                }
+                claimed.insert(next);
                 rim.push(next);
                 current = next;
             }
@@ -1879,6 +1859,71 @@ impl HalfEdgeMesh {
             rims.push(rim);
         }
         Ok(rims)
+    }
+
+    /// The boundary half-edge that continues the rim `arrived` is on, out of those leaving `corner`.
+    ///
+    /// A corner bounding one opening holds one boundary half-edge, so the common case is a lookup with
+    /// nothing to decide. Where two openings meet, two leave and one has to be chosen, and the other choice
+    /// walks the two rims as a single circuit: the cap would then be one face spanning both holes, whose
+    /// corner loop repeats the shared vertex - refused by `append_face_blockers` rather than installed,
+    /// which is the only reason guessing here was ever survivable.
+    ///
+    /// The rule is the sharpest **left** turn about the normal of the face `arrived` lies in, and it
+    /// follows from the one fact a rim always carries: a boundary half-edge still belongs to a face, faces
+    /// wind counter-clockwise, so that face is on the *left* of the direction travelled and the opening is
+    /// on the *right*. Holding on to the same opening for the whole circuit therefore means taking the exit
+    /// that turns left hardest relative to where you came from, because every other exit swings the walk
+    /// past the corner and hands it to the neighbouring opening.
+    ///
+    /// Measured about the arriving face's normal rather than an average over the corner's faces, because
+    /// the arriving face is guaranteed to have one - and the faces at a pinch are precisely the case where
+    /// an average can cancel to nothing, since that is how a corner ends up bounding two openings.
+    ///
+    /// `None` when nothing unclaimed leaves this corner, which ends the walk so the caller can report an
+    /// opening that fails to close on itself.
+    fn rim_continuation(
+        &self,
+        arrived: HalfEdgeId,
+        corner: VertexId,
+        leaving: &HashMap<usize, Vec<HalfEdgeId>>,
+        claimed: &HashSet<HalfEdgeId>,
+    ) -> Option<HalfEdgeId> {
+        let mut open = leaving
+            .get(&corner.0)?
+            .iter()
+            .copied()
+            .filter(|&candidate| !claimed.contains(&candidate));
+        let first = open.next()?;
+        // Taking the second candidate out by name rather than testing `open.next().is_none()` matters: the
+        // test would *consume* it, and the ranking loop below would then see one exit out of two and score
+        // the wrong one - which is how two holes that touch at a corner came out as a single figure-eight.
+        let Some(second) = open.next() else {
+            return Some(first);
+        };
+
+        // Two openings meet here, so the ranking normal is the face the walk is standing on.
+        let normal = self.half_edges[arrived.0]
+            .face
+            .map(|face| self.face_normal(face))?;
+        let travelled =
+            self.vertex_position(corner) - self.vertex_position(self.half_edges[arrived.0].origin);
+
+        let mut best: Option<(f32, HalfEdgeId)> = None;
+        for candidate in [first, second].into_iter().chain(open) {
+            let onward = self.vertex_position(self.half_edge_destination(candidate))
+                - self.vertex_position(corner);
+            let Some(turn) = left_turn_about(travelled, onward, normal) else {
+                continue;
+            };
+            let better = best.map(|(best_turn, _)| turn > best_turn).unwrap_or(true);
+            if better {
+                best = Some((turn, candidate));
+            }
+        }
+        // Flat or degenerate geometry can leave a turn unmeasurable at every exit. Taking the first is no
+        // worse than the geometry that made it unmeasurable, and refusing would block both openings again.
+        best.map(|(_, candidate)| candidate).or(Some(first))
     }
 
     /// Grows a face across every opening in the mesh, closing each rim on itself: Maya's *Fill Hole*.
@@ -1962,6 +2007,31 @@ impl HalfEdgeMesh {
 
         Ok(filled)
     }
+}
+
+/// The counter-clockwise turn from `from` to `to` about `axis`, in `[0, 2π)`, or `None` when either vector
+/// has no direction left once flattened onto the plane across `axis`.
+///
+/// The range is the whole point and not a detail: the correct exit at a pinch is usually a **reflex**
+/// turn, because a quad rim meeting another quad rim at a shared corner turns 270° there, and the
+/// symmetric `atan2` range reports that as -90°. Ranking by that would put the right answer *below* a
+/// wrong 90° and merge the two holes into one rim again. Folding into `[0, 2π)` makes "leftest" a total
+/// order that agrees with the hand you walk the opening with.
+fn left_turn_about(from: Vector3<f32>, to: Vector3<f32>, axis: Vector3<f32>) -> Option<f32> {
+    // Both vectors flattened onto the plane across the axis, since the component along it says nothing
+    // about which way the turn goes.
+    let flatten = |v: Vector3<f32>| v - axis * v.dot(axis);
+    let (a, b) = (flatten(from), flatten(to));
+    let (length_a, length_b) = (a.magnitude(), b.magnitude());
+    if length_a <= 0.0 || length_b <= 0.0 || !length_a.is_finite() || !length_b.is_finite() {
+        return None;
+    }
+
+    let mut turn = a.cross(b).dot(axis).atan2(a.dot(b));
+    if turn < 0.0 {
+        turn += std::f32::consts::TAU;
+    }
+    Some(turn)
 }
 
 /// Everything [`HalfEdgeMesh::bevel_edge`] needs to know before it touches a pointer.
@@ -2250,6 +2320,37 @@ mod tests {
             Point3::new(2.0, 1.0, 0.0),
         ];
         HalfEdgeMesh::from_faces(&positions, &[vec![0, 1, 2, 3], vec![4, 5, 2, 1]])
+    }
+
+    /// A 3x3 plate of unit quads in the `z = 0` plane, wound counter-clockwise about +z, with the listed
+    /// faces left out. Faces are numbered row-major from the bottom left, so `0` is the plate's bottom-left
+    /// corner and `4` is its centre: the pair that meets at corner 5 and shares no edge, which is two
+    /// openings meeting at a single corner.
+    ///
+    /// Deleting the pair through [`HalfEdgeMesh::delete_faces`] is impossible - with the first gone the
+    /// centre corner joins two separate fans, which `validate` refuses, and the all-or-nothing rule stops
+    /// the second delete from ever landing. So the plate is authored straight from `from_faces`, which is
+    /// also how a mesh with a pinch reaches this app: imported from a file.
+    fn plate_missing(missing: &[usize]) -> HalfEdgeMesh {
+        let positions: Vec<Point3<f32>> = (0..16)
+            .map(|index| Point3::new((index % 4) as f32 - 1.5, (index / 4) as f32 - 1.5, 0.0))
+            .collect();
+        let mut quads: Vec<Vec<usize>> = Vec::new();
+        for row in 0..3 {
+            for column in 0..3 {
+                if missing.contains(&(row * 3 + column)) {
+                    continue;
+                }
+                let bottom_left = row * 4 + column;
+                quads.push(vec![
+                    bottom_left,
+                    bottom_left + 1,
+                    bottom_left + 5,
+                    bottom_left + 4,
+                ]);
+            }
+        }
+        HalfEdgeMesh::from_faces(&positions, &quads)
     }
 
     /// Component counts, so a refusal can be shown to have added and removed nothing.
@@ -3989,13 +4090,239 @@ mod tests {
         );
     }
 
+    /// The lattice index of a point on the plate's 5x5 grid, for corner comparisons in the pinch tests.
+    fn lattice(x: i32, y: i32) -> usize {
+        ((y + 2) * 5 + (x + 2)) as usize
+    }
+
+    /// A flat plate of unit quads spanning [-2,2] with two square holes that touch at exactly one corner.
+    ///
+    /// The holes are the cells at [-1,0]x[0,1] and [0,1]x[-1,0], so they share the corner (0,0) and no
+    /// edge: the pinch. Built from a grid rather than a typed-out face list so that "the two openings share
+    /// one corner and nothing else" is a property of the construction rather than of my having counted the
+    /// coordinates correctly, and so the plate stays manifold everywhere else.
+    fn plate_with_two_touching_holes() -> HalfEdgeMesh {
+        let mut positions = Vec::with_capacity(25);
+        for y in -2..=2 {
+            for x in -2..=2 {
+                positions.push(Point3::new(x as f32, y as f32, 0.0));
+            }
+        }
+
+        let mut faces = Vec::with_capacity(14);
+        for y in -2..2 {
+            for x in -2..2 {
+                // The two cells that are the holes, left out so their four edges become boundaries.
+                if (x, y) == (-1, 0) || (x, y) == (0, -1) {
+                    continue;
+                }
+                faces.push(vec![
+                    lattice(x, y),
+                    lattice(x + 1, y),
+                    lattice(x + 1, y + 1),
+                    lattice(x, y + 1),
+                ]);
+            }
+        }
+
+        HalfEdgeMesh::from_faces(&positions, &faces)
+    }
+
     #[test]
-    fn two_openings_meeting_at_one_corner_are_refused_rather_than_merged() {
-        // Two triangles touching at a single corner: each is closed, each edge has one side, no corner is
-        // repeated - and `validate`'s own fan check already calls this damage. Filling it is the worse case,
-        // because two rims leave the shared corner and which one is picked decides whether the cap is one
-        // triangle's lid or a figure-eight across both. There is no right answer to guess at, so it is
-        // refused by the corner that cannot be resolved.
+    fn two_openings_that_touch_at_one_corner_each_get_their_own_cap() {
+        let mut mesh = plate_with_two_touching_holes();
+
+        // The pinch is real, and `validate` already refuses it: the faces at (0,0) form two fans rather
+        // than one, so nothing can be walked between the two sides. Filling is the operation that *heals*
+        // this damage rather than the one it defeats - capping both holes puts a face in each of the two
+        // gaps, and the corner's fan closes into a ring.
+        let damaged = mesh
+            .validate()
+            .expect_err("a corner that joins two fans is the damage the fan check exists for");
+        assert!(
+            damaged
+                .iter()
+                .any(|reason| reason.contains("separate fans") && reason.contains("vertex 12")),
+            "expected the pinch at (0,0), which is lattice index 12, got {damaged:?}"
+        );
+
+        // Both rims are walkable, and the shared corner is a choice to make rather than a dead end. The
+        // plate's own outside edge is the third opening.
+        let rims = mesh
+            .boundary_rims()
+            .expect("two openings meeting at one corner are still two openings");
+        assert_eq!(
+            rims.len(),
+            3,
+            "the two holes plus the plate's outer outline"
+        );
+        let on_the_pinch = rims
+            .iter()
+            .filter(|rim| {
+                rim.iter()
+                    .any(|&half_edge| mesh.half_edges[half_edge.0].origin == VertexId(12))
+            })
+            .count();
+        assert_eq!(
+            on_the_pinch, 2,
+            "exactly the two holes touch at (0,0); the outline does not"
+        );
+
+        let filled = mesh
+            .fill_holes()
+            .expect("each opening closes on its own, not one face across both");
+        assert_eq!(filled.faces.len(), 3, "one cap per opening");
+        // Which rim is scanned first only decides the order the caps arrive in, so the sizes are compared
+        // sorted: the two holes take a quad each and the plate's outline takes the sixteen corners it has.
+        let mut sizes = filled.corners.clone();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![4, 4, 16], "two quads and the outline");
+        assert!(mesh.boundary_edges().is_empty());
+        mesh.validate().unwrap_or_else(|errors| {
+            panic!("capping both holes should heal the pinch: {errors:?}")
+        });
+        // A flat plate with all three of its outlines closed is a squashed sphere, and Euler says so -
+        // which is the check that the two caps did not merge into one figure-eight.
+        assert_eq!(euler_characteristic(&mesh), 2);
+    }
+
+    #[test]
+    fn each_cap_of_a_pinch_covers_its_own_hole_and_faces_the_way_the_plate_does() {
+        let mut mesh = plate_with_two_touching_holes();
+        let filled = mesh
+            .fill_holes()
+            .expect("each opening closes on its own, not one face across both");
+
+        // Read the hole caps as corner sets, ignoring the plate's own outline cap, since which rim is
+        // scanned first only decides the order the caps come back in.
+        let mut caps: Vec<Vec<usize>> = filled
+            .faces
+            .iter()
+            .map(|&face| {
+                let mut corners: Vec<usize> = mesh
+                    .face_vertices(face)
+                    .iter()
+                    .map(|&corner| corner.0)
+                    .collect();
+                corners.sort_unstable();
+                corners
+            })
+            .filter(|corners| corners.len() == 4)
+            .collect();
+        caps.sort();
+        let mut expected = vec![
+            vec![lattice(-1, 0), lattice(0, 0), lattice(-1, 1), lattice(0, 1)],
+            vec![lattice(0, -1), lattice(1, -1), lattice(0, 0), lattice(1, 0)],
+        ];
+        for corners in expected.iter_mut() {
+            corners.sort_unstable();
+        }
+        expected.sort();
+        assert_eq!(
+            caps, expected,
+            "the two hole caps must be the two cells that were left out of the grid"
+        );
+
+        // Both hole caps face +Z, like every face of the plate. A cap that had been wound the other way
+        // would sit in the same place, twin correctly, and still read as a dent from the outside.
+        let quads = filled
+            .faces
+            .iter()
+            .filter(|&&face| mesh.face_vertices(face).len() == 4)
+            .count();
+        assert_eq!(
+            quads, 2,
+            "the two holes, and the outline cap is not one of them"
+        );
+        for &face in &filled.faces {
+            if mesh.face_vertices(face).len() != 4 {
+                continue;
+            }
+            assert!(
+                mesh.face_normal(face).z > 0.9,
+                "cap {face:?} must face the way the plate does, not into it"
+            );
+        }
+    }
+
+    #[test]
+    fn an_imported_pinch_walks_as_two_openings_despite_their_shared_corner() {
+        // The shape `plate_missing` documents: the bottom-left and centre quads left out, so the centre hole
+        // and the notch the bottom-left one leaves in the plate's outline meet at corner 5 and share nothing
+        // else. `delete_faces` cannot put a mesh into this state - removing the first of the pair leaves
+        // corner 5 joining two fans, which `validate` refuses - so a pinch reaches this app through a file
+        // import, which is exactly what this fixture authors.
+        let mesh = plate_missing(&[0, 4]);
+        let damaged = mesh
+            .validate()
+            .expect_err("corner 5 joins the notch and the hole as two separate fans");
+        assert!(
+            damaged
+                .iter()
+                .any(|reason| reason.contains("vertex 5") && reason.contains("separate fans")),
+            "expected the pinch to be reported at corner 5, got {damaged:?}"
+        );
+
+        let rims = mesh
+            .boundary_rims()
+            .expect("both openings are walkable despite sharing corner 5");
+        assert_eq!(
+            rims.len(),
+            2,
+            "the centre hole and the notched outline, not one merged walk"
+        );
+        assert_eq!(
+            rims.iter()
+                .filter(|rim| {
+                    rim.iter()
+                        .any(|&half_edge| mesh.half_edges[half_edge.0].origin == VertexId(5))
+                })
+                .count(),
+            2,
+            "both openings run through the shared corner, which is what makes it a pinch"
+        );
+
+        let mut sizes: Vec<usize> = rims.iter().map(|rim| rim.len()).collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            vec![4, 12],
+            "the centre hole is a ring of four and the notched outline twelve - and both closed, since an \
+             opening that failed to close on itself would have been reported rather than returned"
+        );
+    }
+
+    #[test]
+    fn filling_an_imported_mesh_is_blocked_by_damage_it_did_not_make_and_says_where() {
+        // The same fixture, filled - and refused. Not because of the pinch: `plate_missing` hands
+        // `from_faces` all sixteen lattice corners including the one only the removed bottom-left quad used,
+        // so the mesh arrives with a corner no face reaches. Filling validates the whole document before it
+        // installs anything, so that stray corner blocks both openings, and the reason names the corner
+        // rather than either hole.
+        //
+        // Kept as a test rather than smoothed over, because it is the shape of every all-or-nothing rule in
+        // this module: an operation is only as good as the document it was handed, and the message has to
+        // point somewhere the user can act on. Retiring corners nothing bounds is an operation of its own,
+        // and it is listed in the digest's next steps.
+        let before = plate_missing(&[0, 4]);
+        let mut mesh = before.clone();
+
+        let errors = mesh.fill_holes().expect_err(
+            "a corner the mesh does not use blocks the whole document, so nothing fills",
+        );
+
+        expect_reason(&errors, "does not validate");
+        expect_reason(&errors, "vertex 0 starts no half edge");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn a_figure_eight_across_two_openings_is_still_refused_by_the_corner_it_repeats() {
+        // Two triangles touching at a corner is not a pinch that can be closed: their wedges at the shared
+        // corner overlap, so the walk that keeps one opening on its right is free to visit the other, and
+        // the single rim it produces lists that corner twice. That face is refused for repeating a corner -
+        // stated here because the walk now *chooses* at a shared corner, and the reader needs to know the
+        // choice ends up checked rather than trusted.
         let positions = vec![
             Point3::new(0.0, 0.0, 0.0),
             Point3::new(1.0, 0.0, 0.0),
@@ -4008,9 +4335,9 @@ mod tests {
 
         let errors = mesh
             .fill_holes()
-            .expect_err("two rims leaving corner 2 cannot be told apart");
+            .expect_err("a cap that runs through one corner twice is not a face");
 
-        expect_reason(&errors, "two openings meet at vertex 2");
+        expect_reason(&errors, "could not be closed");
         assert_identical(&mesh, &before);
     }
 }

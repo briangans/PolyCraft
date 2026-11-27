@@ -17,8 +17,14 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-/// Two gizmo line vertices per axis, three axes. Allocated once and updated in-place every frame.
-const GIZMO_VERTEX_COUNT: usize = GizmoAxis::ALL.len() * 2;
+/// The most gizmo line vertices the handle can ever need: three arms, plus the three rotate rings when the
+/// Rotate tool is up, each of those drawn as [`gizmo::RING_SEGMENTS`] chords of two vertices.
+///
+/// Sized for the largest handle rather than the common one, because `upload_gizmo` writes the frame it built
+/// straight into a buffer allocated here and wgpu treats running past the end as a validation error, not a
+/// warning. A frame is rebuilt every mouse event, so this is one allocation held for the life of the window.
+const GIZMO_VERTEX_COUNT: usize =
+    GizmoAxis::ALL.len() * 2 + GizmoAxis::ALL.len() * gizmo::RING_SEGMENTS * 2;
 
 /// Builds the GPU vertex/index buffers for the 3D shaded mesh.
 fn create_mesh_buffers(device: &wgpu::Device, scene: &Scene) -> (wgpu::Buffer, wgpu::Buffer, u32) {
@@ -285,7 +291,109 @@ impl DragAnchor {
     }
 }
 
+/// The most a rotate drag may turn in one cursor event, in radians.
+///
+/// The sibling of [`MAX_EXTRUDE_STEP_ARMS`] for the same hazard: sighting nearly edge-on to the plane a ring
+/// is measured in, the projected bearing leaps for a pixel of cursor travel. A cap this size still lets a
+/// brisk drag reach a full turn in a handful of events, while a wild projection turns the model at the pace
+/// the cursor can be followed rather than the pace the arithmetic ran at.
+const MAX_ROTATE_STEP_RADIANS: f32 = 0.35;
+
+/// Cursor bookkeeping for a rotate drag, which measures a *sweep* rather than a distance.
+///
+/// [`DragAnchor`] differences a scalar that runs along one line, which is what a move or a scale needs. A
+/// turn has no such scalar, and the one way of forcing it is worse than the small steps kept here: an
+/// absolute bearing from `atan2` jumps from +pi to -pi as the handle passes behind the pivot, and a
+/// difference taken across that jump reads a whole turn the wrong way round.
+struct SweepAnchor {
+    /// The cursor's bearing at the previous event, as a unit vector across the plane of the ring.
+    ///
+    /// A bearing rather than a position, because only a point *with* a bearing may become the reference for
+    /// the next step: the cursor crosses the line of rotation mid-drag, and storing that would freeze the
+    /// turn from then on, since every later step would be measured from somewhere with nothing to measure
+    /// from. It also drops the cursor's distance from the pivot, which is not part of a turn.
+    previous: Option<cgmath::Vector3<f32>>,
+    /// Total turn since the grab, in radians.
+    ///
+    /// Absolute, because [`Scene::rotate_vertices`] recomputes every vertex from the grab snapshot and so
+    /// expects the angle the drag has reached rather than the next step toward it.
+    applied: f32,
+    /// Set when a camera change swallowed events, so the next projection only re-baselines.
+    needs_reanchor: bool,
+}
+
+impl SweepAnchor {
+    /// Starts a sweep from the cursor's bearing when the handle was grabbed, if the view could say one.
+    fn at(
+        hit: Option<cgmath::Point3<f32>>,
+        pivot: cgmath::Point3<f32>,
+        axis: cgmath::Vector3<f32>,
+    ) -> Self {
+        let bearing = hit.and_then(|hit| gizmo::bearing_across(hit - pivot, axis));
+        Self {
+            previous: bearing,
+            applied: 0.0,
+            needs_reanchor: bearing.is_none(),
+        }
+    }
+
+    /// Folds one cursor event into the sweep, capping the step at `limit` radians.
+    fn advance(
+        &mut self,
+        hit: cgmath::Point3<f32>,
+        pivot: cgmath::Point3<f32>,
+        axis: cgmath::Vector3<f32>,
+        limit: f32,
+    ) {
+        // No bearing means no information, and the angle already banked stays. Retuning the instrument to
+        // the model it came from rather than to the reading it failed to take.
+        let Some(bearing) = gizmo::bearing_across(hit - pivot, axis) else {
+            return;
+        };
+
+        let previous = self.previous.replace(bearing);
+        let reanchored = std::mem::take(&mut self.needs_reanchor);
+
+        // Either the first bearing the drag has been given, or the view moved since the last and the two
+        // were measured from different sight lines. Both mean note the bearing, turn nothing.
+        let Some(previous) = previous.filter(|_| !reanchored) else {
+            return;
+        };
+        if let Some(step) = gizmo::signed_angle(previous, bearing, axis) {
+            self.applied += step.clamp(-limit, limit);
+        }
+    }
+
+    /// Notes that the view moved, so the next bearing cannot be compared with the last.
+    fn mark_swung(&mut self) {
+        self.needs_reanchor = true;
+    }
+}
+
+/// How far a grabbed handle has carried its gesture, in the unit that tool reads.
+enum Progress {
+    /// Travel along the drag axis, in model units: what Move offsets by, and what Scale divides by the
+    /// selection's own width to become a proportion.
+    Linear(DragAnchor),
+    /// Sweep about the drag axis, in radians.
+    Angular(SweepAnchor),
+}
+
+impl Progress {
+    fn mark_swung(&mut self) {
+        match self {
+            Progress::Linear(anchor) => anchor.mark_swung(),
+            Progress::Angular(anchor) => anchor.mark_swung(),
+        }
+    }
+}
+
 struct DragState {
+    /// The tool this drag was grabbed with, which decides what the cursor's movement means.
+    ///
+    /// Held for the drag's whole life like `frame`, for the same reason: `E` arriving mid-pull must not
+    /// reinterpret travel that has already been banked as a turn of however far the mouse had gone.
+    tool: Tool,
     axis: GizmoAxis,
     /// The orientation this drag was grabbed in, kept for its whole life rather than re-read each event.
     ///
@@ -293,8 +401,126 @@ struct DragState {
     /// user is pulling were drawn in another, and would also let a selection change mid-drag swing the
     /// travel axis under the cursor. Both draw and pick read the same value back out of here.
     frame: gizmo::Frame,
-    anchor: DragAnchor,
+    progress: Progress,
+    /// How wide the selection is along the drag axis, captured at the grab.
+    ///
+    /// The rate a scale drag works at. Re-measuring it as the drag went would shrink that rate as the
+    /// geometry grew, so the handle would run away from the cursor - and growing a wall is exactly the drag
+    /// where that matters most.
+    span: f32,
     initial_positions: Vec<(VertexId, cgmath::Point3<f32>)>,
+}
+
+impl DragState {
+    /// Grabs `axis` of `frame` with the cursor where it is, snapshotting the geometry the gesture works
+    /// from and reading off the two numbers the drag will need for its whole life.
+    ///
+    /// `initial_positions` is the anchor for every write, which is what lets a drag be corrected by a later
+    /// event instead of accumulating, and what makes [`DragState::restore`] an identity rather than an
+    /// inversion. `span` is measured from the same snapshot, before the first event can move anything.
+    fn begin(tool: Tool, frame: gizmo::Frame, axis: GizmoAxis, ray: &Ray) -> Self {
+        let direction = frame.direction(axis);
+        let initial_positions: Vec<(VertexId, cgmath::Point3<f32>)> = Vec::new();
+        let progress = match tool {
+            Tool::Rotate => Progress::Angular(SweepAnchor::at(
+                gizmo::project_ray_onto_plane(frame.origin, direction, ray),
+                frame.origin,
+                direction,
+            )),
+            _ => Progress::Linear(DragAnchor::at(gizmo::project_ray_onto_axis(
+                frame.origin,
+                direction,
+                ray,
+            ))),
+        };
+        Self {
+            tool,
+            axis,
+            frame,
+            progress,
+            span: 0.0,
+            initial_positions,
+        }
+    }
+
+    /// Fills in the selection snapshot the caller gathered, and the width of that selection along the drag
+    /// axis, which is the rate a scale drag works at.
+    fn with_selection(mut self, initial_positions: Vec<(VertexId, cgmath::Point3<f32>)>) -> Self {
+        // Measured here rather than at `begin` so there is one place the snapshot is taken, and one place
+        // that reads it. A selection spanning nothing along the axis gives a zero span, which
+        // `gizmo::scale_factor` turns into a rate of 1.0 - a stuck handle rather than an infinite one.
+        let span = gizmo::span_along(
+            &initial_positions
+                .iter()
+                .map(|&(_, p)| p)
+                .collect::<Vec<_>>(),
+            self.direction(),
+        );
+        self.initial_positions = initial_positions;
+        self.span = span;
+        self
+    }
+
+    /// The direction this drag pulls along, from the frame it was grabbed with.
+    fn direction(&self) -> cgmath::Vector3<f32> {
+        self.frame.direction(self.axis)
+    }
+
+    /// Folds one cursor event into the gesture and writes the result over the document.
+    ///
+    /// Takes the `Scene` rather than reaching through `State`, because reading this anchor and writing the
+    /// mesh are two mutable borrows that cannot overlap - and the split is worth keeping on its own terms: it
+    /// puts "how far has the gesture gone" and "what does that do to the mesh" on either side of one line.
+    fn advance(&mut self, scene: &mut Scene, ray: &Ray) {
+        let pivot = self.frame.origin;
+        let direction = self.direction();
+
+        match &mut self.progress {
+            Progress::Linear(anchor) => {
+                // A sight line running down the axis says nothing about travel along it, so the drag holds
+                // the distance it had already reached rather than inventing one.
+                let Some(param) = gizmo::project_ray_onto_axis(pivot, direction, ray) else {
+                    return;
+                };
+                anchor.advance(param, f32::MAX);
+                match self.tool {
+                    Tool::Scale => scene.scale_vertices(
+                        &self.initial_positions,
+                        pivot,
+                        direction,
+                        gizmo::scale_factor(anchor.applied, self.span),
+                    ),
+                    _ => scene
+                        .translate_vertices(&self.initial_positions, direction * anchor.applied),
+                }
+            }
+            Progress::Angular(anchor) => {
+                let Some(hit) = gizmo::project_ray_onto_plane(pivot, direction, ray) else {
+                    return;
+                };
+                anchor.advance(hit, pivot, direction, MAX_ROTATE_STEP_RADIANS);
+                scene.rotate_vertices(&self.initial_positions, pivot, direction, anchor.applied);
+            }
+        }
+    }
+
+    /// Puts the document back where the grab found it, which is how a cancelled drag leaves nothing behind.
+    ///
+    /// Every tool writes positions recomputed from [`DragState::initial_positions`] by however far the cursor
+    /// has reached, so cancelling is a matter of applying the tool's *identity* - no travel, no turn, unit
+    /// stretch - rather than running the gesture's arithmetic backwards. The test
+    /// `the_angle_is_absolute_so_zero_restores_and_negating_does_not` in `scene` is what pins that property
+    /// down, and it is why Escape needs no memory of the steps a drag took.
+    fn restore(&self, scene: &mut Scene) {
+        let pivot = self.frame.origin;
+        let direction = self.direction();
+        match self.tool {
+            Tool::Rotate => scene.rotate_vertices(&self.initial_positions, pivot, direction, 0.0),
+            Tool::Scale => scene.scale_vertices(&self.initial_positions, pivot, direction, 1.0),
+            _ => scene
+                .translate_vertices(&self.initial_positions, cgmath::Vector3::new(0.0, 0.0, 0.0)),
+        }
+    }
 }
 
 /// An extrude awaiting its depth from the mouse, armed by [`Hotkey::Extrude`] and settled by a click.
@@ -1115,7 +1341,7 @@ impl<'a> State<'a> {
             extrude.anchor.mark_swung();
         }
         if let Some(drag) = self.drag_state.as_mut() {
-            drag.anchor.mark_swung();
+            drag.progress.mark_swung();
         }
     }
 
@@ -1247,7 +1473,7 @@ impl<'a> State<'a> {
     /// Which arm of `frame` the cursor is over, or `None` for none of them.
     ///
     /// The arm length has to come from the frame's own depth rather than the selection's, so this computes
-    /// it the way [`gizmo::frame_arms`] does; sharing one pick helper across hover and press is what keeps
+    /// it the way [`gizmo::handle`] does; sharing one pick helper across hover and press is what keeps
     /// the two from disagreeing about where an arm ends.
     fn gizmo_axis_under(
         &self,
@@ -1286,7 +1512,7 @@ impl<'a> State<'a> {
             return;
         }
 
-        if self.scene.tool() != Tool::Translate {
+        if !self.scene.tool().has_gizmo() {
             self.num_gizmo_vertices = 0;
             return;
         }
@@ -1297,12 +1523,14 @@ impl<'a> State<'a> {
             .map(|d| d.axis)
             .or(self.hovered_axis);
 
+        let rotating = self.scene.tool() == Tool::Rotate;
         let arms = match self.gizmo_frame() {
-            Some(frame) => gizmo::frame_arms(
+            Some(frame) => gizmo::handle(
                 &frame,
                 self.camera.eye(),
                 self.config.height as f32,
                 active_axis,
+                rotating,
             ),
             None => Vec::new(),
         };
@@ -1342,17 +1570,14 @@ impl<'a> State<'a> {
         if let Some(ray) = self.cursor_ray() {
             if self.extrude_state.is_some() {
                 self.track_extrude_drag(&ray);
-            } else if let Some(drag) = self.drag_state.as_mut() {
-                let travel = drag.frame.direction(drag.axis);
-                if let Some(current_param) =
-                    gizmo::project_ray_onto_axis(drag.frame.origin, travel, &ray)
-                {
-                    drag.anchor.advance(current_param, f32::MAX);
-                    let delta_vec = travel * drag.anchor.applied;
-                    self.scene
-                        .translate_vertices(&drag.initial_positions, delta_vec);
-                }
-            } else if self.scene.tool() == Tool::Translate
+            } else if self.drag_state.is_some() {
+                // Taken out rather than borrowed in place: `advance` needs `&mut Scene`, and `self.drag_state`
+                // is a field of the same `self`, so the two borrows cannot overlap. Putting it back at the end
+                // of the block keeps the gesture open across the next event.
+                let mut drag = self.drag_state.take().expect("just tested above");
+                drag.advance(&mut self.scene, &ray);
+                self.drag_state = Some(drag);
+            } else if self.scene.tool().has_gizmo()
                 && !self.camera_controller.alt_pressed
                 && !self.ui_state.pie_menu_active
                 && !self.egui_ctx.wants_pointer_input()
@@ -1388,7 +1613,7 @@ impl<'a> State<'a> {
             {
                 let height = self.config.height as f32;
                 if let Some(ray) = self.cursor_ray() {
-                    let frame = if self.scene.tool() == Tool::Translate {
+                    let frame = if self.scene.tool().has_gizmo() {
                         self.gizmo_frame()
                     } else {
                         None
@@ -1397,11 +1622,6 @@ impl<'a> State<'a> {
                         frame.and_then(|frame| self.gizmo_axis_under(frame, &ray, height));
 
                     if let Some((frame, axis)) = frame.zip(hit_axis) {
-                        let anchor = DragAnchor::at(gizmo::project_ray_onto_axis(
-                            frame.origin,
-                            frame.direction(axis),
-                            &ray,
-                        ));
                         let initial_positions: Vec<(VertexId, cgmath::Point3<f32>)> = self
                             .scene
                             .selected_vertices()
@@ -1409,12 +1629,11 @@ impl<'a> State<'a> {
                             .map(|v| (v, self.scene.mesh().vertex_position(v)))
                             .collect();
 
-                        self.drag_state = Some(DragState {
-                            axis,
-                            frame,
-                            anchor,
-                            initial_positions,
-                        });
+                        let tool = self.scene.tool();
+                        self.drag_state = Some(
+                            DragState::begin(tool, frame, axis, &ray)
+                                .with_selection(initial_positions),
+                        );
                         // Opens the history step for this drag. Nothing has been moved yet, so this
                         // snapshot is the state `undo` returns to. `end_action` on release records it,
                         // which is what makes a whole drag one undo step instead of one per frame.
@@ -1445,8 +1664,7 @@ impl<'a> State<'a> {
             self.scene.abandon_extrude();
         }
         if let Some(drag) = self.drag_state.take() {
-            self.scene
-                .translate_vertices(&drag.initial_positions, cgmath::Vector3::new(0.0, 0.0, 0.0));
+            drag.restore(&mut self.scene);
             self.scene.cancel_action();
         }
     }
@@ -1898,5 +2116,222 @@ mod tests {
             anchor.applied, 1.0,
             "and the same limit holds on the way back"
         );
+    }
+
+    /// A point on the unit circle about Z at `degrees`, for the sweep tests below.
+    fn bearing(degrees: f32) -> cgmath::Point3<f32> {
+        let radians = degrees.to_radians();
+        cgmath::Point3::new(radians.cos(), radians.sin(), 0.0)
+    }
+
+    /// The Z axis through the origin, which every sweep test below turns about.
+    const SPIN: cgmath::Vector3<f32> = cgmath::Vector3 {
+        x: 0.0,
+        y: 0.0,
+        z: 1.0,
+    };
+    const ORIGIN: cgmath::Point3<f32> = cgmath::Point3 {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+
+    #[test]
+    fn an_undisturbed_sweep_tracks_the_cursor_exactly() {
+        // The rotation analogue of the translate test above: with the camera still, a quarter of the way
+        // round the ring is a quarter of a turn, and nothing about the incremental bookkeeping leaks.
+        let mut sweep = SweepAnchor::at(Some(bearing(0.0)), ORIGIN, SPIN);
+        sweep.advance(bearing(45.0), ORIGIN, SPIN, f32::MAX);
+        sweep.advance(bearing(90.0), ORIGIN, SPIN, f32::MAX);
+        assert!(
+            (sweep.applied - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "half way round a quarter turn should be a quarter turn, got {}",
+            sweep.applied
+        );
+
+        sweep.advance(bearing(0.0), ORIGIN, SPIN, f32::MAX);
+        assert!(
+            sweep.applied.abs() < 1e-5,
+            "carrying the handle back to where the grab found it must land there, got {}",
+            sweep.applied
+        );
+    }
+
+    #[test]
+    fn a_sweep_keeps_going_past_where_an_angle_would_flip() {
+        // The reason this anchor exists rather than storing one absolute bearing. `atan2` returns
+        // (-pi, pi], so a handle carried past the far side of the ring jumps from +pi to -pi; a difference
+        // taken across that reads a whole turn the wrong way round, and the model snaps. Stepping in small
+        // arcs and summing never sees the discontinuity, so a full circle plus ten degrees is one circle
+        // plus ten degrees.
+        let mut sweep = SweepAnchor::at(Some(bearing(0.0)), ORIGIN, SPIN);
+        for degrees in (10..=370).step_by(10) {
+            sweep.advance(bearing(degrees as f32), ORIGIN, SPIN, f32::MAX);
+        }
+        assert!(
+            (sweep.applied - 370.0f32.to_radians()).abs() < 1e-4,
+            "the seam at 180 degrees must pass unnoticed, got {} radians",
+            sweep.applied
+        );
+    }
+
+    #[test]
+    fn swinging_the_camera_mid_sweep_absorbs_the_jump() {
+        // Same hazard as the translate drag and the same cure: the two bearings were measured from different
+        // sight lines, so the projection after the swing only re-baselines. Without this, orbiting for a
+        // better look mid-turn would spin the geometry by however far the camera went.
+        let mut sweep = SweepAnchor::at(Some(bearing(0.0)), ORIGIN, SPIN);
+        sweep.advance(bearing(20.0), ORIGIN, SPIN, f32::MAX);
+        sweep.mark_swung();
+        sweep.advance(bearing(250.0), ORIGIN, SPIN, f32::MAX);
+        assert!(
+            (sweep.applied - 20.0f32.to_radians()).abs() < 1e-5,
+            "the swing itself must contribute nothing, got {}",
+            sweep.applied
+        );
+
+        sweep.advance(bearing(260.0), ORIGIN, SPIN, f32::MAX);
+        assert!(
+            (sweep.applied - 30.0f32.to_radians()).abs() < 1e-5,
+            "and the sweep resumes from the angle it had already reached, got {}",
+            sweep.applied
+        );
+    }
+
+    #[test]
+    fn a_sweep_armed_without_a_projection_waits_for_the_cursor() {
+        // Grabbed with the cursor outside the window, or sighting the ring edge-on: there is no bearing to
+        // start from, and inventing one would spin the model the instant the mouse stirred.
+        let mut sweep = SweepAnchor::at(None, ORIGIN, SPIN);
+        sweep.advance(bearing(200.0), ORIGIN, SPIN, f32::MAX);
+        assert_eq!(
+            sweep.applied, 0.0,
+            "the first projection only sets the bearing"
+        );
+
+        sweep.advance(bearing(210.0), ORIGIN, SPIN, f32::MAX);
+        assert!(
+            (sweep.applied - 10.0f32.to_radians()).abs() < 1e-5,
+            "and the second begins the turn, got {}",
+            sweep.applied
+        );
+    }
+
+    #[test]
+    fn one_wild_sweep_step_is_capped_but_the_drag_catches_up() {
+        // Nearly edge-on to the ring's plane, a pixel of cursor travel swings the projected bearing by
+        // nearly a half turn. The cap holds one event to a pace the user can follow; being per event rather
+        // than total, a steady drag still reaches anywhere it is pointed.
+        let mut sweep = SweepAnchor::at(Some(bearing(0.0)), ORIGIN, SPIN);
+
+        // A 170 degree leap asks for 2.97 radians; the cap is what stops the model snapping round.
+        sweep.advance(bearing(170.0), ORIGIN, SPIN, 0.2);
+        assert!(
+            (sweep.applied - 0.2).abs() < 1e-6,
+            "one event cannot outrun the handle, got {}",
+            sweep.applied
+        );
+
+        // A small step is not capped, so the drag carries on from the angle it reached rather than being
+        // permanently slowed by the one event that ran wild.
+        sweep.advance(bearing(175.0), ORIGIN, SPIN, 0.2);
+        assert!(
+            (sweep.applied - (0.2 + 5.0f32.to_radians())).abs() < 1e-6,
+            "steady tracking keeps gaining, got {}",
+            sweep.applied
+        );
+
+        // And the same limit holds coming back, measured the way the cursor actually went: 175 degrees back
+        // round is a leap of -3.05, capped to -0.2, not a short-cut the other way.
+        sweep.advance(bearing(0.0), ORIGIN, SPIN, 0.2);
+        assert!(
+            (sweep.applied - 5.0f32.to_radians()).abs() < 1e-6,
+            "the cap must bite in both directions, got {}",
+            sweep.applied
+        );
+    }
+
+    #[test]
+    fn a_sweep_holds_its_angle_when_the_cursor_loses_its_bearing() {
+        // Mid-drag the cursor can cross the line of rotation, where it has no bearing at all. The turn stops
+        // rather than reading zero and writing the model back to where the grab began - which would look like
+        // the handle had come loose and shaken the geometry off.
+        let mut sweep = SweepAnchor::at(Some(bearing(0.0)), ORIGIN, SPIN);
+        sweep.advance(bearing(40.0), ORIGIN, SPIN, f32::MAX);
+        let held = sweep.applied;
+
+        // Straight up the axis: on the line of rotation, so no bearing to measure from.
+        sweep.advance(cgmath::Point3::new(0.0, 0.0, 5.0), ORIGIN, SPIN, f32::MAX);
+        assert_eq!(
+            sweep.applied, held,
+            "the angle must survive the pass through the axis"
+        );
+
+        // And it carries on from there, not from the other side of the circle.
+        sweep.advance(bearing(50.0), ORIGIN, SPIN, f32::MAX);
+        assert!(
+            (sweep.applied - (held + 10.0f32.to_radians())).abs() < 1e-5,
+            "the drag resumes where it stopped, got {}",
+            sweep.applied
+        );
+    }
+
+    #[test]
+    fn each_tool_banks_its_gesture_in_its_own_unit() {
+        // The one place a rotate drag and a scale drag part company is which anchor they carry, and getting
+        // it wrong is invisible until the model shears: a rotate reading travel as an angle, or a scale
+        // dividing a distance by the wrong span. `Select` is here because it must not grab a handle at all,
+        // which `Tool::has_gizmo` is what the draw and pick paths both ask.
+        let frame = gizmo::Frame::world(cgmath::Point3::new(0.0, 0.5, 0.0));
+        let ray = Ray::new(
+            cgmath::Point3::new(4.0, 0.5, 4.0),
+            cgmath::Vector3::new(-1.0, 0.0, -1.0),
+        );
+        for (tool, angular) in [
+            (Tool::Translate, false),
+            (Tool::Rotate, true),
+            (Tool::Scale, false),
+        ] {
+            let drag = DragState::begin(tool, frame, GizmoAxis::Z, &ray);
+            assert_eq!(
+                matches!(drag.progress, Progress::Angular(_)),
+                angular,
+                "{tool:?} must {}measure a sweep",
+                if angular { "" } else { "not " }
+            );
+            assert_eq!(
+                drag.tool, tool,
+                "a drag must remember what it was grabbed with"
+            );
+            assert_eq!(drag.frame, frame, "and the frame it was grabbed in");
+        }
+
+        assert!(!Tool::Select.has_gizmo());
+    }
+
+    #[test]
+    fn every_tool_that_offers_a_handle_names_itself_in_history() {
+        // The label is what the undo list shows, so a drag that records "Move Vertex" while it was turning
+        // the geometry is a history the user cannot read after the fact.
+        for tool in [Tool::Translate, Tool::Rotate, Tool::Scale] {
+            for mode in [
+                EditMode::Vertex,
+                EditMode::Edge,
+                EditMode::Face,
+                EditMode::Object,
+            ] {
+                let label = drag_action_label(mode, tool);
+                assert!(
+                    label.starts_with(tool.label()),
+                    "a {tool:?} drag logged itself as {label:?}, which does not name the tool"
+                );
+            }
+        }
+        assert_eq!(
+            drag_action_label(EditMode::Vertex, Tool::Rotate),
+            "Rotate Vertex"
+        );
+        assert_eq!(drag_action_label(EditMode::Face, Tool::Scale), "Scale Face");
+        assert_eq!(drag_action_label(EditMode::Object, Tool::Scale), "Scale");
     }
 }

@@ -21,7 +21,7 @@ use crate::mesh::{HalfEdgeMesh, VertexId};
 use crate::picking::{world_per_pixel, Ray};
 use crate::scene::EditMode;
 use crate::selection::Selection;
-use cgmath::{vec3, InnerSpace, Point3, Vector3};
+use cgmath::{vec3, EuclideanSpace, InnerSpace, Point3, Vector3};
 
 /// Bright yellow highlight when an axis is hovered or actively dragged (Maya convention).
 pub const COLOR_AXIS_ACTIVE: [f32; 3] = [1.0, 0.90, 0.15];
@@ -390,7 +390,7 @@ pub fn arms(frame: &Frame, length: f32, active_axis: Option<GizmoAxis>) -> Vec<A
         .collect()
 }
 
-/// The three arms of `frame`, each long enough to measure `AXIS_LENGTH_PIXELS` at the frame's own depth.
+/// The whole transform handle for one frame at one view: three arms, plus the three rings if `turning`.
 ///
 /// Takes the frame rather than the selection because drawing and picking must agree exactly on where an
 /// arm is: the two used to build their own world frame from the pivot independently, which was harmless
@@ -399,18 +399,26 @@ pub fn arms(frame: &Frame, length: f32, active_axis: Option<GizmoAxis>) -> Vec<A
 /// arms tilt while the drag follows a world axis is worse still - it lies about where the geometry will
 /// go. Both callers now take their frame from the same [`frame_for`].
 ///
-/// Empty for a degenerate view where an arm would have no size.
-pub fn frame_arms(
+/// A degenerate view - pivot at the eye, where [`axis_world_length`] answers zero - needs no special
+/// case: every arm collapses onto its own start point and draws nothing, and the rings take the same zero
+/// radius and answer empty. This is also the length the handle is picked at, so a squashed gizmo is a
+/// gizmo that cannot be grabbed rather than one that grabs nothing where it appears to be.
+pub fn handle(
     frame: &Frame,
     camera_eye: Point3<f32>,
     viewport_height: f32,
     active_axis: Option<GizmoAxis>,
+    turning: bool,
 ) -> Vec<Arm> {
     let length = axis_world_length(frame.origin, camera_eye, viewport_height);
-    if length <= 0.0 {
-        return Vec::new();
+    let mut arms = arms(frame, length, active_axis);
+    // The rings belong to the rotate handle alone. Drawn at the same radius as the arms are long, each
+    // passes through the arm tips, so the handle reads as one object rather than two scales of thing
+    // floating near each other - and the plane a ring lies in is the plane its drag measures.
+    if turning {
+        arms.extend(rings(frame, length, active_axis));
     }
-    arms(frame, length, active_axis)
+    arms
 }
 
 /// Tests if a ray passes within `tolerance_pixels` of any arm of `frame`.
@@ -478,6 +486,224 @@ pub fn project_ray_onto_axis(
 
     let t = (u_w0 - b * ray_w0) / denom;
     Some(t)
+}
+
+/// Below this, a sight line counts as running along the plane rather than meeting it.
+///
+/// Matches the tolerance [`project_ray_onto_axis`] uses for the same hazard from the other side.
+const PLANE_GRAZING_TOLERANCE: f32 = 1e-4;
+
+/// Where `ray` meets the plane through `point` with the given `normal`.
+///
+/// The rotate drag needs this and cannot use [`project_ray_onto_axis`]: turning about an axis moves the
+/// cursor *around* it, so a projection onto the axis itself reports that nothing happened however far the
+/// handle is swung - and worse, reports whatever movement it does find as travel along the axis, which is
+/// the gesture the tool must never make. The intersection with the plane across the axis is where the turn
+/// actually reads.
+///
+/// `None` when the sight line runs *along* the plane, which is seeing the ring edge-on: the wheel has
+/// collapsed to a line, its bearing cannot be read from a cursor position, and every pixel of travel slides
+/// the hit arbitrarily far across the plane. Looking straight down the axis is the opposite case and the
+/// best one - the ring is face-on - though a cursor aimed at the pivot itself then has no bearing, which
+/// [`signed_angle`] refuses rather than reporting a turn of nothing.
+///
+/// Also `None` for the plane behind the eye, where the infinite line still meets it but the cursor points the
+/// other way. Callers hold the angle they had rather than invent one, exactly as the extrude drag holds its
+/// depth when the cursor runs along its travel axis.
+pub fn project_ray_onto_plane(
+    point: Point3<f32>,
+    normal: Vector3<f32>,
+    ray: &Ray,
+) -> Option<Point3<f32>> {
+    let magnitude = normal.magnitude();
+    if !magnitude.is_finite() || magnitude <= 0.0 {
+        return None;
+    }
+    let normal = normal / magnitude;
+
+    let towards = ray.direction.dot(normal);
+    if !towards.is_finite() || towards.abs() < PLANE_GRAZING_TOLERANCE {
+        return None;
+    }
+
+    // Solving `((ray.origin + t * direction) - point) . normal == 0` for t. A negative root is the plane
+    // behind the eye: the infinite *line* meets it, but the cursor points the other way, and a hit there
+    // would turn the solid by an angle read from behind the camera.
+    let distance = (point - ray.origin).dot(normal) / towards;
+    if !distance.is_finite() || distance <= 0.0 {
+        return None;
+    }
+    Some(ray.origin + ray.direction * distance)
+}
+
+/// The direction a cursor offset points, flattened into the plane across `axis`, as a unit vector.
+///
+/// `None` when the offset lies on the line of rotation, where it has no bearing to point in. Callers that
+/// remember a cursor position between events need this distinction rather than just a zero: storing an
+/// offset with no bearing as the reference for the next step would freeze the measurement from then on,
+/// because every later step would be taken from somewhere that cannot be measured from.
+///
+/// Unit length so callers can hold it without carrying the cursor's distance from the pivot, which is not
+/// part of a bearing and would make a drag that also pushed outward turn at a different rate.
+pub fn bearing_across(offset: Vector3<f32>, axis: Vector3<f32>) -> Option<Vector3<f32>> {
+    let magnitude = axis.magnitude();
+    if !magnitude.is_finite() || magnitude <= 0.0 {
+        return None;
+    }
+    let axis = axis / magnitude;
+
+    // Flattening before measuring: the part of the offset that runs along the axis contributes nothing to
+    // a bearing but does contribute to a length, which would let a cursor pushed far out along the axis
+    // appear to have a bearing when it has none.
+    let across = offset - axis * offset.dot(axis);
+    let span = across.magnitude();
+    if !span.is_finite() || span <= f32::EPSILON {
+        return None;
+    }
+    Some(across / span)
+}
+
+/// The turn from `from` to `to` about `axis`, right-hand rule, in radians, in `(-pi, pi]`.
+///
+/// Both vectors are offsets from a common origin, so callers pass positions relative to the pivot. The
+/// answer is measured *across* the axis - looking back down it, counter-clockwise positive - which is the
+/// same convention [`crate::scene::Scene::rotate_vertices`] applies, and what makes a ring's colour and the
+/// way it turns agree.
+///
+/// `None` when either vector has no span across the axis - it lies on the line of rotation, so there is no
+/// bearing for a turn to have been measured between. Answering zero for that would report a measured turn
+/// of nothing where in truth nothing was measured, and a drag that reads zeros keeps writing the mesh back
+/// to where it started rather than holding still.
+pub fn signed_angle(from: Vector3<f32>, to: Vector3<f32>, axis: Vector3<f32>) -> Option<f32> {
+    let magnitude = axis.magnitude();
+    if !magnitude.is_finite() || magnitude <= 0.0 {
+        return None;
+    }
+    let axis = axis / magnitude;
+
+    let across_from = bearing_across(from, axis)?;
+    let across_to = bearing_across(to, axis)?;
+    Some(
+        across_from
+            .cross(across_to)
+            .dot(axis)
+            .atan2(across_from.dot(across_to)),
+    )
+}
+
+/// How far `positions` span along `direction`: the distance between the two that lie furthest apart
+/// measured down the axis, or 0.0 when there is nothing to span.
+///
+/// This is the yardstick a scale drag works in. A factor has to be relative to something, and the only
+/// honest choice is the geometry itself: a drag that doubles a wall should also double a face and not a
+/// sliver. The alternative - reading the factor off how far the cursor sits from the pivot along the arm -
+/// has a factor of infinity at the pivot and flips sign as the drag crosses it, both of which the user
+/// discovers by losing the model.
+///
+/// A zero result needs flooring by the caller: a single vertex, or two corners level across the axis, span
+/// nothing, and dividing by that turns a one-pixel move into an infinite stretch.
+pub fn span_along(positions: &[Point3<f32>], direction: Vector3<f32>) -> f32 {
+    let magnitude = direction.magnitude();
+    if !magnitude.is_finite() || magnitude <= 0.0 || positions.is_empty() {
+        return 0.0;
+    }
+    let direction = direction / magnitude;
+
+    let mut lowest = f32::INFINITY;
+    let mut highest = f32::NEG_INFINITY;
+    for position in positions {
+        let along = direction.dot(position.to_vec());
+        if along.is_finite() {
+            lowest = lowest.min(along);
+            highest = highest.max(along);
+        }
+    }
+    if !lowest.is_finite() || !highest.is_finite() {
+        return 0.0;
+    }
+    highest - lowest
+}
+
+/// The stretch a scale drag has reached: 1.0 at the grab, 2.0 once the cursor has travelled along the arm
+/// as far as the selection is wide.
+///
+/// The floor is deliberately not applied here - [`crate::scene::Scene::scale_vertices`] owns it, along with
+/// the reason (a factor pushed through zero silently inverts every face it touches and no topology check
+/// sees it), and a second copy here would only be a second thing to keep in step.
+pub fn scale_factor(travel: f32, span: f32) -> f32 {
+    if !travel.is_finite() || !span.is_finite() || span <= 0.0 {
+        return 1.0;
+    }
+    1.0 + travel / span
+}
+
+/// How many chords a rotate ring is drawn with.
+pub const RING_SEGMENTS: usize = 48;
+
+/// The circle a rotate handle draws about one slot of `frame`, at `radius`, as `segments` chords.
+///
+/// Returns [`Arm`]s rather than inventing a shape: the gizmo pass is a line list, so a ring is drawn exactly
+/// as an arm is and needs no second vertex format, buffer or pipeline. When the handle becomes lit geometry,
+/// the torus generator replaces this function and nothing downstream notices.
+///
+/// Chords because the handle is roughly [`AXIS_LENGTH_PIXELS`] across on screen at any zoom, which makes
+/// each of these a fraction of a pixel wide - the eye reads the polygon as a circle, and the vertex count
+/// stays a rounding error in the gizmo buffer.
+///
+/// The chords sweep counter-clockwise about `axis` as their index rises, matching the right-hand rule
+/// [`signed_angle`] measures and [`crate::scene::Scene::rotate_vertices`] applies, so a ring's sweep and the
+/// turn it advertises cannot come apart. Empty for a radius of nothing.
+pub fn ring(
+    frame: &Frame,
+    axis: GizmoAxis,
+    radius: f32,
+    segments: usize,
+    active_axis: Option<GizmoAxis>,
+) -> Vec<Arm> {
+    if radius <= 0.0 || !radius.is_finite() || segments < 2 {
+        return Vec::new();
+    }
+
+    // Two slots spanning the plane across `axis`, taken in the frame's own handedness so that
+    // `side.cross(raise)` points back along that slot: a frame is right-handed by construction, so
+    // consecutive slots cross into the one after them. Going the other way would draw a ring whose
+    // increasing angle turns opposite to the angle the drag measures. The test is against the frame's own
+    // slot rather than `axis.unit_vector()`, because in component space those are different vectors and
+    // comparing the two would reject every tilted frame.
+    let index = axis.index();
+    let side = frame.axes[(index + 1) % 3];
+    let raise = frame.axes[(index + 2) % 3];
+    if side.cross(raise).dot(frame.axes[index]) <= 0.0 {
+        return Vec::new();
+    }
+
+    let color = if active_axis == Some(axis) {
+        COLOR_AXIS_ACTIVE
+    } else {
+        axis.color()
+    };
+
+    let step = std::f32::consts::TAU / segments as f32;
+    let point_at = |i: usize| {
+        let angle = step * i as f32;
+        frame.origin + (side * angle.cos() + raise * angle.sin()) * radius
+    };
+
+    (0..segments)
+        .map(|i| Arm {
+            start: point_at(i),
+            end: point_at((i + 1) % segments),
+            color,
+        })
+        .collect()
+}
+
+/// The three rings a rotate handle draws, each passing through the arm tips at `radius`.
+pub fn rings(frame: &Frame, radius: f32, active_axis: Option<GizmoAxis>) -> Vec<Arm> {
+    GizmoAxis::ALL
+        .iter()
+        .flat_map(|&axis| ring(frame, axis, radius, RING_SEGMENTS, active_axis))
+        .collect()
 }
 
 #[cfg(test)]
@@ -619,7 +845,7 @@ mod tests {
         let Some(frame) = frame_for(mesh, mode, selection, space) else {
             return Vec::new();
         };
-        frame_arms(&frame, eye, VIEWPORT, active)
+        handle(&frame, eye, VIEWPORT, active, false)
     }
 
     const VIEWPORT: f32 = 600.0;
@@ -987,5 +1213,365 @@ mod tests {
                  to world instead of aiming at a deleted component"
             );
         }
+    }
+    // ---- Rotate / scale drag math --------------------------------------------------------------------
+
+    /// Projects a ray aimed at `through` onto the plane through `origin` with `normal`.
+    fn plane_hit(
+        eye: Point3<f32>,
+        origin: Point3<f32>,
+        normal: Vector3<f32>,
+        through: Point3<f32>,
+    ) -> Point3<f32> {
+        project_ray_onto_plane(origin, normal, &Ray::new(eye, through - eye))
+            .expect("a sight line that is not parallel to the plane meets it")
+    }
+
+    #[test]
+    fn a_ray_is_measured_where_it_meets_the_plane_across_the_axis() {
+        let eye = Point3::new(0.0, 0.0, 3.0);
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let hit = plane_hit(eye, origin, Vector3::unit_z(), Point3::new(1.0, 0.0, 0.0));
+        assert!(
+            (hit - Point3::new(1.0, 0.0, 0.0)).magnitude() < 1e-4,
+            "the sight line aims straight at that point, got {hit:?}"
+        );
+
+        // A pivot off the world origin, which is the normal case: the plane belongs to the pivot, not to
+        // wherever the world happens to put it.
+        let lifted = Point3::new(0.0, 0.0, 1.0);
+        let hit = plane_hit(eye, lifted, Vector3::unit_z(), Point3::new(2.0, 0.0, 1.0));
+        assert!(
+            (hit - Point3::new(2.0, 0.0, 1.0)).magnitude() < 1e-4,
+            "the plane must sit at the pivot, got {hit:?}"
+        );
+    }
+
+    #[test]
+    fn seeing_the_ring_edge_on_offers_no_turn_to_measure() {
+        let eye = Point3::new(0.0, 0.0, 3.0);
+        let origin = Point3::new(0.0, 0.0, 0.0);
+
+        // The sight line running along the plane across the axis - here looking down -Z, which lies flat in
+        // the plane across X, so the ring about X is seen edge on. The bearing of a point on a line seen
+        // end-on is not readable, and the few pixels that do project land miles from the pivot.
+        let edge_on = Ray::new(eye, Vector3::new(0.0, 0.0, -1.0));
+        assert_eq!(
+            project_ray_onto_plane(origin, Vector3::unit_x(), &edge_on),
+            None
+        );
+
+        // The plane behind the eye: the infinite line still meets it, but the cursor points the other way,
+        // and a turn read from behind the camera goes the wrong half of the way round.
+        let away = Ray::new(eye, Vector3::new(0.0, 0.0, 1.0));
+        assert_eq!(
+            project_ray_onto_plane(origin, Vector3::unit_z(), &away),
+            None
+        );
+
+        // And an axis with no direction has no plane across it at all.
+        let anywhere = Ray::new(eye, Point3::new(1.0, 1.0, 0.0) - eye);
+        assert_eq!(
+            project_ray_onto_plane(origin, Vector3::new(0.0, 0.0, 0.0), &anywhere),
+            None
+        );
+    }
+
+    #[test]
+    fn looking_down_the_axis_reads_the_turn_face_on() {
+        // The case a rotate drag is most comfortable in, and worth stating because it is the one an
+        // edge-on test tempts a reader to think is degenerate: sighting along the axis, the ring faces the
+        // cursor and the screen centre maps exactly onto the pivot.
+        let eye = Point3::new(0.0, 0.0, 3.0);
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let hit = plane_hit(eye, origin, Vector3::unit_z(), Point3::new(0.0, 0.0, 0.0));
+        assert!(
+            (hit - origin).magnitude() < 1e-5,
+            "the pivot must project onto itself, got {hit:?}"
+        );
+
+        // And a quarter of the way round the ring reads as a quarter of a turn, which is the promise the
+        // drawn chords make and the drag keeps.
+        let start = plane_hit(eye, origin, Vector3::unit_z(), Point3::new(1.0, 0.0, 0.0));
+        let end = plane_hit(eye, origin, Vector3::unit_z(), Point3::new(0.0, 1.0, 0.0));
+        let angle = signed_angle(start - origin, end - origin, Vector3::unit_z())
+            .expect("both cursors sit off the axis");
+        assert!(
+            (angle - std::f32::consts::FRAC_PI_2).abs() < 1e-4,
+            "screen quarters must be ring quarters, got {angle}"
+        );
+    }
+
+    #[test]
+    fn a_quarter_turn_about_an_axis_is_positive_the_right_way_round() {
+        // The sign is the whole difference between a ring that turns with its colour's axis and one that
+        // turns against it, and only an explicit case can say which way is which: looking back down +Z,
+        // +X sweeps counter-clockwise to +Y, so that pair must read +pi/2 and its reverse -pi/2.
+        let quarter = std::f32::consts::FRAC_PI_2;
+        let cases = [
+            (Vector3::unit_x(), Vector3::unit_y(), GizmoAxis::Z, quarter),
+            (Vector3::unit_y(), Vector3::unit_x(), GizmoAxis::Z, -quarter),
+            (Vector3::unit_y(), Vector3::unit_z(), GizmoAxis::X, quarter),
+            (Vector3::unit_z(), Vector3::unit_x(), GizmoAxis::Y, quarter),
+        ];
+        for (from, to, axis, expected) in cases {
+            let angle = signed_angle(from, to, axis.unit_vector()).expect("two distinct bearings");
+            assert!(
+                (angle - expected).abs() < 1e-5,
+                "{from:?} to {to:?} about {:?} should read {expected}, got {angle}",
+                axis.unit_vector()
+            );
+        }
+    }
+
+    #[test]
+    fn a_turn_is_measured_across_the_axis_rather_than_along_it() {
+        // Both cursors sit far up the axis, so their raw dot product is dominated by the part that runs
+        // along it. Measuring the vectors as they stand would report a shallow angle for a clean quarter
+        // turn, which reads as a handle that has gone stiff rather than one that was measured wrong.
+        let along = Vector3::new(0.0, 0.0, 40.0);
+        let from = Vector3::unit_x() + along;
+        let to = Vector3::unit_y() + along;
+        let angle = signed_angle(from, to, Vector3::unit_z()).expect("both span the plane");
+        assert!(
+            (angle - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+            "the height along the axis is not part of the turn, got {angle}"
+        );
+    }
+
+    #[test]
+    fn a_cursor_on_the_line_of_rotation_has_no_bearing_at_all() {
+        // Answering zero here would look like a measured turn of nothing and write the mesh back to where it
+        // started; `None` lets the drag hold still, which is what the view actually supports.
+        assert_eq!(
+            signed_angle(
+                Vector3::new(0.0, 0.0, 7.0),
+                Vector3::unit_x(),
+                Vector3::unit_z()
+            ),
+            None
+        );
+        assert_eq!(
+            signed_angle(
+                Vector3::unit_x(),
+                Vector3::unit_y(),
+                Vector3::new(0.0, 0.0, 0.0)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_ring_lies_in_the_plane_across_its_axis_and_closes_on_itself() {
+        let frame = Frame::world(Point3::new(0.5, -0.5, 1.0));
+        let radius = 0.75;
+        for &axis in GizmoAxis::ALL.iter() {
+            let chords = ring(&frame, axis, radius, RING_SEGMENTS, None);
+            assert_eq!(chords.len(), RING_SEGMENTS);
+
+            let normal = frame.direction(axis);
+            for chord in &chords {
+                for point in [chord.start, chord.end] {
+                    let offset = point - frame.origin;
+                    assert!(
+                        (offset.magnitude() - radius).abs() < 1e-4,
+                        "{axis:?} ring drifted to {:?}",
+                        offset.magnitude()
+                    );
+                    assert!(
+                        offset.dot(normal).abs() < 1e-4,
+                        "{axis:?} ring tilted out of the plane it is meant to lie in"
+                    );
+                }
+            }
+
+            // Chords, not a scatter of points: each has to start where the last one ended, or the drawn
+            // circle has a gap in it and reads as three arcs rather than one ring.
+            for (index, chord) in chords.iter().enumerate() {
+                let next = &chords[(index + 1) % chords.len()];
+                assert!(
+                    (chord.end - next.start).magnitude() < 1e-6,
+                    "the {axis:?} ring broke between chord {index} and the next"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_ring_sweeps_the_way_its_axis_turns() {
+        // The ring is a promise about direction, not only about a plane: it is drawn before the user has
+        // moved, and the drag then measures with `signed_angle`. If the chords ran the other way round the
+        // ring would advertise a turn and deliver its mirror, and nothing but this comparison would say so.
+        let frame = Frame::world(Point3::new(0.0, 0.0, 0.0));
+        for &axis in GizmoAxis::ALL.iter() {
+            let normal = frame.direction(axis);
+            let chords = ring(&frame, axis, 1.0, RING_SEGMENTS, None);
+            let step = signed_angle(
+                chords[0].start - frame.origin,
+                chords[0].end - frame.origin,
+                normal,
+            )
+            .expect("neighbouring ring points have a bearing between them");
+            assert!(
+                step > 0.0,
+                "the {axis:?} ring's increasing index must turn the way {normal:?} turns, read {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ring_takes_its_highlight_from_the_axis_being_held() {
+        let frame = Frame::world(Point3::new(0.0, 0.0, 0.0));
+        for &axis in GizmoAxis::ALL.iter() {
+            let chords = ring(&frame, axis, 1.0, 8, Some(axis));
+            assert!(
+                chords.iter().all(|c| c.color == COLOR_AXIS_ACTIVE),
+                "holding {axis:?} must light its own ring"
+            );
+            let other = GizmoAxis::ALL[(axis.index() + 1) % 3];
+            let dimmed = ring(&frame, other, 1.0, 8, Some(axis));
+            assert!(
+                dimmed.iter().all(|c| c.color == other.color()),
+                "holding {axis:?} must leave the {other:?} ring its own colour"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ring_of_no_radius_draws_nothing() {
+        let frame = Frame::world(Point3::new(0.0, 0.0, 0.0));
+        assert!(ring(&frame, GizmoAxis::X, 0.0, RING_SEGMENTS, None).is_empty());
+        assert!(ring(&frame, GizmoAxis::X, -1.0, RING_SEGMENTS, None).is_empty());
+        assert!(ring(&frame, GizmoAxis::X, f32::NAN, RING_SEGMENTS, None).is_empty());
+        // Two points cannot be a circle, whatever the radius.
+        assert!(ring(&frame, GizmoAxis::X, 1.0, 1, None).is_empty());
+        assert_eq!(ring(&frame, GizmoAxis::X, 1.0, 2, None).len(), 2);
+    }
+
+    #[test]
+    fn the_three_rings_cover_the_three_turn_planes() {
+        let frame = Frame::from_axis(Point3::new(1.0, 1.0, 1.0), Vector3::new(1.0, 1.0, 1.0))
+            .expect("a diagonal defines a component frame");
+        let drawn = rings(&frame, 0.4, Some(GizmoAxis::Y));
+        assert_eq!(drawn.len(), 3 * RING_SEGMENTS);
+        assert_eq!(
+            drawn
+                .iter()
+                .filter(|chord| chord.color == COLOR_AXIS_ACTIVE)
+                .count(),
+            RING_SEGMENTS,
+            "exactly one of the three rings carries the highlight"
+        );
+    }
+
+    #[test]
+    fn span_along_measures_the_geometry_not_the_cursor() {
+        let mesh = cube();
+        let corners: Vec<Point3<f32>> = (0..mesh.vertices.len())
+            .map(|i| mesh.vertex_position(VertexId(i)))
+            .collect();
+
+        for &axis in GizmoAxis::ALL.iter() {
+            let span = span_along(&corners, axis.unit_vector());
+            assert!(
+                (span - 1.0).abs() < 1e-5,
+                "the unit cube spans 1.0 along {:?}, measured {span}",
+                axis.unit_vector()
+            );
+        }
+
+        // Corner to corner, the span is the width of the shadow the points cast down the direction, so a
+        // diagonal sees the cube sqrt(3) across.
+        let diagonal = Vector3::new(1.0, 1.0, 1.0).normalize();
+        assert!(
+            (span_along(&corners, diagonal) - 3.0f32.sqrt()).abs() < 1e-5,
+            "got {}",
+            span_along(&corners, diagonal)
+        );
+    }
+
+    #[test]
+    fn a_selection_with_nothing_to_span_measures_nothing() {
+        let mesh = cube();
+        let one = vec![mesh.vertex_position(VertexId(0))];
+        assert_eq!(span_along(&one, Vector3::unit_x()), 0.0);
+
+        // Two corners level across the axis cast a shadow of no width - the case a scale must not divide by.
+        let level = vec![Point3::new(-0.5, 0.5, 0.5), Point3::new(0.5, 0.5, 0.5)];
+        assert_eq!(span_along(&level, Vector3::unit_z()), 0.0);
+        assert_eq!(span_along(&[], Vector3::unit_x()), 0.0);
+        assert_eq!(span_along(&level, Vector3::new(0.0, 0.0, 0.0)), 0.0);
+    }
+
+    #[test]
+    fn the_rotate_handle_adds_three_rings_and_the_others_do_not() {
+        let frame = Frame::world(Point3::new(0.0, 0.0, 0.0));
+        let eye = Point3::new(0.0, 0.0, 3.0);
+
+        let move_handle = handle(&frame, eye, VIEWPORT, None, false);
+        assert_eq!(move_handle.len(), GizmoAxis::ALL.len());
+
+        let rotate_handle = handle(&frame, eye, VIEWPORT, None, true);
+        assert_eq!(
+            rotate_handle.len(),
+            GizmoAxis::ALL.len() + 3 * RING_SEGMENTS,
+            "the rotate handle is the same three arms plus three rings, nothing else"
+        );
+        // The arms come first and unchanged, so the ring soup cannot shift where a tip is picked.
+        assert_eq!(&rotate_handle[..GizmoAxis::ALL.len()], &move_handle[..]);
+    }
+
+    #[test]
+    fn a_handle_at_the_eye_draws_nothing_worth_picking() {
+        // Pivot at the eye is the view `axis_world_length` answers zero for. The old builder returned an
+        // empty vec; this one returns arms of no length and no rings, which draws nothing and, more
+        // importantly, contains no line a pick could land on more than a pixel from the pivot.
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let drawn = handle(&Frame::world(origin), origin, VIEWPORT, None, true);
+        assert_eq!(drawn.len(), GizmoAxis::ALL.len());
+        for arm in &drawn {
+            assert_eq!(arm.start, arm.end, "an arm at zero length is a point");
+            assert!((arm.end - origin).magnitude() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn every_handle_vertex_is_finite_at_a_sharp_corner_of_the_view() {
+        // The one thing the gizmo buffer cannot survive is a NaN, which wgpu takes as licence to draw
+        // garbage across the viewport rather than as an error. A pivot on the eye axis and a frame tilted
+        // by hand are the two ways the arithmetic gets nearest to dividing by something small.
+        let eye = Point3::new(0.0, 0.0, 0.001);
+        let frames = [
+            Frame::world(Point3::new(0.0, 0.0, 0.0)),
+            Frame::world(Point3::new(0.0, 0.0, 0.001)),
+            Frame::from_axis(Point3::new(0.4, -0.2, 0.1), Vector3::new(1.0, 1.0, 1.0))
+                .expect("a diagonal defines a frame"),
+        ];
+        for frame in &frames {
+            for turning in [false, true] {
+                for arm in handle(frame, eye, VIEWPORT, Some(GizmoAxis::X), turning) {
+                    for point in [arm.start, arm.end] {
+                        assert!(
+                            point.x.is_finite() && point.y.is_finite() && point.z.is_finite(),
+                            "handle geometry went non-finite at {point:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_scale_rate_doubles_once_the_drag_has_matched_the_span() {
+        assert_eq!(scale_factor(0.0, 2.0), 1.0);
+        assert!((scale_factor(2.0, 2.0) - 2.0).abs() < 1e-6);
+        assert!((scale_factor(-1.0, 2.0) - 0.5).abs() < 1e-6);
+
+        // Nothing to divide by, so the drag cannot state a rate. Returning 1.0 leaves the geometry where it
+        // was rather than stretching it to infinity, which is the difference between a stuck handle and a
+        // lost model.
+        assert_eq!(scale_factor(1.0, 0.0), 1.0);
+        assert_eq!(scale_factor(f32::NAN, 2.0), 1.0);
+        assert_eq!(scale_factor(1.0, f32::INFINITY), 1.0);
     }
 }

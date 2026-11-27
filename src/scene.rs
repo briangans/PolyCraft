@@ -9,6 +9,7 @@ use crate::mesh::{EdgeId, FaceId, HalfEdgeMesh, TopologyErrors, VertexId};
 use crate::mesh_edit::IdRemap;
 use crate::picking::{self, Ray};
 use crate::selection::Selection;
+use cgmath::{Basis3, Rad, Rotation, Rotation3};
 use cgmath::{InnerSpace, Point3, Vector3};
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -23,6 +24,17 @@ pub const EDGE_PICK_RADIUS_PIXELS: f32 = 6.0;
 /// How many actions `undo` can walk back before the oldest ones are dropped. Meshes here are small
 /// (a snapshot is a few hundred KB at most), so they stay cheap enough to keep a deep stack.
 pub const HISTORY_DEPTH: usize = 64;
+
+/// How far a scale drag may compress the geometry, as a fraction of the size it started at.
+///
+/// A drag writes positions straight into the mesh and nothing revalidates a position afterwards:
+/// [`HalfEdgeMesh::validate`] judges how faces are *linked*, not the volume they enclose. So a factor
+/// allowed through zero would reverse the winding of every face the selection touches - the corners stay
+/// in place, the mesh stays perfectly manifold, and every normal it reports points into the solid. It is
+/// the mirror of the mistake `fill_holes` documents, that a wrongly wound face twins correctly and passes
+/// every check the topology has. A floor above zero keeps the sign of each face intact; a user can still
+/// flatten a wall paper-thin, which is a shape rather than a defect.
+pub const MIN_SCALE_FACTOR: f32 = 1e-3;
 
 /// The depth below which an extrude preview counts as "has not started yet", in model units.
 ///
@@ -267,6 +279,86 @@ impl Scene {
         for &(v_id, initial_pos) in vertices {
             if v_id.0 < self.mesh.vertices.len() {
                 self.mesh.vertices[v_id.0].position = initial_pos + delta;
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Rotates the given vertices about the line through `pivot` running along `axis`, by `angle` radians,
+    /// positive being counter-clockwise as seen looking back down the axis from its own tip - the
+    /// right-hand rule, which is what makes a ring's colour and the way it turns agree.
+    ///
+    /// Like [`Scene::translate_vertices`], every drag event recomputes from the positions captured when the
+    /// handle was grabbed rather than nudging wherever the geometry currently stands. A drag therefore
+    /// cannot accumulate rounding across a hundred cursor events, and Escape puts the mesh back by writing
+    /// the same snapshot at zero angle instead of needing the arithmetic to run backwards.
+    ///
+    /// `axis` is normalised here even though every caller hands over a [`crate::gizmo::Frame`] slot, which
+    /// is unit by construction: `Rotation3::from_axis_angle` does not normalise - its own documentation says
+    /// the axis "must be normalized, or it represents an invalid rotation" - so a slot that had drifted
+    /// would rotate about the right *line* but at the wrong radius, shrinking the geometry toward the pivot
+    /// while looking like a clean spin. A vector with no direction at all rotates nothing rather than
+    /// inventing an axis to rotate about.
+    pub fn rotate_vertices(
+        &mut self,
+        vertices: &[(VertexId, Point3<f32>)],
+        pivot: Point3<f32>,
+        axis: Vector3<f32>,
+        angle: f32,
+    ) {
+        if vertices.is_empty() || !angle.is_finite() {
+            return;
+        }
+        let magnitude = axis.magnitude();
+        if !magnitude.is_finite() || magnitude <= 0.0 {
+            return;
+        }
+        let rotation = Basis3::from_axis_angle(axis / magnitude, Rad(angle));
+        for &(v_id, initial_pos) in vertices {
+            if v_id.0 < self.mesh.vertices.len() {
+                self.mesh.vertices[v_id.0].position =
+                    pivot + rotation.rotate_vector(initial_pos - pivot);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Scales the given vertices along the one direction `axis` through `pivot` by `factor`: the part of
+    /// each vertex's offset that runs along the axis is stretched, the part across it stays put.
+    ///
+    /// One axis and not all three, because that is the degree of freedom a scale gizmo's arm offers. Maya's
+    /// uniform scale is a separate on-screen circle for the same reason - a handle that resized all three
+    /// axes would shrink a cube when the user meant to lengthen it, and the difference is invisible until
+    /// the proportion is gone.
+    ///
+    /// The factor is floored at [`Scene::MIN_SCALE_FACTOR`]. A drag writes positions straight in and nothing
+    /// revalidates them, so this is the one corruption the tool can reach that no check would catch.
+    pub fn scale_vertices(
+        &mut self,
+        vertices: &[(VertexId, Point3<f32>)],
+        pivot: Point3<f32>,
+        axis: Vector3<f32>,
+        factor: f32,
+    ) {
+        if vertices.is_empty() {
+            return;
+        }
+        let magnitude = axis.magnitude();
+        if !magnitude.is_finite() || magnitude <= 0.0 {
+            return;
+        }
+        let direction = axis / magnitude;
+        let factor = if factor.is_finite() {
+            factor.max(MIN_SCALE_FACTOR)
+        } else {
+            MIN_SCALE_FACTOR
+        };
+        for &(v_id, initial_pos) in vertices {
+            if v_id.0 < self.mesh.vertices.len() {
+                let offset = initial_pos - pivot;
+                let along = direction.dot(offset);
+                let across = offset - direction * along;
+                self.mesh.vertices[v_id.0].position = pivot + across + direction * (along * factor);
             }
         }
         self.dirty = true;
@@ -1279,6 +1371,226 @@ mod tests {
         assert!(scene.take_dirty(), "translating vertices must flag dirty");
         let new_pos = scene.mesh().vertex_position(v0);
         assert_eq!(new_pos, initial_pos + delta);
+    }
+
+    // ---- Rotate / scale drags ----------------------------------------------------------------------
+
+    /// Asserts two positions coincide to within the tolerance f32 rotation maths deserves.
+    fn near(a: Point3<f32>, b: Point3<f32>) -> bool {
+        (a - b).magnitude() < 1e-5
+    }
+
+    /// Every vertex of the document paired with where it currently sits, as a drag captures them.
+    fn capture(scene: &Scene) -> Vec<(VertexId, Point3<f32>)> {
+        (0..scene.mesh().vertices.len())
+            .map(|i| (VertexId(i), scene.mesh().vertex_position(VertexId(i))))
+            .collect()
+    }
+
+    #[test]
+    fn a_positive_angle_turns_counter_clockwise_about_its_own_axis() {
+        // The sign is the whole difference between a ring that turns with its colour's axis and one that
+        // turns against it, and nothing but a test can say which way is which: vertex 0 sits at
+        // (-0.5, -0.5, 0.5), so a quarter turn about +Z carries it to where vertex 1 is.
+        let mut scene = Scene::new();
+        let start = capture(&scene);
+        let origin = Point3::new(0.0, 0.0, 0.0);
+
+        scene.rotate_vertices(
+            &start,
+            origin,
+            Vector3::unit_z(),
+            std::f32::consts::FRAC_PI_2,
+        );
+
+        assert!(
+            near(
+                scene.mesh().vertex_position(VertexId(0)),
+                Point3::new(0.5, -0.5, 0.5)
+            ),
+            "a positive angle about +Z must carry -X toward +Y, got {:?}",
+            scene.mesh().vertex_position(VertexId(0))
+        );
+    }
+
+    #[test]
+    fn a_rotation_spins_the_mesh_rather_than_smearing_it() {
+        // A rotation about an axis holds every corner at its distance from that axis and at its height
+        // along it. Asserting that is the way to catch a transform rotating about the wrong line - which
+        // is what an unnormalised axis would do, and it reads as a clean spin right up until the solid has
+        // quietly shrunk toward wherever the pivot actually was.
+        let mut scene = Scene::new();
+        let start = capture(&scene);
+        let origin = Point3::new(0.0, 0.0, 0.0);
+
+        scene.rotate_vertices(&start, origin, Vector3::unit_z(), 1.0);
+
+        for &(id, before) in &start {
+            let after = scene.mesh().vertex_position(id);
+            let radius_before = (before.x * before.x + before.y * before.y).sqrt();
+            let radius_after = (after.x * after.x + after.y * after.y).sqrt();
+            assert!(
+                (radius_before - radius_after).abs() < 1e-5 && (before.z - after.z).abs() < 1e-5,
+                "vertex {id:?} left its circle: {before:?} -> {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drag_of_many_steps_lands_where_its_final_step_lands() {
+        // A cursor sends hundreds of events, each carrying the angle wound round *since the grab*, and
+        // `rotate_vertices` recomputes every vertex from the snapshot taken at the grab rather than nudging
+        // wherever the geometry currently stands. The two together are what stops a long drag rounding its
+        // way off the circle: the hundredth event must land where a single event of the same angle would,
+        // however many came before it.
+        let mut scene = Scene::new();
+        let start = capture(&scene);
+        let origin = Point3::new(0.0, 0.0, 0.0);
+
+        for step in 1..=100 {
+            scene.rotate_vertices(&start, origin, Vector3::unit_y(), step as f32 * 0.01);
+        }
+
+        let mut direct = Scene::new();
+        let direct_start = capture(&direct);
+        direct.rotate_vertices(&direct_start, origin, Vector3::unit_y(), 1.0);
+
+        for i in 0..scene.mesh().vertices.len() {
+            let id = VertexId(i);
+            assert!(
+                near(
+                    scene.mesh().vertex_position(id),
+                    direct.mesh().vertex_position(id)
+                ),
+                "a hundred small steps rounded {id:?} off the circle a single step lands on: {:?}",
+                scene.mesh().vertex_position(id)
+            );
+        }
+    }
+
+    #[test]
+    fn the_angle_is_absolute_so_zero_restores_and_negating_does_not() {
+        // Both halves matter, and the second is a trap. Because every call recomputes from the snapshot
+        // rather than from where the previous call left the geometry, subtracting the angle does *not*
+        // retrace a step - it re-derives the opposite way round the circle. What does put the mesh back is
+        // writing zero, which is why Escape can restore a rotate drag without needing its arithmetic to run
+        // backwards, and why an Escape written as "step back by the last delta" would leave the solid turned.
+        let mut scene = Scene::new();
+        let start = capture(&scene);
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let angle = 0.4;
+
+        scene.rotate_vertices(&start, origin, Vector3::unit_y(), angle);
+        scene.rotate_vertices(&start, origin, Vector3::unit_y(), -angle);
+        assert!(
+            !near(scene.mesh().vertex_position(VertexId(0)), start[0].1),
+            "negating the angle would only retrace the drag if it were incremental, and it is not"
+        );
+
+        scene.rotate_vertices(&start, origin, Vector3::unit_y(), 0.0);
+        for &(id, before) in &start {
+            assert!(
+                near(scene.mesh().vertex_position(id), before),
+                "writing zero must put {id:?} back where the grab found it, since that is how a rotate \
+                 drag is cancelled: {:?}",
+                scene.mesh().vertex_position(id)
+            );
+        }
+    }
+
+    #[test]
+    fn scaling_along_one_axis_leaves_the_two_across_it_alone() {
+        let mut scene = Scene::new();
+        let start = capture(&scene);
+
+        scene.scale_vertices(&start, Point3::new(0.0, 0.0, 0.0), Vector3::unit_x(), 2.0);
+
+        for &(id, before) in &start {
+            let after = scene.mesh().vertex_position(id);
+            assert!(
+                near(after, Point3::new(before.x * 2.0, before.y, before.z)),
+                "scaling X must stretch only the X of {id:?}: {before:?} -> {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corner_on_the_pivot_plane_stays_put_while_its_neighbours_stretch() {
+        // The corners a scale leaves unmoved are exactly those on the plane through the pivot across the
+        // axis, and they are worth naming because they are shared with faces outside the selection: get them
+        // wrong and stretching one wall drags the wall beside it off its corners.
+        let mut scene = Scene::new();
+        let on_the_plane = (VertexId(0), Point3::new(0.0, 0.25, 0.75));
+        let off_the_plane = (VertexId(1), Point3::new(0.5, 0.25, 0.75));
+
+        scene.scale_vertices(
+            &[on_the_plane, off_the_plane],
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::unit_x(),
+            3.0,
+        );
+
+        assert!(
+            near(scene.mesh().vertex_position(VertexId(0)), on_the_plane.1),
+            "a corner on the pivot plane cannot move, or the seam it shares with the next wall has torn"
+        );
+        assert!(
+            near(
+                scene.mesh().vertex_position(VertexId(1)),
+                Point3::new(1.5, 0.25, 0.75)
+            ),
+            "the corner off the plane must travel three times as far from it"
+        );
+    }
+
+    #[test]
+    fn a_scale_cannot_be_pushed_through_zero() {
+        // Dragging a handle back through the pivot is the one gesture that would hand the mesh inverted
+        // winding and nothing downstream would see it - see `MIN_SCALE_FACTOR`. The corner has to stay on
+        // the side of the plane it started on however hard the drag is pushed the other way.
+        let mut scene = Scene::new();
+        for factor in [0.0, -1.0, -40.0, f32::NAN] {
+            scene.scale_vertices(
+                &[(VertexId(0), Point3::new(0.5, 0.0, 0.0))],
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::unit_x(),
+                factor,
+            );
+            let after = scene.mesh().vertex_position(VertexId(0));
+            assert!(
+                after.x > 0.0,
+                "factor {factor} left the corner on the far side of the pivot plane at {after:?}"
+            );
+            assert!(
+                (after.x - MIN_SCALE_FACTOR * 0.5).abs() < 1e-9,
+                "factor {factor} should have floored to `MIN_SCALE_FACTOR`, landed at {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_axis_with_no_direction_transforms_nothing() {
+        // Both operations read their axis out of a `Frame` slot, which is unit by construction, so this is
+        // the defensive path - but the alternative to doing nothing is worse than doing nothing: a zero
+        // vector through `Rotation3::from_axis_angle` yields NaN positions, which survive into the mesh, the
+        // GPU buffer and the undo snapshot, and no `validate` catches a NaN.
+        let mut scene = Scene::new();
+        let start = capture(&scene);
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let nowhere = Vector3::new(0.0, 0.0, 0.0);
+
+        scene.rotate_vertices(&start, origin, nowhere, 1.0);
+        scene.scale_vertices(&start, origin, nowhere, 2.0);
+        // A NaN angle is the same hazard arriving from the cursor rather than from the frame.
+        scene.rotate_vertices(&start, origin, Vector3::unit_z(), f32::NAN);
+
+        assert!(
+            !scene.take_dirty(),
+            "a no-op must not dirty the document or every frame re-uploads the buffers for nothing"
+        );
+        for &(id, before) in &start {
+            assert_eq!(scene.mesh().vertex_position(id), before);
+        }
     }
 
     // ---- Undo / redo -----------------------------------------------------------------------------

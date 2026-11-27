@@ -45,6 +45,10 @@ pub enum Command {
     FaceMode,
     SelectTool,
     MoveTool,
+    /// Maya's `E`. Turns the selection about the arm of the handle that is dragged.
+    RotateTool,
+    /// Maya's `R`. Stretches the selection along the arm of the handle that is dragged.
+    ScaleTool,
     Undo,
     Redo,
     Extrude,
@@ -110,22 +114,15 @@ pub const MENUS: &[Menu] = &[
             live("Face", "F11", Command::FaceMode),
             live("Object", "F8", Command::ObjectMode),
             // Maya keeps these on the Tool Box, the column of buttons at the left of its window, which
-            // this app has no equivalent of - so the menu is the only place they can be reached, and the
-            // only place their absence can be seen. The two greyed rows say what selecting them does here,
-            // because it is not nothing: `E` and `R` do change the tool and tick the Tools panel, and they
-            // also hide the gizmo, which `State::upload_gizmo` draws for Move alone.
+            // this app has no equivalent of - so the menu is the only place they can be reached. All four
+            // are live: the three transform tools draw and drag one handle each, differing only in what the
+            // cursor's movement means once an arm is held. `Show Manipulator` stays greyed because there is
+            // nothing to show or hide - the handle follows the tool and the selection, so it has no state of
+            // its own to toggle.
             live("Select Tool", "Q", Command::SelectTool),
             live("Move Tool", "W", Command::MoveTool),
-            gap(
-                "Rotate Tool",
-                "E",
-                "selectable, but nothing drags: E hides the gizmo, which is drawn for Move alone",
-            ),
-            gap(
-                "Scale Tool",
-                "R",
-                "selectable, but nothing drags: R hides the gizmo, which is drawn for Move alone",
-            ),
+            live("Rotate Tool", "E", Command::RotateTool),
+            live("Scale Tool", "R", Command::ScaleTool),
             gap(
                 "Show Manipulator Tool",
                 "T",
@@ -353,13 +350,16 @@ pub fn mode_for(command: Command) -> Option<EditMode> {
 
 /// The transform tool a row switches to, if it switches to one.
 ///
-/// Maya shows the active tool by lighting its Tool Box button; with no Tool Box, the tick on these two
-/// rows is where that state is visible. The greyed Rotate and Scale rows answer `None`, which is accurate
-/// twice over: they carry no command, and even the key that selects those tools draws no manipulator.
+/// Maya shows the active tool by lighting its Tool Box button; with no Tool Box, the tick on these rows is
+/// where that state is visible. All four tool rows answer here, including the two that draw the same handle
+/// Move does - a row that ticks a tool it does not switch to would be the worse bug, because the tick is how
+/// the user checks which gesture the arms are about to perform.
 pub fn tool_for(command: Command) -> Option<Tool> {
     match command {
         Command::SelectTool => Some(Tool::Select),
         Command::MoveTool => Some(Tool::Translate),
+        Command::RotateTool => Some(Tool::Rotate),
+        Command::ScaleTool => Some(Tool::Scale),
         _ => None,
     }
 }
@@ -401,6 +401,8 @@ mod tests {
         Command::FaceMode,
         Command::SelectTool,
         Command::MoveTool,
+        Command::RotateTool,
+        Command::ScaleTool,
         Command::Undo,
         Command::Redo,
         Command::Extrude,
@@ -468,6 +470,8 @@ mod tests {
                     | Command::FaceMode
                     | Command::SelectTool
                     | Command::MoveTool
+                    | Command::RotateTool
+                    | Command::ScaleTool
             );
             assert_eq!(
                 ticks_state, is_state,

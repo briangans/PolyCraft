@@ -298,6 +298,8 @@ fn dispatch(command: Command, response: &mut UiResponse) {
         C::FaceMode => response.mode = Some(EditMode::Face),
         C::SelectTool => response.tool = Some(Tool::Select),
         C::MoveTool => response.tool = Some(Tool::Translate),
+        C::RotateTool => response.tool = Some(Tool::Rotate),
+        C::ScaleTool => response.tool = Some(Tool::Scale),
         C::Undo => response.undo = true,
         C::Redo => response.redo = true,
         C::Extrude => response.extrude = true,

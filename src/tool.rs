@@ -13,13 +13,23 @@ pub enum Tool {
     /// Move / Translate tool (W key). Draws the 3D translate gizmo at the selection pivot.
     #[default]
     Translate,
-    /// Rotate tool (E key). Reserved for future rotation manipulator.
+    /// Rotate tool (E key). Turns the selection about the axis of the arm that is dragged.
     Rotate,
-    /// Scale tool (R key). Reserved for future scale manipulator.
+    /// Scale tool (R key). Stretches the selection along the axis of the arm that is dragged.
     Scale,
 }
 
 impl Tool {
+    /// Whether this tool draws and drags a transform handle at the selection.
+    ///
+    /// `Select` is the only one that does not: it is the tool for saying *which* components, and a handle
+    /// sitting over the picking would take the click the user meant for the geometry. The three transform
+    /// tools all grab an arm of the same [`crate::gizmo::Frame`] and differ only in what the cursor's
+    /// movement means once it is held, which is why they share one gizmo rather than having three.
+    pub fn has_gizmo(self) -> bool {
+        !matches!(self, Tool::Select)
+    }
+
     /// Human-readable name for UI display.
     pub fn label(self) -> &'static str {
         match self {
@@ -48,6 +58,16 @@ mod tests {
     #[test]
     fn default_tool_is_translate() {
         assert_eq!(Tool::default(), Tool::Translate);
+    }
+
+    #[test]
+    fn every_transform_tool_offers_a_handle_and_select_does_not() {
+        // The gizmo is drawn, picked and dragged on this predicate, so a tool that answers wrong either
+        // loses its manipulator or sits over the geometry the Select tool is trying to pick.
+        assert!(!Tool::Select.has_gizmo());
+        assert!(Tool::Translate.has_gizmo());
+        assert!(Tool::Rotate.has_gizmo());
+        assert!(Tool::Scale.has_gizmo());
     }
 
     #[test]
