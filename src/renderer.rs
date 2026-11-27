@@ -405,6 +405,7 @@ enum Hotkey {
     Extrude,
     EdgeLoop,
     Bevel,
+    Delete,
     CycleSpace,
     SelectAll,
     SelectNone,
@@ -430,6 +431,10 @@ enum Hotkey {
 ///
 /// All three act on the mode in use, matching Maya: `Ctrl+A` in Face mode selects every face, and a
 /// selection made in one mode is not carried into another.
+///
+/// **`Del`** is Maya's key for removing a component and is taken unchanged - the only modelling command
+/// here that needs no modifier, which is why `Ctrl+Delete` and `Shift+Delete` deliberately do nothing
+/// rather than reaching the same command by a second chord.
 ///
 /// The tool keys only fire with Ctrl released: `Ctrl+Z` sends `KeyZ`, and without that guard a
 /// `Ctrl` chord would silently switch tools. They also require Shift released, which frees the
@@ -485,6 +490,7 @@ fn hotkey_for(key: winit::keyboard::KeyCode, ctrl: bool, shift: bool) -> Option<
         Key::F9 => Some(Hotkey::SetMode(EditMode::Vertex)),
         Key::F10 => Some(Hotkey::SetMode(EditMode::Edge)),
         Key::F11 => Some(Hotkey::SetMode(EditMode::Face)),
+        Key::Delete => Some(Hotkey::Delete),
         Key::Escape => Some(Hotkey::CancelDrag),
         _ => None,
     }
@@ -843,6 +849,10 @@ impl<'a> State<'a> {
                 self.bevel_selected_edge();
                 true
             }
+            Some(Hotkey::Delete) => {
+                self.delete_selected();
+                true
+            }
             Some(Hotkey::CycleSpace) => {
                 self.cycle_reference_system();
                 true
@@ -986,6 +996,42 @@ impl<'a> State<'a> {
                     "Beveled the edge, opening facet {} between the faces it joined",
                     bevel.facet.0
                 ));
+            }
+            Err(errors) => self.notice = Some(errors.join(" ")),
+        }
+    }
+
+    /// Retires the selected components, opening the mesh where they were, and echoes what left.
+    ///
+    /// The gesture in flight is closed first for the reason `insert_edge_loop` documents, and the reason is
+    /// sharper here than it is there: an armed extrude previews from the snapshot taken when it was armed,
+    /// so a click after a delete would write back the faces that have just been removed. Nothing of its own
+    /// follows a delete - what goes is decided by the selection, not the cursor - so there is no drag state
+    /// to hand over to, and a refusal arrives as a notice rather than silence.
+    pub fn delete_selected(&mut self) {
+        self.cancel_active_drag();
+
+        match self.scene.delete_selected() {
+            Ok(gone) => {
+                let mut echo = format!(
+                    "Deleted {} {}",
+                    gone.faces,
+                    if gone.faces == 1 { "face" } else { "faces" }
+                );
+                // Only worth saying when corners actually went: they leave no outline of their own, so a
+                // count is the sole sign that the mesh shrank rather than merely opened.
+                if gone.vertices > 0 {
+                    echo.push_str(&format!(
+                        ", dropping {} {} that no surviving face needed",
+                        gone.vertices,
+                        if gone.vertices == 1 {
+                            "corner"
+                        } else {
+                            "corners"
+                        }
+                    ));
+                }
+                self.notice = Some(echo);
             }
             Err(errors) => self.notice = Some(errors.join(" ")),
         }
@@ -1398,6 +1444,9 @@ impl<'a> State<'a> {
         if response.bevel {
             self.bevel_selected_edge();
         }
+        if response.delete {
+            self.delete_selected();
+        }
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -1429,6 +1478,7 @@ impl<'a> State<'a> {
                 extruding: self.scene.is_extruding(),
                 can_insert_edge_loop: self.scene.can_insert_edge_loop(),
                 can_bevel: self.scene.can_bevel(),
+                can_delete: self.scene.can_delete(),
                 space: self.scene.space(),
                 notice: self.notice.as_deref(),
             },
@@ -1701,6 +1751,22 @@ mod tests {
         // would shadow a chord another application already owns.
         assert_eq!(hotkey_for(Key::F9, true, false), None);
         assert_eq!(hotkey_for(Key::F8, false, true), None);
+    }
+
+    #[test]
+    fn delete_is_bound_to_the_delete_key_alone() {
+        assert_eq!(hotkey_for(Key::Delete, false, false), Some(Hotkey::Delete));
+
+        // Maya has no modifier variant of Delete. Inventing one would put an undiscoverable chord in front
+        // of the operation that destroys geometry, and `Ctrl+Delete` is a text-editing key everywhere else.
+        assert_eq!(hotkey_for(Key::Delete, true, false), None);
+        assert_eq!(hotkey_for(Key::Delete, false, true), None);
+
+        // Backspace is the key a user reaches for on a laptop, but it is Maya's text-editing key and this
+        // app has no text field to protect yet - so a stray press would delete a face with no way to undo
+        // the surprise. Held back deliberately rather than overlooked; see the digest's rule that a
+        // borrowed key is indistinguishable from a broken one.
+        assert_eq!(hotkey_for(Key::Backspace, false, false), None);
     }
 
     #[test]

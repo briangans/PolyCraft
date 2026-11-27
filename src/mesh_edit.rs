@@ -130,6 +130,59 @@ pub struct Beveled {
     pub new_vertices: [VertexId; 2],
 }
 
+/// What [`HalfEdgeMesh::delete_faces`] removed, and where everything that survived ended up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Deleted {
+    /// The faces retired, in the order they were asked for and with repeats dropped.
+    pub faces: Vec<FaceId>,
+    /// Half-edges that went with them. Every half-edge belongs to a face, so none can outlive one.
+    pub half_edges: usize,
+    /// Corners that belonged to nothing else and were dropped alongside them.
+    pub vertices: usize,
+    /// Where each surviving component moved, so whatever holds ids can move them the same way.
+    pub remap: IdRemap,
+}
+
+/// Where each component went when a mesh was rebuilt from a subset of its own records.
+///
+/// Deleting is the one edit that cannot be done by appending: records genuinely leave the `Vec`s and
+/// every id above a removed one shifts down. A `usize` picked up beforehand - by the selection, above all
+/// others - would then name a *different* component, quietly, and the viewport would highlight the wrong
+/// face with nothing anywhere to follow. So the operation returns the correspondence rather than promising
+/// ids did not move, and leaves `Scene` to apply it.
+///
+/// An entry of `None` means the component is gone, which is what a caller needs in order to *drop* it
+/// rather than relocate it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdRemap {
+    vertices: Vec<Option<VertexId>>,
+    faces: Vec<Option<FaceId>>,
+}
+
+impl IdRemap {
+    /// Where a corner went, or `None` if it went with the faces that owned it.
+    pub fn vertex(&self, vertex: VertexId) -> Option<VertexId> {
+        self.vertices.get(vertex.0).copied().flatten()
+    }
+
+    /// Where a face went, or `None` if it was one of the ones deleted.
+    pub fn face(&self, face: FaceId) -> Option<FaceId> {
+        self.faces.get(face.0).copied().flatten()
+    }
+
+    /// Where an edge went, following the two corners it names.
+    ///
+    /// `Some` here means *both corners still exist*, not that the edge does: the faces that ran it may
+    /// have been the ones deleted, leaving two survivors with nothing between them. Numbering is all a
+    /// remap can answer; the caller confirms existence against the rebuilt mesh, which is what `Scene`'s
+    /// selection clip already does for every edge it holds.
+    pub fn edge(&self, edge: EdgeId) -> Option<EdgeId> {
+        let first = self.vertex(VertexId(edge.0))?;
+        let second = self.vertex(VertexId(edge.1))?;
+        Some(EdgeId::between(first, second))
+    }
+}
+
 impl HalfEdgeMesh {
     /// Every edge with no twin - the hull of the mesh - each as the same `(EdgeId, HalfEdgeId)` pair
     /// [`HalfEdgeMesh::edges`] yields.
@@ -1516,6 +1569,209 @@ impl HalfEdgeMesh {
             }
         }
     }
+
+    /// Retires the named faces and everything that existed only to bound them, leaving an opening where
+    /// they were. Nothing is closed up: this is Maya's *Delete*, not a hole fill.
+    ///
+    /// This is the one edit that cannot be done by appending, and the reason the append-only rule held for
+    /// every operation before it is that none of them reduced the number of records. Removing a face has to
+    /// remove its half-edges, and the corners those half-edges were the last to claim - so two options
+    /// existed. Slots could be poisoned in place, keeping every id ever handed out valid at the cost of
+    /// `Vec`s that never shrink and a `validate` that must learn which holes are deliberate; that is what
+    /// `slotmap`/generational ids buy, and they are still not a dependency. Instead the mesh is **rebuilt
+    /// densely** from the records that survive, and the operation reports where everything went as an
+    /// [`IdRemap`]. Ids therefore *do* move, which is why `Deleted` carries the remap rather than the
+    /// operation being quiet, and why the mesh stays cheap to walk: every query in `mesh.rs` still assumes
+    /// no gaps, and `picking`/`overlay`/`selection` still hold plain `usize`s across frames.
+    ///
+    /// Deleting the whole mesh is allowed and yields an empty one, which validates - an empty document is a
+    /// state a user can reach and undo out of, not a broken one.
+    ///
+    /// Returns what went and where the rest landed, or every reason nothing can be deleted, having changed
+    /// nothing.
+    pub fn delete_faces(&mut self, faces: &[FaceId]) -> Result<Deleted, TopologyErrors> {
+        let mut reasons = TopologyErrors::new();
+        let mut removed: Vec<FaceId> = Vec::with_capacity(faces.len());
+        let mut marked: HashSet<FaceId> = HashSet::new();
+        for &face in faces {
+            if face.0 >= self.faces.len() {
+                reasons.push(format!("face {} does not exist on this mesh", face.0));
+            } else if marked.insert(face) {
+                removed.push(face);
+            }
+        }
+        if !reasons.is_empty() {
+            return Err(reasons);
+        }
+        if removed.is_empty() {
+            return Err(vec!["there is no face named to delete".to_string()]);
+        }
+
+        let mut keep_face = vec![true; self.faces.len()];
+        for &face in &removed {
+            keep_face[face.0] = false;
+        }
+
+        // Counted off the candidate before it moves, because `install_if_valid` consumes it either way and
+        // a refusal has to be able to report nothing at all rather than a half-measured deletion.
+        let (candidate, remap) = self.rebuild_keeping(&keep_face);
+        let half_edges = self.half_edges.len() - candidate.half_edges.len();
+        let vertices = self.vertices.len() - candidate.vertices.len();
+
+        install_if_valid(
+            candidate,
+            self,
+            format!(
+                "deleting face{} {} produced topology that does not validate",
+                if removed.len() == 1 { "" } else { "s" },
+                removed
+                    .iter()
+                    .map(|face| face.0.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ),
+        )?;
+
+        Ok(Deleted {
+            faces: removed,
+            half_edges,
+            vertices,
+            remap,
+        })
+    }
+
+    /// Rebuilds this mesh without the faces `keep_face` marks false, densely, and reports where
+    /// everything went.
+    ///
+    /// Nothing here judges whether the request makes sense - [`HalfEdgeMesh::delete_faces`] refuses the
+    /// impossible first - so this reads as pure rewrite, which is what keeps it reviewable. The three
+    /// correspondences are computed up front in old-index order and every pass below looks a slot up in
+    /// them, so there is no place a live record can be copied twice or skipped.
+    ///
+    /// A dangling id is handed on dangling rather than smoothed into `None`: it is damage for the
+    /// validator to report, and rewriting it away here would leave the report nothing to name.
+    fn rebuild_keeping(&self, keep_face: &[bool]) -> (HalfEdgeMesh, IdRemap) {
+        let mut new_face: Vec<Option<FaceId>> = vec![None; self.faces.len()];
+        let mut next = 0;
+        for index in 0..self.faces.len() {
+            if keep_face[index] {
+                new_face[index] = Some(FaceId(next));
+                next += 1;
+            }
+        }
+
+        // Every half-edge belongs to exactly one face - `resolve_ids` refuses one that belongs to none -
+        // so a half-edge survives on exactly one condition: its face does.
+        let mut new_half_edge: Vec<Option<HalfEdgeId>> = vec![None; self.half_edges.len()];
+        let mut next = 0;
+        for (slot, edge) in new_half_edge.iter_mut().zip(&self.half_edges) {
+            if edge.face.is_some_and(|face| keep_face[face.0]) {
+                *slot = Some(HalfEdgeId(next));
+                next += 1;
+            }
+        }
+
+        // A corner survives when some surviving half-edge starts at it, which is the same question
+        // `check_vertices` asks - so a corner that stays is always one the mesh can still be walked out
+        // from, and no separate sweep for orphans is needed.
+        let mut keep_vertex = vec![false; self.vertices.len()];
+        for index in 0..self.half_edges.len() {
+            if new_half_edge[index].is_some() {
+                keep_vertex[self.half_edges[index].origin.0] = true;
+            }
+        }
+
+        // Then numbered in index order, exactly like the two tables above. Folding this into the scan
+        // would hand ids out in half-edge order while the dense `vertices` vector is written in index
+        // order, and two corners would trade places: a mesh whose ids all resolve, drawing the wrong
+        // shape. Surviving corners are numbered contiguously either way, so nothing else notices - only
+        // the geometry does, which is nothing at all.
+        let mut new_vertex: Vec<Option<VertexId>> = vec![None; self.vertices.len()];
+        let mut next = 0;
+        for index in 0..self.vertices.len() {
+            if keep_vertex[index] {
+                new_vertex[index] = Some(VertexId(next));
+                next += 1;
+            }
+        }
+
+        let moved = |id: HalfEdgeId| match new_half_edge.get(id.0) {
+            None => Some(id),
+            Some(&fresh) => fresh,
+        };
+
+        // The same hand-on-dangling rule for face ids, kept a separate closure because the two tables
+        // are different lengths and a half-edge id must never be looked up in the face one.
+        let kept = |id: FaceId| match new_face.get(id.0) {
+            None => Some(id),
+            Some(&fresh) => fresh,
+        };
+
+        let mut half_edges: Vec<HalfEdge> =
+            Vec::with_capacity(new_half_edge.iter().filter(|slot| slot.is_some()).count());
+        let mut first_out: HashMap<usize, HalfEdgeId> = HashMap::new();
+        for (edge, slot) in self.half_edges.iter().zip(&new_half_edge) {
+            if slot.is_none() {
+                continue;
+            }
+            let fresh = HalfEdgeId(half_edges.len());
+            let origin = new_vertex
+                .get(edge.origin.0)
+                .copied()
+                .flatten()
+                .unwrap_or(edge.origin);
+            first_out.entry(origin.0).or_insert(fresh);
+
+            half_edges.push(HalfEdge {
+                origin,
+                twin: None,
+                next: edge.next.and_then(moved),
+                prev: edge.prev.and_then(moved),
+                face: edge.face.and_then(kept),
+            });
+        }
+
+        // Twins are the one link that crosses between faces, so they cannot be copied in the pass above:
+        // the partner may not have been written yet. Linking them afterwards, by looking each id up in the
+        // same table, is what makes a survivor whose partner's face was deleted come out as a fresh
+        // boundary edge rather than a pointer into a hole.
+        for (index, slot) in new_half_edge.iter().enumerate() {
+            let (Some(fresh), Some(twin)) = (*slot, self.half_edges[index].twin) else {
+                continue;
+            };
+            half_edges[fresh.0].twin = match new_half_edge.get(twin.0) {
+                None => Some(twin),
+                Some(&survivor) => survivor,
+            };
+        }
+
+        let vertices: Vec<MeshVertex> = (0..self.vertices.len())
+            .filter(|&index| keep_vertex[index])
+            .map(|index| MeshVertex {
+                position: self.vertices[index].position,
+                half_edge: new_vertex[index].and_then(|fresh| first_out.get(&fresh.0).copied()),
+            })
+            .collect();
+
+        let faces: Vec<Face> = (0..self.faces.len())
+            .filter(|&index| keep_face[index])
+            .map(|index| Face {
+                half_edge: self.faces[index].half_edge.and_then(moved),
+            })
+            .collect();
+
+        (
+            HalfEdgeMesh {
+                vertices,
+                half_edges,
+                faces,
+            },
+            IdRemap {
+                vertices: new_vertex,
+                faces: new_face,
+            },
+        )
+    }
 }
 
 /// Everything [`HalfEdgeMesh::bevel_edge`] needs to know before it touches a pointer.
@@ -1792,6 +2048,20 @@ mod tests {
         HalfEdgeMesh::from_faces(&cube_positions(), &faces)
     }
 
+    /// Two quads sharing the edge between corners 1 and 2 - the smallest mesh with an interior edge, an
+    /// exterior edge, corners shared by two faces and corners claimed by only one.
+    fn joined_quads() -> HalfEdgeMesh {
+        let positions = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(1.0, 1.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+            Point3::new(2.0, 1.0, 0.0),
+        ];
+        HalfEdgeMesh::from_faces(&positions, &[vec![0, 1, 2, 3], vec![4, 5, 2, 1]])
+    }
+
     /// Component counts, so a refusal can be shown to have added and removed nothing.
     fn shape(mesh: &HalfEdgeMesh) -> (usize, usize, usize) {
         (mesh.vertices.len(), mesh.half_edges.len(), mesh.faces.len())
@@ -1837,15 +2107,7 @@ mod tests {
 
     #[test]
     fn joining_two_quads_takes_only_the_shared_edge_off_the_hull() {
-        let positions = vec![
-            Point3::new(0.0, 0.0, 0.0),
-            Point3::new(1.0, 0.0, 0.0),
-            Point3::new(1.0, 1.0, 0.0),
-            Point3::new(0.0, 1.0, 0.0),
-            Point3::new(2.0, 0.0, 0.0),
-            Point3::new(2.0, 1.0, 0.0),
-        ];
-        let mesh = HalfEdgeMesh::from_faces(&positions, &[vec![0, 1, 2, 3], vec![4, 5, 2, 1]]);
+        let mesh = joined_quads();
 
         assert_eq!(mesh.edges().len(), 7, "four plus four less the shared edge");
         assert_eq!(mesh.boundary_edges().len(), 6);
@@ -3183,5 +3445,171 @@ mod tests {
             mesh.boundary_edges().is_empty(),
             "still closed after both chamfers"
         );
+    }
+
+    #[test]
+    fn deleting_one_face_of_a_cube_leaves_an_open_box() {
+        let mut mesh = HalfEdgeMesh::create_cube();
+
+        let gone = mesh
+            .delete_faces(&[FaceId(0)])
+            .expect("a cube face is perfectly deletable");
+
+        assert_eq!(mesh.faces.len(), 5);
+        assert_eq!(
+            mesh.half_edges.len(),
+            20,
+            "the face took its four edges with it"
+        );
+        assert_eq!(gone.faces, vec![FaceId(0)]);
+        assert_eq!(gone.half_edges, 4);
+        assert_eq!(
+            gone.vertices, 0,
+            "every corner is shared with three other faces"
+        );
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("a five-sided box should validate: {errors:?}"));
+
+        assert_eq!(mesh.boundary_edges().len(), 4, "the rim where the face was");
+        assert_eq!(
+            euler_characteristic(&mesh),
+            1,
+            "a box missing its lid is topologically a disc, not a sphere"
+        );
+        assert_eq!(
+            mesh.generate_render_buffers().indices.len(),
+            30,
+            "five quads fan to 10 triangles"
+        );
+    }
+
+    #[test]
+    fn the_neighbours_of_a_deleted_face_gain_the_edges_it_left() {
+        // The twin pass is the whole reason for rebuilding rather than blanking records: each of the four
+        // faces that bounded the deleted one had the relevant half-edge twinned, and after the delete that
+        // partner is gone. Leaving the pointer behind would be a dangling id; clearing both sides is what
+        // turns a shared edge into a rim.
+        //
+        // The expectation is measured off the mesh before it changes rather than assumed, because a cube
+        // face has one neighbour on the far side that shares nothing - and the rebuild renumbers, so a
+        // hardcoded face index would describe whichever face happened to land there.
+        let before = HalfEdgeMesh::create_cube();
+        let doomed = FaceId(0);
+
+        let shared: Vec<usize> = (1..before.faces.len())
+            .map(|index| {
+                before
+                    .face_half_edges(FaceId(index))
+                    .iter()
+                    .filter(|&&half_edge| {
+                        before.half_edges[half_edge.0]
+                            .twin
+                            .is_some_and(|twin| before.half_edges[twin.0].face == Some(doomed))
+                    })
+                    .count()
+            })
+            .collect();
+        assert_eq!(
+            shared.iter().sum::<usize>(),
+            4,
+            "four faces bound the front one"
+        );
+        assert_eq!(
+            shared.iter().filter(|&&count| count == 0).count(),
+            1,
+            "the face on the far side shares no edge with it: {shared:?}"
+        );
+
+        let mut mesh = before;
+        let gone = mesh
+            .delete_faces(&[doomed])
+            .expect("a cube face is perfectly deletable");
+
+        for (old, expected) in shared.iter().enumerate() {
+            let survivor = gone
+                .remap
+                .face(FaceId(old + 1))
+                .expect("only face 0 was deleted");
+            let open = mesh
+                .face_half_edges(survivor)
+                .iter()
+                .filter(|&&half_edge| mesh.half_edges[half_edge.0].twin.is_none())
+                .count();
+            assert_eq!(
+                open, *expected,
+                "face {} should meet the opening along {} of its four edges",
+                survivor.0, expected
+            );
+        }
+    }
+
+    #[test]
+    fn a_deleted_face_retires_the_corners_nothing_else_bounds() {
+        // The far pair belongs to the second face alone, so deleting that face must drop them while the
+        // shared pair stays. This is the same question `check_vertices` asks, which is why no separate
+        // orphan sweep is needed afterwards - the survivor rule and the validity rule are one rule.
+        let mut mesh = joined_quads();
+        let before = mesh.clone();
+
+        let gone = mesh
+            .delete_faces(&[FaceId(1)])
+            .expect("the second of two joined quads is deletable");
+
+        assert_eq!(mesh.faces.len(), 1);
+        assert_eq!(mesh.half_edges.len(), 4);
+        assert_eq!(gone.half_edges, 4);
+        assert_eq!(gone.vertices, 2, "the two corners only that face claimed");
+        assert_eq!(mesh.vertices.len(), before.vertices.len() - 2);
+        assert_eq!(mesh.boundary_edges().len(), 4, "a lone quad is all rim");
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("the lone remaining quad should validate: {errors:?}"));
+    }
+
+    #[test]
+    fn every_surviving_face_keeps_the_geometry_its_remap_points_at() {
+        // Deleting shifts every id above the gap, so the guarantee a caller needs is not "ids are stable"
+        // but "the remap is right". Asserted against positions rather than ids, because a rebuild that
+        // pointed a surviving face at the wrong corner would still have had the right counts.
+        let before = HalfEdgeMesh::create_cube();
+        let mut mesh = before.clone();
+        let kept: Vec<(FaceId, Vec<[f32; 3]>)> = (0..before.faces.len())
+            .filter(|&index| index != 2)
+            .map(|index| {
+                let corners = before
+                    .face_positions(FaceId(index))
+                    .iter()
+                    .map(|point| [point.x, point.y, point.z])
+                    .collect();
+                (FaceId(index), corners)
+            })
+            .collect();
+
+        let gone = mesh
+            .delete_faces(&[FaceId(2)])
+            .expect("a cube face is perfectly deletable");
+
+        assert_eq!(
+            gone.remap.face(FaceId(2)),
+            None,
+            "the deleted face names nothing"
+        );
+        for (old, corners) in kept {
+            let fresh = gone
+                .remap
+                .face(old)
+                .unwrap_or_else(|| panic!("face {} should have survived", old.0));
+            assert_face_at(&mesh, fresh, &corners);
+        }
+
+        for index in 0..before.vertices.len() {
+            let old = VertexId(index);
+            if let Some(fresh) = gone.remap.vertex(old) {
+                assert_eq!(
+                    mesh.vertices[fresh.0].position, before.vertices[index].position,
+                    "corner {} was remapped to a vertex standing somewhere else",
+                    old.0
+                );
+            }
+        }
     }
 }

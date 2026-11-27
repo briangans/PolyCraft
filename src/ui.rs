@@ -31,6 +31,9 @@ pub struct UiResponse {
     /// The Bevel button was clicked, to trim the selected edge and open a facet where it ran. Lands on the
     /// press like an edge loop.
     pub bevel: bool,
+    /// The Delete button was clicked, or `Del` pressed. Lands on the press too - there is nothing to drag,
+    /// since what leaves the mesh is decided by the selection rather than by the cursor.
+    pub delete: bool,
     /// `Select > All`. Every component of the mode in use; the count depends on the mode, which is why
     /// this is a request rather than a set of ids - `Scene` is the only thing that can see the mesh.
     pub select_all: bool,
@@ -71,6 +74,9 @@ pub struct UiContext<'a> {
     pub can_insert_edge_loop: bool,
     /// Whether an edge can be bevelled right now, for the same reason again.
     pub can_bevel: bool,
+    /// Whether `Del` has something to remove right now, for the same reason again - the menu row and the
+    /// button grey out for exactly the reason the key would report.
+    pub can_delete: bool,
     /// Which orientation the transform gizmo is currently drawn and dragged in, so the button beside it can
     /// show the one that is live.
     pub space: Space,
@@ -126,6 +132,18 @@ fn bevel_button_text(available: bool) -> &'static str {
     }
 }
 
+/// Button text for the delete command, on the same rule as the three above. `Del` is Maya's own key for it
+/// and needs no modifier, so it is the one modelling command whose chord is a whole key - which is also why
+/// it is worth spelling out while it is live: a bare key is easy to press by accident, and the button is
+/// where a user learns that it can be pressed on purpose.
+fn delete_button_text(available: bool) -> &'static str {
+    if available {
+        "Delete  (Del)"
+    } else {
+        "Delete"
+    }
+}
+
 /// Which commands can act on the selection and history as they stand, so a menu row greys out for the
 /// same reason the panel button beside the viewport does.
 ///
@@ -138,6 +156,7 @@ struct Availability {
     extrude: bool,
     edge_loop: bool,
     bevel: bool,
+    delete: bool,
 }
 
 impl Availability {
@@ -159,6 +178,10 @@ impl Availability {
             C::Bevel if !available.bevel => {
                 Some("Needs exactly one edge selected - press F10 and click one edge.")
             }
+            C::Delete if !available.delete => Some(
+                "Removes faces, so pick them with F11 or a corner with F9. Del on an edge would merge the \
+                 two faces it joins, which is not built yet.",
+            ),
             _ => None,
         }
     }
@@ -257,6 +280,7 @@ fn dispatch(command: Command, response: &mut UiResponse) {
         C::Extrude => response.extrude = true,
         C::EdgeLoop => response.edge_loop = true,
         C::Bevel => response.bevel = true,
+        C::Delete => response.delete = true,
         C::CycleReferenceSystem => response.cycle_space = true,
         C::SelectAll => response.select_all = true,
         C::SelectNone => response.select_none = true,
@@ -323,6 +347,7 @@ impl UiState {
             extruding,
             can_insert_edge_loop,
             can_bevel,
+            can_delete,
             space: current_space,
             notice,
         } = current;
@@ -340,6 +365,7 @@ impl UiState {
                 extrude: can_extrude,
                 edge_loop: can_insert_edge_loop,
                 bevel: can_bevel,
+                delete: can_delete,
             },
             &mut response,
         );
@@ -491,6 +517,13 @@ impl UiState {
                 if ui.add_enabled(can_bevel, bevel_button).clicked() {
                     response.bevel = true;
                 }
+                // Delete sits with the modelling commands rather than beside Undo, because that is where
+                // Maya puts it - in the mesh-editing group, not the history group - and because greying it
+                // out with them keeps one rule for one kind of grey.
+                let delete_button = egui::Button::new(delete_button_text(can_delete));
+                if ui.add_enabled(can_delete, delete_button).clicked() {
+                    response.delete = true;
+                }
                 ui.separator();
                 ui.label(format!("Mode: {}", current_mode.label()));
                 let count_str = match current_mode {
@@ -606,6 +639,8 @@ mod tests {
             extruding: false,
             can_insert_edge_loop: false,
             can_bevel: false,
+            can_delete: false,
+
             notice: None,
             space: Space::World,
         }
@@ -970,6 +1005,8 @@ mod tests {
             extruding: false,
             can_insert_edge_loop: false,
             can_bevel: false,
+            can_delete: false,
+
             notice: None,
             space: Space::World,
         }

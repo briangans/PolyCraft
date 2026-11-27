@@ -6,6 +6,7 @@
 use crate::gizmo::Space;
 use crate::history::HistoryStack;
 use crate::mesh::{EdgeId, FaceId, HalfEdgeMesh, TopologyErrors, VertexId};
+use crate::mesh_edit::IdRemap;
 use crate::picking::{self, Ray};
 use crate::selection::Selection;
 use cgmath::{InnerSpace, Point3, Vector3};
@@ -75,6 +76,21 @@ pub struct BevelCommit {
     /// The four edges now bounding that facet, in order around it. They take over the selection, because
     /// the edge the user had picked no longer names a pair of vertices on the mesh.
     pub facet_edges: [EdgeId; 4],
+}
+
+/// What a delete removed, for the command echo.
+///
+/// Only counts, not ids: the faces that went are exactly the ones the user had selected, and their ids
+/// stopped meaning anything the moment the mesh was rebuilt, so echoing them would quote numbers that now
+/// name other faces.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DeleteCommit {
+    /// Faces retired, which is how many components the selection had asked for.
+    pub faces: usize,
+    /// Half-edges that went with them - two per edge of each opening, give or take the shared ones.
+    pub half_edges: usize,
+    /// Corners that belonged to no surviving face and were dropped alongside them.
+    pub vertices: usize,
 }
 
 /// An extrude awaiting the depth the mouse is giving it.
@@ -248,12 +264,7 @@ impl Scene {
     /// Shared by the hotkey seam and the Tools panel so the button greys out for exactly the reason the
     /// key does nothing, rather than looking live and then failing quietly.
     pub fn can_extrude(&self) -> bool {
-        self.mode == EditMode::Face
-            && self
-                .selection
-                .faces()
-                .iter()
-                .any(|&face| face.0 < self.mesh.faces.len())
+        self.mode == EditMode::Face && !self.live_faces().is_empty()
     }
 
     /// Whether an extrude drag is open, awaiting its depth.
@@ -375,14 +386,7 @@ impl Scene {
             ]);
         }
 
-        let mut faces: Vec<FaceId> = self
-            .selection
-            .faces()
-            .iter()
-            .copied()
-            .filter(|&face| face.0 < self.mesh.faces.len())
-            .collect();
-        faces.sort_by_key(|face| face.0);
+        let faces = self.live_faces();
 
         let Some(direction) = extrude_direction(&self.mesh, &faces) else {
             return Err(vec![
@@ -550,6 +554,187 @@ impl Scene {
             .copied()
             .filter(|&edge| edge.0 < self.mesh.vertices.len() && edge.1 < self.mesh.vertices.len())
             .collect()
+    }
+
+    /// The selected faces that still name a record on the mesh, in id order with repeats dropped - the
+    /// guard [`Scene::live_edges`] documents, which a selection inherits from undo and from loading a
+    /// different document. Canonical order is what makes every operation taking this list deterministic,
+    /// and `dedup` matters because a face reached twice from a corner fan would otherwise be counted twice.
+    fn live_faces(&self) -> Vec<FaceId> {
+        let mut faces: Vec<FaceId> = self
+            .selection
+            .faces()
+            .iter()
+            .copied()
+            .filter(|&face| face.0 < self.mesh.faces.len())
+            .collect();
+        faces.sort_by_key(|face| face.0);
+        faces.dedup();
+        faces
+    }
+
+    /// The selected vertices that still name a record on the mesh, in id order with repeats dropped - the
+    /// same guard as [`Scene::live_faces`], because corners age exactly the way faces do.
+    fn live_vertices(&self) -> Vec<VertexId> {
+        let mut vertices: Vec<VertexId> = self
+            .selection
+            .vertices()
+            .iter()
+            .copied()
+            .filter(|&vertex| vertex.0 < self.mesh.vertices.len())
+            .collect();
+        vertices.sort_by_key(|vertex| vertex.0);
+        vertices.dedup();
+        vertices
+    }
+
+    /// Moves every component the user holds across a rebuild, dropping the ones that went with the faces.
+    ///
+    /// Every earlier operation got this for free: append-only edits left each id handed out beforehand
+    /// valid forever, so a selection could stay where it was. Deletion is where that promise ends - an id
+    /// above a retired record now names its *neighbour*, which would highlight the wrong component with
+    /// nothing anywhere reporting it. That is why
+    /// [`crate::mesh_edit::HalfEdgeMesh::delete_faces`] returns the correspondence instead of a count.
+    ///
+    /// In practice only the mode in use can hold anything, because [`Selection::retain_mode`] clears the
+    /// others on a mode switch - and of the three, today the corner set is the only one a delete can move
+    /// without emptying: a Face-mode delete removes exactly the faces held, and Edge mode refuses. All
+    /// three are remapped anyway because the correspondence answers all three questions already and
+    /// trimming it would mean rebuilding it the moment edge merge lands. What is *not* true is that any
+    /// of the two idle paths is covered by a test - the corner case is the one with a test behind it.
+    ///
+    /// Edges additionally check themselves against the rebuilt mesh, because a remap can only answer where
+    /// the two corners went - the faces that ran between them may have been the deleted ones, leaving two
+    /// survivors with nothing between them.
+    fn remap_selection(&mut self, remap: &IdRemap) {
+        let present: HashSet<EdgeId> = self
+            .mesh
+            .edges()
+            .into_iter()
+            .map(|(edge, _half_edge)| edge)
+            .collect();
+
+        let vertices: Vec<VertexId> = self
+            .selection
+            .vertices()
+            .iter()
+            .filter_map(|&vertex| remap.vertex(vertex))
+            .collect();
+        let faces: Vec<FaceId> = self
+            .selection
+            .faces()
+            .iter()
+            .filter_map(|&face| remap.face(face))
+            .collect();
+        let edges: Vec<EdgeId> = self
+            .selection
+            .edges()
+            .iter()
+            .filter_map(|&edge| remap.edge(edge))
+            .filter(|&edge| present.contains(&edge))
+            .collect();
+
+        self.selection.vertices_mut().clear();
+        self.selection.vertices_mut().extend(vertices);
+        self.selection.faces_mut().clear();
+        self.selection.faces_mut().extend(faces);
+        self.selection.edges_mut().clear();
+        self.selection.edges_mut().extend(edges);
+    }
+
+    /// Whether `Del` can act on the selection as it stands, so the menu row and the panel button grey out
+    /// for the reason the key would report rather than looking live and then refusing quietly.
+    ///
+    /// Delegates to [`Scene::delete_targets`] instead of restating its rules: a second opinion about
+    /// availability is the opinion that offers a command the document then declines.
+    pub fn can_delete(&self) -> bool {
+        self.delete_targets().is_ok()
+    }
+
+    /// Retires the selected components and leaves an opening where they were: Maya's `Del`. One undoable
+    /// step.
+    ///
+    /// Faces go directly. A selected vertex takes the faces attached to it, which is Maya's behaviour - a
+    /// corner cannot be lifted out of a shell without the faces that hold it. Edge mode refuses, because
+    /// Maya's `Del` on an edge *merges* the two faces it joins rather than removing anything, and that
+    /// merge is a separate operation; `menu.rs` keeps the distinction in the row's tooltip.
+    ///
+    /// This is the only command that renumbers the document, so it is the only one that has to move the
+    /// selection - see [`Scene::remap_selection`].
+    ///
+    /// Returns what left the mesh, or every reason nothing can go, the document and history untouched.
+    pub fn delete_selected(&mut self) -> Result<DeleteCommit, TopologyErrors> {
+        let faces = self.delete_targets()?;
+
+        self.begin_action(&delete_label(faces.len()));
+        let mut mesh = self.mesh.clone();
+        match mesh.delete_faces(&faces) {
+            Ok(gone) => {
+                let commit = DeleteCommit {
+                    faces: gone.faces.len(),
+                    half_edges: gone.half_edges,
+                    vertices: gone.vertices,
+                };
+                self.mesh = mesh;
+                self.dirty = true;
+                self.remap_selection(&gone.remap);
+                self.end_action();
+                Ok(commit)
+            }
+            Err(errors) => {
+                // Nothing reached the mesh, so there is no step worth recording - and an action left open
+                // would file the *next* edit under this one.
+                self.cancel_action();
+                Err(errors)
+            }
+        }
+    }
+
+    /// The faces the selection asks to have deleted, or why it asks for nothing that can be.
+    fn delete_targets(&self) -> Result<Vec<FaceId>, TopologyErrors> {
+        match self.mode {
+            EditMode::Face => {
+                let faces = self.live_faces();
+                if faces.is_empty() {
+                    // This branch only runs in Face mode, so the guidance is the one thing that is true
+                    // for both reasons a face selection can be empty here - nothing clicked yet, or ids
+                    // left behind by an undo or another document. Either way the remedy is the same click.
+                    return Err(vec![
+                        "no face is selected, so there is nothing to delete; click the face to open first"
+                            .to_string(),
+                    ]);
+                }
+                Ok(faces)
+            }
+            EditMode::Vertex => {
+                let mut faces: Vec<FaceId> = self
+                    .live_vertices()
+                    .iter()
+                    .flat_map(|&vertex| self.mesh.outgoing_half_edges(vertex))
+                    .filter_map(|half_edge| self.mesh.half_edges[half_edge.0].face)
+                    .collect();
+                faces.sort_by_key(|face| face.0);
+                faces.dedup();
+                if faces.is_empty() {
+                    return Err(vec![
+                        "the corners selected bound no face, so there is nothing to delete; click a corner \
+                         of the mesh first"
+                            .to_string(),
+                    ]);
+                }
+                Ok(faces)
+            }
+            EditMode::Edge => Err(vec![
+                "deleting an edge merges the two faces it joins into one, which is not built yet; press \
+                 F11 and delete those faces instead"
+                    .to_string(),
+            ]),
+            EditMode::Object => Err(vec![
+                "a document holds one mesh and there is no empty document to return to; pick a component \
+                 mode and delete the faces to remove"
+                    .to_string(),
+            ]),
+        }
     }
 
     /// Selects whatever the ray hits, in the current mode. `additive` keeps what was already
@@ -812,6 +997,15 @@ fn extrude_label(face_count: usize) -> String {
         "Extrude Face".to_string()
     } else {
         "Extrude Faces".to_string()
+    }
+}
+
+/// The name Undo reads back for a delete, singular or plural the way Maya's echo is.
+fn delete_label(face_count: usize) -> String {
+    if face_count == 1 {
+        "Delete Face".to_string()
+    } else {
+        "Delete Faces".to_string()
     }
 }
 
@@ -2035,5 +2229,253 @@ mod tests {
             .bevel_selected_edge()
             .expect_err("a dead edge names nothing to trim");
         expect_reason(&errors, "needs one edge selected");
+    }
+
+    // ------------------------------------------------------------------ delete
+
+    /// A Face-mode scene holding the faces named, the way a Ctrl-click run would leave them.
+    fn scene_holding_faces(faces: &[usize]) -> Scene {
+        let mut scene = face_mode_scene();
+        for &face in faces {
+            scene.selection.faces_mut().insert(FaceId(face));
+        }
+        scene
+    }
+
+    #[test]
+    fn delete_is_off_until_something_can_actually_go() {
+        let scene = Scene::new();
+        assert!(
+            !scene.can_delete(),
+            "Object mode has no component to open, so the row must not look live"
+        );
+
+        assert!(
+            !scene_holding_faces(&[]).can_delete(),
+            "Face mode with nothing selected has nothing to remove"
+        );
+        assert!(
+            scene_holding_faces(&[0]).can_delete(),
+            "one live face is enough"
+        );
+
+        let mut edge_only = edge_mode_scene();
+        edge_only
+            .selection
+            .edges_mut()
+            .insert(EdgeId::between(VertexId(0), VertexId(1)));
+        assert!(
+            !edge_only.can_delete(),
+            "an edge cannot come out without merging, so Del refuses and greys out alike"
+        );
+    }
+
+    #[test]
+    fn deleting_a_face_opens_the_cube_in_one_undoable_step() {
+        let mut scene = scene_holding_faces(&[0]);
+
+        let gone = scene
+            .delete_selected()
+            .expect("one selected face of the cube should delete");
+
+        assert_eq!(gone.faces, 1);
+        assert_eq!(scene.mesh().faces.len(), 5, "the front face is open");
+        assert_eq!(
+            scene.mesh().half_edges.len(),
+            20,
+            "the four half-edges bounding it went with it"
+        );
+        assert_eq!(
+            scene.mesh().vertices.len(),
+            8,
+            "every corner is still bounded by another face, so none is retired"
+        );
+        assert_eq!(scene.undo_label(), Some("Delete Face"));
+        assert!(
+            scene.can_undo(),
+            "the delete is the single step Ctrl+Z walks back"
+        );
+    }
+
+    #[test]
+    fn undoing_a_delete_gives_back_the_removed_face_exactly() {
+        let scene = scene_holding_faces(&[0]);
+        let before = scene.mesh().clone();
+        let mut scene = scene;
+
+        scene.delete_selected().expect("delete should succeed");
+        assert_ne!(scene.mesh(), &before, "something has to have gone");
+        assert!(scene.undo(), "the delete must be one step, not several");
+        assert_eq!(
+            scene.mesh(),
+            &before,
+            "undo restores the document record for record, corners and half-edges included"
+        );
+
+        assert!(scene.redo(), "and redo takes it away again");
+        assert_eq!(scene.mesh().faces.len(), 5);
+    }
+
+    #[test]
+    fn a_corner_delete_retires_every_corner_it_held() {
+        // A vertex-mode delete removes *all* the faces attached to a corner, so each corner held is left
+        // unbounded and retires - which is why no command today can hand back a surviving selected corner
+        // to relocate. The correspondence that would move one is verified where it is produced, in
+        // `mesh_edit::every_surviving_face_keeps_the_geometry_its_remap_points_at`; what this pins is the
+        // reachable half, that the selection is never left holding a corner the mesh no longer has.
+        let mut scene = Scene::new();
+        scene.set_mode(EditMode::Vertex);
+        scene.select_at(&corner_ray(), false, VIEWPORT_HEIGHT);
+        scene.selection.vertices_mut().insert(VertexId(7));
+        assert_eq!(scene.selected_count(), 2, "two corners to start");
+
+        let gone = scene
+            .delete_selected()
+            .expect("two corners and their faces should delete");
+
+        assert_eq!(
+            gone.faces, 5,
+            "five of the six bound one corner or the other"
+        );
+        assert!(
+            scene.selection.vertices().is_empty(),
+            "both corners were retired, so neither may stay highlighted"
+        );
+        scene
+            .mesh()
+            .validate()
+            .expect("what is left must still be a valid mesh");
+    }
+
+    #[test]
+    fn a_delete_drops_the_faces_it_removed_from_the_selection() {
+        // In Face mode the command deletes exactly what is held, so the honest expectation is an emptied
+        // selection rather than a remapped one - and holding that here is what stops a later change
+        // quietly leaving the highlight on records that no longer exist.
+        let mut scene = scene_holding_faces(&[0, 2]);
+
+        scene.delete_selected().expect("two faces should delete");
+
+        assert!(
+            scene.selection.faces().is_empty(),
+            "a deleted face must not stay selected"
+        );
+        assert_eq!(scene.selected_count(), 0);
+    }
+
+    #[test]
+    fn a_refused_delete_records_nothing_in_history() {
+        // A refusal that still opened a history step would leave Ctrl+Z stepping back through a press
+        // that changed nothing - and an action left open would file the next real edit under this one.
+        let mut scene = Scene::new();
+        let before = scene.mesh().clone();
+        assert!(!scene.can_undo());
+
+        let errors = scene
+            .delete_selected()
+            .expect_err("nothing is selected in Object mode");
+        expect_reason(&errors, "pick a component mode");
+
+        assert_eq!(scene.mesh(), &before, "and the document is untouched");
+        assert!(
+            !scene.can_undo(),
+            "a refusal must not leave a step for Ctrl+Z to walk back through"
+        );
+
+        // The refusal must not have wedged history open: switching into Face mode and deleting for real
+        // still lands as one clean step, rather than being filed under the press that did nothing.
+        scene.set_mode(EditMode::Face);
+        scene.selection.faces_mut().insert(FaceId(0));
+        scene
+            .delete_selected()
+            .expect("the next real edit still records cleanly");
+        assert_eq!(scene.undo_label(), Some("Delete Face"));
+    }
+
+    #[test]
+    fn deleting_a_corner_takes_the_faces_attached_to_it() {
+        // Maya's rule: a corner cannot lift out of a shell on its own, so Del on a vertex removes the
+        // faces that hold it. On a cube that is the three meeting at the corner, and the corner itself
+        // retires with them because nothing else bounds it any more.
+        let mut scene = Scene::new();
+        scene.set_mode(EditMode::Vertex);
+        scene.select_at(&corner_ray(), false, VIEWPORT_HEIGHT);
+        assert_eq!(scene.selected_count(), 1, "the test aims at one corner");
+
+        let gone = scene
+            .delete_selected()
+            .expect("a selected corner should take its faces");
+
+        assert_eq!(gone.faces, 3, "three faces meet at a corner of a cube");
+        assert_eq!(scene.mesh().faces.len(), 3);
+        assert_eq!(
+            scene.mesh().vertices.len(),
+            7,
+            "the corner that belonged to none other goes too"
+        );
+        assert_eq!(scene.undo_label(), Some("Delete Faces"));
+    }
+
+    #[test]
+    fn deleting_every_face_leaves_an_empty_document_rather_than_an_error() {
+        // A state a user can reach by Ctrl+A and Del, and undo out of - so it has to be a legal document,
+        // not a broken one. This is also the only route that empties the mesh, and every query in the
+        // renderer is expected to survive it.
+        let mut scene = scene_holding_faces(&[0, 1, 2, 3, 4, 5]);
+
+        let gone = scene
+            .delete_selected()
+            .expect("clearing the document is a legal delete");
+
+        assert_eq!(gone.faces, 6);
+        assert_eq!(scene.mesh().faces.len(), 0);
+        assert!(
+            scene.mesh().vertices.is_empty(),
+            "nothing bounds the corners once every face is gone"
+        );
+        scene
+            .mesh()
+            .validate()
+            .expect("an empty document is a valid one");
+        assert!(
+            scene.selection.faces().is_empty(),
+            "the selection cannot keep pointing at records that no longer exist"
+        );
+
+        assert!(scene.undo());
+        assert_eq!(scene.mesh().faces.len(), 6, "and it comes back whole");
+    }
+
+    #[test]
+    fn edge_mode_delete_names_the_merge_it_does_not_do() {
+        // Refusing quietly would read as a dead key. The reason is the useful part: Maya's Del on an edge
+        // merges rather than removes, so the user needs to know which command they actually want.
+        let mut scene = edge_mode_scene();
+        scene
+            .selection
+            .edges_mut()
+            .insert(EdgeId::between(VertexId(0), VertexId(1)));
+
+        let errors = scene
+            .delete_selected()
+            .expect_err("merging is not built, so an edge cannot go");
+        expect_reason(&errors, "merges the two faces");
+        assert_eq!(scene.mesh().faces.len(), 6, "and nothing went");
+    }
+
+    #[test]
+    fn a_selection_left_over_from_an_earlier_document_is_not_deleted() {
+        // Face ids outlive a document through undo and a load, so Del can be handed an id past the end.
+        // Acting on it would answer with a deletion the user cannot see; the guard refuses by delegating
+        // to the same live check the button greys out on.
+        let mut scene = face_mode_scene();
+        let stale = scene.mesh().faces.len() + 4;
+        scene.selection.faces_mut().insert(FaceId(stale));
+
+        assert!(!scene.can_delete());
+        let errors = scene
+            .delete_selected()
+            .expect_err("a dead face id names nothing to remove");
+        expect_reason(&errors, "no face is selected");
     }
 }

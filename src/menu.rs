@@ -50,6 +50,9 @@ pub enum Command {
     Extrude,
     EdgeLoop,
     Bevel,
+    /// Maya's `Del`. Removes the selected faces, or the faces a selected corner bounds; the row keeps
+    /// Maya's own `Remove` label because that is where Maya puts it.
+    Delete,
     /// Maya's `X`, which this app borrows for the reference system - see the digest's keymap note.
     CycleReferenceSystem,
     SelectAll,
@@ -199,17 +202,19 @@ pub const MENUS: &[Menu] = &[
                 "freehand cuts across a face; needs a face-splitting primitive",
             ),
             gap("Insert Edge Tool", "", "needs the same face-splitting primitive"),
+            live("Delete Component", "Del", Command::Delete),
             gap(
                 "Remove",
-                "Del",
-                "nothing can leave the mesh - every operation so far only appends",
+                "",
+                "rebuilds the surface over a component instead of opening a hole; the same merge that \
+                 Del on a selected edge would need",
             ),
             gap(
                 "Merge",
                 "",
-                "welds coincident vertices, which needs vertex removal",
+                "welds coincident corners into one, which needs a merge primitive rather than a removal",
             ),
-            gap("Split", "", "needs vertex removal"),
+            gap("Split", "", "unwelds a corner into one per face, which needs corners that can be shared"),
             gap(
                 "Extract Faces",
                 "",
@@ -232,10 +237,14 @@ pub const MENUS: &[Menu] = &[
                 "needs a normal per vertex; generate_render_buffers writes one flat normal per face",
             ),
             gap("Harden Edge", "", "needs per-edge soft/hard state the mesh does not hold"),
-            gap("Booleans", "", "union/difference need CSG and, again, deletion"),
+            gap("Booleans", "", "union/difference need CSG, and a second mesh to cut against"),
             gap("Combine", "", "no scene graph, so no second mesh to combine into"),
             gap("Separate", "", "no scene graph"),
-            gap("Cleanup...", "", "needs violations to find, which waits on the delete pass"),
+            gap(
+                "Cleanup...",
+                "",
+                "no operation leaves violations to clean: each one validates its result before installing it",
+            ),
             gap("Add Divisions", "3", "needs subdivision surfaces, a subsystem of its own"),
             gap("Reduce", "", "needs edge collapse"),
             gap(
@@ -398,6 +407,7 @@ mod tests {
         Command::Extrude,
         Command::EdgeLoop,
         Command::Bevel,
+        Command::Delete,
         Command::CycleReferenceSystem,
         Command::SelectAll,
         Command::SelectNone,
