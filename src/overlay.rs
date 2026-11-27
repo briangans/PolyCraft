@@ -115,10 +115,53 @@ pub fn gizmo_line_vertices(arms: &[crate::gizmo::Arm]) -> Vec<OverlayVertex> {
     lines
 }
 
+/// Converts solid handle geometry into triangle-list vertices, three per face.
+///
+/// Unlike [`gizmo_line_vertices`], each vertex carries the face's normal: the gizmo is on its way to
+/// being lit like the mesh rather than pasted over it, and the flat face of a cone *is* its shading.
+/// The lit pipeline culls back faces, which is what lets a closed cone read as a solid instead of
+/// depending on the order its triangles happen to be emitted in.
+pub fn gizmo_tip_vertices(faces: &[crate::gizmo::Triangle]) -> Vec<OverlayVertex> {
+    let mut triangles = Vec::with_capacity(faces.len() * 3);
+    for face in faces {
+        for vertex in face.vertices {
+            triangles.push(OverlayVertex::new_with_normal(
+                [vertex.x, vertex.y, vertex.z],
+                [face.normal.x, face.normal.y, face.normal.z],
+                face.color,
+            ));
+        }
+    }
+    triangles
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mesh::{EdgeId, HalfEdgeMesh, VertexId};
+
+    #[test]
+    fn a_tip_reaches_the_gpu_as_three_lit_vertices_per_face() {
+        let frame = crate::gizmo::Frame::world(cgmath::Point3::new(0.0, 0.0, 0.0));
+        let faces = crate::gizmo::arrowheads(&frame, 1.0, None);
+        let vertices = gizmo_tip_vertices(&faces);
+        assert_eq!(vertices.len(), faces.len() * 3);
+        // Each face keeps its own normal: a cone shaded from one shared normal would read flat.
+        for (face, corners) in faces.iter().zip(vertices.chunks(3)) {
+            for (vertex, want) in corners.iter().zip(face.vertices) {
+                assert_eq!(vertex.position, [want.x, want.y, want.z]);
+                assert_eq!(vertex.color, face.color);
+            }
+            assert_eq!(
+                corners[0].normal,
+                [face.normal.x, face.normal.y, face.normal.z]
+            );
+        }
+        // Zero normals would make the lit shader fall back to ambient on every face.
+        assert!(vertices
+            .iter()
+            .all(|v| v.normal.iter().any(|component| *component != 0.0)));
+    }
 
     #[test]
     fn cube_wireframe_in_object_mode_unselected() {

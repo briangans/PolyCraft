@@ -26,6 +26,13 @@ use winit::window::Window;
 const GIZMO_VERTEX_COUNT: usize =
     GizmoAxis::ALL.len() * 2 + GizmoAxis::ALL.len() * gizmo::RING_SEGMENTS * 2;
 
+/// The most solid arrowhead vertices the handle can ever need: three tips, each [`gizmo::TIP_SEGMENTS`]
+/// side faces plus the same number of cap faces, at three unshared vertices per flat-shaded face.
+///
+/// Sized the same way as [`GIZMO_VERTEX_COUNT`] — for the largest handle, because the tip buffer is
+/// written whole and running past its end is a wgpu validation error rather than a warning.
+const GIZMO_TIP_VERTEX_COUNT: usize = GizmoAxis::ALL.len() * gizmo::TIP_SEGMENTS * 2 * 3;
+
 /// Builds the GPU vertex/index buffers for the 3D shaded mesh.
 fn create_mesh_buffers(device: &wgpu::Device, scene: &Scene) -> (wgpu::Buffer, wgpu::Buffer, u32) {
     let render_data = scene.mesh().generate_render_buffers();
@@ -559,6 +566,7 @@ pub struct State<'a> {
     overlay_line_pipeline: wgpu::RenderPipeline,
     overlay_dot_pipeline: wgpu::RenderPipeline,
     gizmo_pipeline: wgpu::RenderPipeline,
+    gizmo_tip_pipeline: wgpu::RenderPipeline,
     scene: Scene,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -569,6 +577,8 @@ pub struct State<'a> {
     num_dot_vertices: u32,
     gizmo_buffer: wgpu::Buffer,
     num_gizmo_vertices: u32,
+    gizmo_tip_buffer: wgpu::Buffer,
+    num_gizmo_tip_vertices: u32,
     depth_texture_view: wgpu::TextureView,
     /// The multisampled colour buffer the scene renders into, resolved onto the surface at the end of the
     /// same pass. Rebuilt with the depth buffer whenever the window changes size.
@@ -616,6 +626,16 @@ fn drag_action_label(mode: EditMode, tool: Tool) -> String {
     } else {
         format!("{} {}", tool.label(), mode.label())
     }
+}
+
+/// Which handle is capped with solid arrowheads: the Move handle alone, for now.
+///
+/// Rotate's rings are drawn at the radius the arms reach, so cones at those tips would sit under the
+/// rings where the user aims to grab them; Scale's tips will be cubes rather than cones. Keeping the
+/// choice in one pure function is what stops the drawn tips and the picked handle disagreeing about
+/// which tool owns a solid head.
+fn draws_gizmo_tips(tool: Tool) -> bool {
+    tool == Tool::Translate
 }
 
 /// A keyboard action the viewport responds to. Produced by [`hotkey_for`], carried out by
@@ -886,6 +906,54 @@ impl<'a> State<'a> {
             }),
         );
 
+        // The solid arrowheads of the Move handle. Lit by the mesh's own shaders so the head reads as a
+        // piece of geometry rather than a decal, with back faces culled - the cone's winding is
+        // counter-clockwise from outside exactly as the mesh's is, so culling is what makes it look solid.
+        // Depth still always-passes, matching the arms: occluding the tips while the shafts stayed on top
+        // would split one handle across two depth rules.
+        let gizmo_tip_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Gizmo Tip Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[GpuVertex::desc()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: VIEWPORT_SAMPLE_COUNT,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        });
+
         let overlay_dot_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Overlay Dot Pipeline"),
             layout: Some(&render_pipeline_layout),
@@ -945,6 +1013,13 @@ impl<'a> State<'a> {
             mapped_at_creation: false,
         });
 
+        let gizmo_tip_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Gizmo Tip Buffer"),
+            size: (GIZMO_TIP_VERTEX_COUNT * std::mem::size_of::<GpuVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -967,6 +1042,7 @@ impl<'a> State<'a> {
             overlay_line_pipeline,
             overlay_dot_pipeline,
             gizmo_pipeline,
+            gizmo_tip_pipeline,
             scene,
             vertex_buffer,
             index_buffer,
@@ -977,6 +1053,8 @@ impl<'a> State<'a> {
             num_dot_vertices,
             gizmo_buffer,
             num_gizmo_vertices: 0,
+            gizmo_tip_buffer,
+            num_gizmo_tip_vertices: 0,
             depth_texture_view,
             msaa_view,
             camera,
@@ -1509,11 +1587,13 @@ impl<'a> State<'a> {
                 self.queue
                     .write_buffer(&self.gizmo_buffer, 0, bytemuck::cast_slice(&vertices));
             }
+            self.num_gizmo_tip_vertices = 0;
             return;
         }
 
         if !self.scene.tool().has_gizmo() {
             self.num_gizmo_vertices = 0;
+            self.num_gizmo_tip_vertices = 0;
             return;
         }
 
@@ -1524,6 +1604,23 @@ impl<'a> State<'a> {
             .or(self.hovered_axis);
 
         let rotating = self.scene.tool() == Tool::Rotate;
+        let tips = match self.gizmo_frame() {
+            Some(frame) => {
+                // The same length the arms are drawn at and the picker tests at, so a tip always caps the
+                // end of the arm it belongs to rather than floating past it.
+                let length = gizmo::axis_world_length(
+                    frame.origin,
+                    self.camera.eye(),
+                    self.config.height as f32,
+                );
+                if draws_gizmo_tips(self.scene.tool()) {
+                    gizmo::arrowheads(&frame, length, active_axis)
+                } else {
+                    Vec::new()
+                }
+            }
+            None => Vec::new(),
+        };
         let arms = match self.gizmo_frame() {
             Some(frame) => gizmo::handle(
                 &frame,
@@ -1539,6 +1636,16 @@ impl<'a> State<'a> {
         if self.num_gizmo_vertices > 0 {
             self.queue
                 .write_buffer(&self.gizmo_buffer, 0, bytemuck::cast_slice(&vertices));
+        }
+
+        let tip_vertices = overlay::gizmo_tip_vertices(&tips);
+        self.num_gizmo_tip_vertices = tip_vertices.len() as u32;
+        if self.num_gizmo_tip_vertices > 0 {
+            self.queue.write_buffer(
+                &self.gizmo_tip_buffer,
+                0,
+                bytemuck::cast_slice(&tip_vertices),
+            );
         }
     }
 
@@ -1835,6 +1942,13 @@ impl<'a> State<'a> {
                 render_pass.draw(0..self.num_dot_vertices, 0..1);
             }
 
+            if self.num_gizmo_tip_vertices > 0 {
+                render_pass.set_pipeline(&self.gizmo_tip_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, self.gizmo_tip_buffer.slice(..));
+                render_pass.draw(0..self.num_gizmo_tip_vertices, 0..1);
+            }
+
             if self.num_gizmo_vertices > 0 {
                 render_pass.set_pipeline(&self.gizmo_pipeline);
                 render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -2051,6 +2165,24 @@ mod tests {
             "Move Face"
         );
         assert_eq!(drag_action_label(EditMode::Object, Tool::Translate), "Move");
+    }
+
+    #[test]
+    fn only_the_translate_handle_is_capped_with_solid_tips() {
+        assert!(draws_gizmo_tips(Tool::Translate));
+        // Rotate's rings pass through the arm tips, and Scale's tips are cubes, so cones on either
+        // would sit on top of the thing the user is aiming at.
+        assert!(!draws_gizmo_tips(Tool::Rotate));
+        assert!(!draws_gizmo_tips(Tool::Scale));
+        assert!(!draws_gizmo_tips(Tool::Select));
+    }
+
+    #[test]
+    fn a_full_set_of_tips_fits_the_tip_buffer() {
+        // Running past the end of the fixed gizmo buffers is a wgpu validation error, not a warning.
+        let frame = gizmo::Frame::world(cgmath::Point3::new(0.0, 0.0, 0.0));
+        let faces = gizmo::arrowheads(&frame, 1.0, None);
+        assert!(overlay::gizmo_tip_vertices(&faces).len() <= GIZMO_TIP_VERTEX_COUNT);
     }
 
     #[test]

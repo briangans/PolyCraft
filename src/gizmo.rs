@@ -375,19 +375,21 @@ pub fn frame_for(
 pub fn arms(frame: &Frame, length: f32, active_axis: Option<GizmoAxis>) -> Vec<Arm> {
     GizmoAxis::ALL
         .iter()
-        .map(|&axis| {
-            let color = if active_axis == Some(axis) {
-                COLOR_AXIS_ACTIVE
-            } else {
-                axis.color()
-            };
-            Arm {
-                start: frame.origin,
-                end: frame.arm_end(axis, length),
-                color,
-            }
+        .map(|&axis| Arm {
+            start: frame.origin,
+            end: frame.arm_end(axis, length),
+            color: active_color(axis, active_axis),
         })
         .collect()
+}
+
+/// The colour one part of the handle draws in: bright yellow while its axis is hovered or dragged.
+pub fn active_color(axis: GizmoAxis, active_axis: Option<GizmoAxis>) -> [f32; 3] {
+    if active_axis == Some(axis) {
+        COLOR_AXIS_ACTIVE
+    } else {
+        axis.color()
+    }
 }
 
 /// The whole transform handle for one frame at one view: three arms, plus the three rings if `turning`.
@@ -703,6 +705,111 @@ pub fn rings(frame: &Frame, radius: f32, active_axis: Option<GizmoAxis>) -> Vec<
     GizmoAxis::ALL
         .iter()
         .flat_map(|&axis| ring(frame, axis, radius, RING_SEGMENTS, active_axis))
+        .collect()
+}
+
+/// How many slices a solid tip is swept through.
+///
+/// A tip is only a few dozen pixels across on screen, so this is plenty to hide the facets and it
+/// keeps the handle's triangle count at three cones' worth rather than three spheres'.
+pub const TIP_SEGMENTS: usize = 16;
+
+/// One flat shaded triangle of solid handle geometry.
+///
+/// The gizmo is on its way from lines to lit, occludable geometry, and a triangle is the smallest
+/// thing a rasteriser can shade. It carries its own normal rather than having one derived per pass
+/// because the flat face of a cone is the lighting - a smooth normal interpolated from the base
+/// circle would wash the tip out into a blur.
+///
+/// Winding is counter-clockwise as seen from outside, which is what the mesh already uses, so the
+/// handle and the model agree about which way a face points.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Triangle {
+    pub vertices: [Point3<f32>; 3],
+    pub normal: Vector3<f32>,
+    pub color: [f32; 3],
+}
+
+/// The cone that caps one translate arm, its tip at the arm's end and its base back along the shaft.
+///
+/// `reach` is how far the cone runs back from the tip and `width` how far its base corners sit from
+/// the axis; both are fractions of `length` at the call site, so the head scales with the handle
+/// instead of drifting as the gizmo's world length changes with zoom.
+///
+/// Returns nothing when the axis projects to a point on screen. `length` comes from
+/// [`axis_world_length`], which is zero for an arm pointing at or away from the eye, and a cone
+/// built on such an axis would have its apex and base at the same place - a degenerate fan rather
+/// than a handle.
+pub fn arrowhead(
+    frame: &Frame,
+    axis: GizmoAxis,
+    length: f32,
+    reach: f32,
+    width: f32,
+    active_axis: Option<GizmoAxis>,
+) -> Vec<Triangle> {
+    let direction = frame.direction(axis);
+    if length <= 0.0 || !length.is_finite() {
+        return Vec::new();
+    }
+    let Some(crosswise) = Frame::from_axis(Point3::new(0.0, 0.0, 0.0), direction) else {
+        return Vec::new();
+    };
+
+    let tip = frame.arm_end(axis, length);
+    let base = tip - direction * reach;
+    let color = active_color(axis, active_axis);
+
+    let corners: Vec<Point3<f32>> = (0..TIP_SEGMENTS)
+        .map(|step| {
+            let tangent = crosswise.direction(GizmoAxis::X)
+                * (std::f32::consts::TAU * step as f32 / TIP_SEGMENTS as f32).cos()
+                + crosswise.direction(GizmoAxis::Y)
+                    * (std::f32::consts::TAU * step as f32 / TIP_SEGMENTS as f32).sin();
+            base + tangent * width
+        })
+        .collect();
+
+    let mut triangles = Vec::with_capacity(TIP_SEGMENTS * 2);
+    for step in 0..TIP_SEGMENTS {
+        let next = (step + 1) % TIP_SEGMENTS;
+        // Winding is counter-clockwise seen from outside, matching the mesh, and each normal is the
+        // winding's own normal rather than a separately guessed one. If the two ever disagreed, the
+        // face would be culled by the very lighting that shades it, and nothing would say so.
+        triangles.push(face_triangle([tip, corners[step], corners[next]], color));
+        // The cap closes the far end of the cone and faces away from the tip, so the head reads as a
+        // solid rather than a paper bag seen through its own opening.
+        triangles.push(face_triangle([corners[next], corners[step], base], color));
+    }
+    triangles
+}
+
+/// A triangle whose normal is the one its winding implies.
+fn face_triangle(vertices: [Point3<f32>; 3], color: [f32; 3]) -> Triangle {
+    let normal = (vertices[1] - vertices[0])
+        .cross(vertices[2] - vertices[0])
+        .normalize();
+    Triangle {
+        vertices,
+        normal,
+        color,
+    }
+}
+
+/// The solid tips for every arm of a translate handle, as one flat list ready to upload.
+pub fn arrowheads(frame: &Frame, length: f32, active_axis: Option<GizmoAxis>) -> Vec<Triangle> {
+    GizmoAxis::ALL
+        .iter()
+        .flat_map(|&axis| {
+            arrowhead(
+                frame,
+                axis,
+                length,
+                length * 0.22,
+                length * 0.07,
+                active_axis,
+            )
+        })
         .collect()
 }
 
@@ -1573,5 +1680,154 @@ mod tests {
         assert_eq!(scale_factor(1.0, 0.0), 1.0);
         assert_eq!(scale_factor(f32::NAN, 2.0), 1.0);
         assert_eq!(scale_factor(1.0, f32::INFINITY), 1.0);
+    }
+
+    /// The length a tip is built at in these tests: what a pivot at the origin sees from a typical eye.
+    fn tip_length() -> f32 {
+        axis_world_length(
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(0.0, 0.0, 3.0),
+            VIEWPORT,
+        )
+    }
+
+    #[test]
+    fn a_tip_is_a_closed_cone_wrapping_its_arm() {
+        let frame = Frame::world(Point3::new(0.0, 0.0, 0.0));
+        let length = tip_length();
+        let tip = arrowhead(
+            &frame,
+            GizmoAxis::Z,
+            length,
+            length * 0.22,
+            length * 0.07,
+            None,
+        );
+
+        // One side per slice plus one cap per slice. The cap is what makes the head a solid instead of
+        // an open bag whose inside the lighting has no answer for.
+        assert_eq!(tip.len(), TIP_SEGMENTS * 2);
+        for face in &tip {
+            for point in face.vertices {
+                assert!(
+                    point.x.is_finite() && point.y.is_finite() && point.z.is_finite(),
+                    "tip geometry went non-finite at {point:?}"
+                );
+            }
+            assert!(
+                (face.normal.magnitude() - 1.0).abs() < 1e-5,
+                "a non-unit normal scales the lighting term it is fed into"
+            );
+        }
+    }
+
+    #[test]
+    fn every_tip_face_winds_the_way_its_normal_points() {
+        // The mesh pipeline culls back faces with `FrontFace::Ccw`. A tip whose winding and normal were
+        // derived independently could disagree between the two, and the face would be culled by the very
+        // lighting that shades it - an invisible handle with nothing in the log to explain it.
+        let frame = Frame::world(Point3::new(0.4, -0.2, 0.1));
+        let length = tip_length();
+        for axis in GizmoAxis::ALL {
+            for face in arrowhead(&frame, axis, length, length * 0.22, length * 0.07, None) {
+                let wound = (face.vertices[1] - face.vertices[0])
+                    .cross(face.vertices[2] - face.vertices[0])
+                    .normalize();
+                assert!(
+                    wound.dot(face.normal) > 0.99,
+                    "tip face wound clockwise against its own normal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tip_shrinks_towards_the_axis_it_caps_rather_than_across_it() {
+        let frame = Frame::world(Point3::new(0.0, 0.0, 0.0));
+        let length = tip_length();
+        let reach = length * 0.22;
+        let width = length * 0.07;
+        let tip = arrowhead(&frame, GizmoAxis::Z, length, reach, width, None);
+
+        let apex = frame.arm_end(GizmoAxis::Z, length);
+        let axis: Vector3<f32> = frame.direction(GizmoAxis::Z);
+        assert!(
+            tip.iter().any(|face| face.vertices.contains(&apex)),
+            "the cone's point must sit exactly on the arm's tip, or the head floats off the shaft"
+        );
+
+        for face in &tip {
+            for point in &face.vertices {
+                let along = (*point - apex).dot(axis);
+                assert!(
+                    along <= 1e-5 && along >= -(reach + 1e-5),
+                    "a tip vertex escaped the span of the arm it caps"
+                );
+                let across = ((*point - apex) - axis * along).magnitude();
+                assert!(
+                    across <= width + 1e-5,
+                    "a tip bulged wider than the cone it was asked for"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tip_survives_a_component_frame_tilted_off_the_world_axes() {
+        // Component space is the whole reason the gizmo is a `Frame` and not three world vectors, so a
+        // cone built from `frame.direction` has to tilt with it rather than standing up regardless.
+        let direction = Vector3::new(1.0, 1.0, 1.0);
+        let frame =
+            Frame::from_axis(Point3::new(0.4, -0.2, 0.1), direction).expect("diagonal frame");
+        let length = tip_length();
+        let tip = arrowhead(
+            &frame,
+            GizmoAxis::Z,
+            length,
+            length * 0.22,
+            length * 0.07,
+            None,
+        );
+
+        let axis = frame.direction(GizmoAxis::Z);
+        let apex = frame.arm_end(GizmoAxis::Z, length);
+        assert!(
+            tip.iter().any(|face| face.vertices.contains(&apex)),
+            "a tilted frame must still put the point of the cone on its own arm's tip"
+        );
+
+        // The cap's normal is the cone's axis, so it is the cheapest read on whether the cone tilted.
+        let cap_normal = tip[1].normal;
+        assert!(
+            (cap_normal.dot(-axis) - 1.0).abs() < 1e-5,
+            "the cap faces {cap_normal:?}, not back along the frame's axis"
+        );
+    }
+
+    #[test]
+    fn a_tip_on_an_axis_that_points_at_the_eye_draws_nothing() {
+        // `axis_world_length` answers zero for an arm pointing at or away from the eye. A cone built on
+        // that length would have its apex and base at the same place: a fan of degenerate triangles that
+        // the rasteriser still shades, producing a smear where a handle should have vanished.
+        let frame = Frame::world(Point3::new(0.0, 0.0, 0.0));
+        assert!(arrowhead(&frame, GizmoAxis::X, 0.0, 0.1, 0.02, None).is_empty());
+        assert!(arrowhead(&frame, GizmoAxis::X, -1.0, 0.1, 0.02, None).is_empty());
+        assert!(arrowhead(&frame, GizmoAxis::X, f32::NAN, 0.1, 0.02, None).is_empty());
+        assert!(arrowheads(&frame, 0.0, None).is_empty());
+    }
+
+    #[test]
+    fn a_tip_lights_up_with_the_axis_it_caps() {
+        let frame = Frame::world(Point3::new(0.0, 0.0, 0.0));
+        let length = tip_length();
+        let heads = arrowheads(&frame, length, Some(GizmoAxis::Y));
+        assert_eq!(heads.len(), GizmoAxis::ALL.len() * TIP_SEGMENTS * 2);
+
+        // The heads come out in axis order, so the highlight has to move with the arm and not with the
+        // index - the same rule the arms follow, which is why both read `active_color`.
+        for (index, axis) in GizmoAxis::ALL.iter().enumerate() {
+            let head = &heads[index * TIP_SEGMENTS * 2];
+            assert_eq!(head.color, active_color(*axis, Some(GizmoAxis::Y)));
+        }
     }
 }
