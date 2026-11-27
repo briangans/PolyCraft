@@ -53,6 +53,9 @@ pub enum Command {
     /// Maya's `Del`. Removes the selected faces, or the faces a selected corner bounds; the row keeps
     /// Maya's own `Remove` label because that is where Maya puts it.
     Delete,
+    /// Maya's *Fill Hole*: caps every opening in the mesh. Not driven by the selection, which is why it
+    /// follows `Delete` rather than the selection-driven commands above it.
+    FillHoles,
     /// Maya's `X`, which this app borrows for the reference system - see the digest's keymap note.
     CycleReferenceSystem,
     SelectAll,
@@ -221,11 +224,7 @@ pub const MENUS: &[Menu] = &[
                 "lifts faces into a second object, and a document holds no second object",
             ),
             gap("Duplicate Faces", "", "would need an object, or a second mesh"),
-            gap(
-                "Fill Hole",
-                "",
-                "caps an open rim; needs a face grown across a boundary loop, and the rim walk exists",
-            ),
+            live("Fill Hole", "", Command::FillHoles),
             gap(
                 "Reverse",
                 "",
@@ -408,6 +407,7 @@ mod tests {
         Command::EdgeLoop,
         Command::Bevel,
         Command::Delete,
+        Command::FillHoles,
         Command::CycleReferenceSystem,
         Command::SelectAll,
         Command::SelectNone,

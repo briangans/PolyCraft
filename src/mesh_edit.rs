@@ -30,7 +30,10 @@
 //! expensive part, and these run on an edit - once per user gesture, not once per frame.
 
 use cgmath::{InnerSpace, Point3, Vector3};
-use std::collections::{HashMap, HashSet};
+use std::collections::{
+    hash_map::Entry::{Occupied, Vacant},
+    HashMap, HashSet,
+};
 
 use crate::mesh::{
     face_area, EdgeId, Face, FaceId, HalfEdge, HalfEdgeId, HalfEdgeMesh, MeshVertex,
@@ -141,6 +144,17 @@ pub struct Deleted {
     pub vertices: usize,
     /// Where each surviving component moved, so whatever holds ids can move them the same way.
     pub remap: IdRemap,
+}
+
+/// What [`HalfEdgeMesh::fill_holes`] closed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filled {
+    /// The cap grown across each opening, one per rim, in rim order. These are the only new ids an
+    /// append creates, so everything handed out before the fill still names what it did.
+    pub faces: Vec<FaceId>,
+    /// How many corners each cap took, alongside the face it describes - echoed so a three-corner closing
+    /// is not reported as a quad.
+    pub corners: Vec<usize>,
 }
 
 /// Where each component went when a mesh was rebuilt from a subset of its own records.
@@ -1771,6 +1785,182 @@ impl HalfEdgeMesh {
                 faces: new_face,
             },
         )
+    }
+
+    /// Every opening in the mesh, one rim of half-edges per opening.
+    ///
+    /// A rim is chained corner to corner: from a boundary half-edge, step to the boundary half-edge
+    /// *leaving the vertex that one arrives at*. That is the rule that traces the outline of a hole.
+    /// Two alternatives do not work here: walking `next` circles the neighbour face that owns the
+    /// boundary edge rather than the opening it bounds, and walking the fan around a vertex breaks at
+    /// the first boundary edge by definition - which is why [`HalfEdgeMesh::outgoing_half_edges`] scans
+    /// instead of walking. Corner-to-corner chaining needs no fan and lands on the opening.
+    ///
+    /// Two half-edges leaving the same corner along the boundary means two openings meeting at a single
+    /// vertex. Which rim continues there is not something a walk can decide - guessing would merge two
+    /// holes into one figure-eight rim - so it is refused rather than resolved. A chain that runs out of
+    /// boundary edges before arriving home is reported the same way; neither is reachable from the
+    /// operations this app has, and both are stated so the next operation does not assume them.
+    ///
+    /// Rims come back in the order their first half-edge is scanned, each starting at that half-edge, so
+    /// two calls on one mesh agree and anything built on them is deterministic.
+    pub fn boundary_rims(&self) -> Result<Vec<Vec<HalfEdgeId>>, TopologyErrors> {
+        // Which boundary half-edge leaves each corner. A second one at the same corner is recorded as a
+        // pinch and reported below rather than overwritten: which of the two to take decides the rim.
+        let mut leaving: HashMap<usize, HalfEdgeId> = HashMap::new();
+        let mut pinched: Vec<VertexId> = Vec::new();
+        for (index, edge) in self.half_edges.iter().enumerate() {
+            if edge.twin.is_some() {
+                continue;
+            }
+            match leaving.entry(edge.origin.0) {
+                Vacant(slot) => {
+                    slot.insert(HalfEdgeId(index));
+                }
+                Occupied(_) => {
+                    if !pinched.contains(&edge.origin) {
+                        pinched.push(edge.origin);
+                    }
+                }
+            }
+        }
+        if !pinched.is_empty() {
+            return Err(pinched
+                .iter()
+                .map(|corner| {
+                    format!(
+                        "two openings meet at vertex {}, so their rims cannot be told apart; close the \
+                         corner between them before filling",
+                        corner.0
+                    )
+                })
+                .collect());
+        }
+
+        let mut rims: Vec<Vec<HalfEdgeId>> = Vec::new();
+        let mut claimed: HashSet<HalfEdgeId> = HashSet::new();
+        for index in 0..self.half_edges.len() {
+            let start = HalfEdgeId(index);
+            if self.half_edges[index].twin.is_some() || claimed.contains(&start) {
+                continue;
+            }
+
+            let mut rim: Vec<HalfEdgeId> = vec![start];
+            claimed.insert(start);
+            let mut current = start;
+            loop {
+                let destination = self.half_edge_destination(current);
+                if destination == self.half_edges[start.0].origin {
+                    break;
+                }
+                let Some(&next) = leaving.get(&destination.0) else {
+                    break;
+                };
+                // Reaching a half-edge already on another rim needs a pinch, which was refused above;
+                // stopping here rather than looping is what keeps this total on a mesh whose twins
+                // arrived mislinked.
+                if !claimed.insert(next) {
+                    break;
+                }
+                rim.push(next);
+                current = next;
+            }
+
+            let last = *rim
+                .last()
+                .expect("a rim always holds the half-edge it started at");
+            if self.half_edge_destination(last) != self.half_edges[start.0].origin {
+                return Err(vec![format!(
+                    "the boundary running from vertex {} does not close on itself, so it bounds nothing \
+                     that can be filled",
+                    self.half_edges[start.0].origin.0
+                )]);
+            }
+            rims.push(rim);
+        }
+        Ok(rims)
+    }
+
+    /// Grows a face across every opening in the mesh, closing each rim on itself: Maya's *Fill Hole*.
+    ///
+    /// This is the inverse of [`HalfEdgeMesh::delete_faces`], and where delete is the one edit that
+    /// rebuilds, filling is back to **appending**: a cap adds one face and the half-edges bounding it and
+    /// links each to the rim half-edge running the same edge in reverse. Nothing leaves the `Vec`s, so
+    /// every id handed out beforehand stays valid - which is why this returns no [`IdRemap`] and why
+    /// `Scene` needs no remap pass here. Deleting and then filling renumbers for the delete and appends
+    /// for the fill; the two are separate undo steps and neither borrows the other's caveat.
+    ///
+    /// The corners of a cap are the rim's corners **reversed**, and that reversal is the whole trick
+    /// rather than a detail. A rim half-edge runs, say, corner 1 to corner 0; the cap must run 0 to 1 for
+    /// those two to be twins, and it has to get that right on all of its edges at once. Reversing the
+    /// rim's own cyclic order is the single ordering that satisfies every edge simultaneously, and it also
+    /// makes the cap wind the way the missing face did - so the new face points along the normal the
+    /// surface had instead of folding inward through it.
+    ///
+    /// That orientation is not something `validate` can be left to catch: it judges twinning, and a
+    /// wrongly wound cap twins *correctly* while facing the wrong way, since the rim it closes is the only
+    /// thing it touches. What pins it instead is `filling_an_open_box_grows_the_face_that_was_left_off`,
+    /// which requires the cap to reproduce the missing face's own corner loop in the same winding and then
+    /// measures its normal against the direction it has to point - the one check a flipped cap would fail
+    /// and nothing else would.
+    ///
+    /// Every opening is closed in one clone, so a mesh with two holes takes one undo step, and if any one
+    /// of them cannot be capped the operation is refused with all of the reasons and nothing installed.
+    /// Capping them one at a time would leave a half-filled mesh behind on the first refusal.
+    ///
+    /// Returns the caps created and how many corners each took, or every reason nothing can be closed.
+    /// A mesh that is already closed is refused: it is the one case where the command cannot do anything
+    /// the user could have meant, and a silent success reads as a dead key.
+    pub fn fill_holes(&mut self) -> Result<Filled, TopologyErrors> {
+        let rims = self.boundary_rims()?;
+        if rims.is_empty() {
+            return Err(vec![
+                "this mesh is closed on every side, so there is no opening to fill".to_string(),
+            ]);
+        }
+
+        let mut candidate = self.clone();
+        let mut filled = Filled::default();
+        let mut reasons = TopologyErrors::new();
+        for rim in &rims {
+            // Read the corners off the clone, not `self`: an earlier cap in this same loop has already
+            // twinned part of the boundary, and `append_face_blockers` has to be asked about the mesh the
+            // face is actually going into.
+            let corners: Vec<VertexId> = rim
+                .iter()
+                .rev()
+                .map(|&half_edge| candidate.half_edges[half_edge.0].origin)
+                .collect();
+
+            let blockers = candidate.append_face_blockers(&corners);
+            if !blockers.is_empty() {
+                reasons.extend(blockers.into_iter().map(|blocker| {
+                    format!(
+                        "the opening running from vertex {} could not be closed: {}",
+                        corners[0].0, blocker
+                    )
+                }));
+                continue;
+            }
+            let face = candidate.push_face(&corners);
+            filled.faces.push(face);
+            filled.corners.push(corners.len());
+        }
+        if !reasons.is_empty() {
+            return Err(reasons);
+        }
+
+        install_if_valid(
+            candidate,
+            self,
+            format!(
+                "filling {} opening{} produced topology that does not validate",
+                rims.len(),
+                if rims.len() == 1 { "" } else { "s" }
+            ),
+        )?;
+
+        Ok(filled)
     }
 }
 
@@ -3611,5 +3801,216 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_open_box_reports_one_rim_running_the_missing_faces_outline() {
+        let mesh = open_box();
+
+        let rims = mesh
+            .boundary_rims()
+            .expect("five cube faces meet in one clean opening");
+
+        assert_eq!(rims.len(), 1, "one opening, therefore one rim");
+        assert_eq!(
+            rims[0].len(),
+            4,
+            "the missing bottom quad bounds four edges"
+        );
+
+        // The rim has to arrive back where it started, corner for corner: a chain that drifted would cap
+        // the wrong opening or none. Each step's destination is the next step's origin, and the last
+        // arrives at the first's origin.
+        let corners: Vec<usize> = rims[0]
+            .iter()
+            .map(|&half_edge| mesh.half_edges[half_edge.0].origin.0)
+            .collect();
+        let destinations: Vec<usize> = rims[0]
+            .iter()
+            .map(|&half_edge| mesh.half_edge_destination(half_edge).0)
+            .collect();
+        assert_eq!(
+            corners,
+            vec![0, 1, 5, 4],
+            "one turn of the opening's outline"
+        );
+        assert_eq!(corners[0], destinations[3], "the rim closes on itself");
+        assert_eq!(
+            destinations[..3],
+            corners[1..],
+            "each step arrives at the corner the next one leaves, so the walk never jumps the rim"
+        );
+    }
+
+    #[test]
+    fn filling_an_open_box_grows_the_face_that_was_left_off() {
+        let mut mesh = open_box();
+
+        let filled = mesh.fill_holes().expect("an open box is one clean opening");
+
+        assert_eq!(filled.faces, vec![FaceId(5)]);
+        assert_eq!(
+            filled.corners,
+            vec![4],
+            "the lid is the quad that was missing"
+        );
+        assert_eq!(mesh.faces.len(), 6);
+        assert!(
+            mesh.boundary_edges().is_empty(),
+            "nothing is left open, so the solid is closed again"
+        );
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("a closed box should validate: {errors:?}"));
+        assert_eq!(
+            euler_characteristic(&mesh),
+            2,
+            "closed on every side is a sphere again, which is what the disc became"
+        );
+
+        // The strongest form of the winding claim: reversing the rim does not merely produce *a* face that
+        // twins, it reproduces the missing face's own corner loop - same corners, same order - so the cap
+        // carries the outward (-y) normal the bottom had rather than the inward one its neighbour wears.
+        assert_eq!(
+            mesh.face_vertices(FaceId(5)),
+            ids(&CUBE_FACES[5]),
+            "the cap should be the cube's bottom face, corner for corner and in the same winding"
+        );
+        let normal = mesh.face_normal(FaceId(5));
+        assert!(
+            normal.y < -0.99,
+            "the cap points down and out, not up through the box: {normal:?}"
+        );
+    }
+
+    #[test]
+    fn filling_a_closed_mesh_is_refused_because_there_is_nothing_to_close() {
+        let before = HalfEdgeMesh::create_cube();
+        let mut mesh = before.clone();
+
+        let errors = mesh
+            .fill_holes()
+            .expect_err("a closed solid has no opening");
+
+        expect_reason(&errors, "no opening to fill");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn closing_a_lone_quad_would_stack_a_second_face_on_the_one_it_closes() {
+        // The rim of a single quad bounds an opening, and the one face that could close it is the quad
+        // itself flipped. Twinning links perfectly and every other invariant holds, which is exactly the
+        // case `check_faces_are_distinct` exists for - so the refusal arrives as that validator's line with
+        // the fill's own context in front of it, and nothing installed.
+        let before = open_quad();
+        let mut mesh = before.clone();
+
+        let errors = mesh
+            .fill_holes()
+            .expect_err("the only face that could close this rim is already there");
+
+        expect_reason(&errors, "span the same 4 corners");
+        expect_reason(&errors, "filling 1 opening");
+        assert_identical(&mesh, &before);
+    }
+
+    #[test]
+    fn every_opening_in_a_mesh_closes_in_one_pass() {
+        let mut mesh = HalfEdgeMesh::create_cube();
+
+        // Front and back, leaving a tube: two openings that share nothing.
+        mesh.delete_faces(&[FaceId(0), FaceId(2)])
+            .expect("two opposite faces of a cube are deletable");
+        assert_eq!(mesh.boundary_edges().len(), 8, "two rims of four");
+
+        let rims = mesh
+            .boundary_rims()
+            .expect("the two rims share no corner, so each is walkable");
+        assert_eq!(rims.len(), 2, "one rim per opening, not one merged walk");
+
+        let filled = mesh
+            .fill_holes()
+            .expect("both ends of the tube should close together");
+
+        assert_eq!(filled.faces.len(), 2, "one cap per opening");
+        assert_eq!(filled.corners, vec![4, 4], "both caps are quads");
+        assert_eq!(mesh.faces.len(), 6);
+        assert!(mesh.boundary_edges().is_empty());
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("a closed solid should validate: {errors:?}"));
+        assert_eq!(euler_characteristic(&mesh), 2);
+
+        // Each cap covers one of the two faces that were removed, and the two are not the same four
+        // corners - measured as sets, because the delete in front of this renumbered the mesh.
+        let mut caps: Vec<Vec<usize>> = filled
+            .faces
+            .iter()
+            .map(|&face| {
+                let mut corners: Vec<usize> = mesh
+                    .face_vertices(face)
+                    .iter()
+                    .map(|&corner| corner.0)
+                    .collect();
+                corners.sort_unstable();
+                corners
+            })
+            .collect();
+        caps.sort();
+        assert_eq!(
+            caps,
+            vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+            "the caps belong to opposite ends of the tube, not both to one end"
+        );
+    }
+
+    #[test]
+    fn filling_appends_so_every_id_handed_out_before_it_still_names_the_same_face() {
+        // The counterpart to the remap a delete has to carry: a cap adds records and removes none, so no id
+        // moves and `Scene` needs no remap pass here. Stated as a test because it is what the digest's
+        // append-only rule buys, and the day filling is rewritten to rebuild this is what fails first.
+        let mut mesh = open_box();
+        let before: Vec<Vec<Point3<f32>>> = (0..mesh.faces.len())
+            .map(|index| mesh.face_positions(FaceId(index)))
+            .collect();
+
+        mesh.fill_holes().expect("an open box is one clean opening");
+
+        for (index, corners) in before.iter().enumerate() {
+            assert_eq!(
+                mesh.face_positions(FaceId(index)),
+                *corners,
+                "face {} was standing somewhere else after the fill",
+                index
+            );
+        }
+        assert_eq!(
+            mesh.faces.len(),
+            before.len() + 1,
+            "the cap is the only record added"
+        );
+    }
+
+    #[test]
+    fn two_openings_meeting_at_one_corner_are_refused_rather_than_merged() {
+        // Two triangles touching at a single corner: each is closed, each edge has one side, no corner is
+        // repeated - and `validate`'s own fan check already calls this damage. Filling it is the worse case,
+        // because two rims leave the shared corner and which one is picked decides whether the cap is one
+        // triangle's lid or a figure-eight across both. There is no right answer to guess at, so it is
+        // refused by the corner that cannot be resolved.
+        let positions = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.5, 1.0, 0.0),
+            Point3::new(0.5, -1.0, 0.0),
+            Point3::new(1.5, -1.0, 0.0),
+        ];
+        let before = HalfEdgeMesh::from_faces(&positions, &[vec![0, 1, 2], vec![2, 3, 4]]);
+        let mut mesh = before.clone();
+
+        let errors = mesh
+            .fill_holes()
+            .expect_err("two rims leaving corner 2 cannot be told apart");
+
+        expect_reason(&errors, "two openings meet at vertex 2");
+        assert_identical(&mesh, &before);
     }
 }

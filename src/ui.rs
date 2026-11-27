@@ -34,6 +34,9 @@ pub struct UiResponse {
     /// The Delete button was clicked, or `Del` pressed. Lands on the press too - there is nothing to drag,
     /// since what leaves the mesh is decided by the selection rather than by the cursor.
     pub delete: bool,
+    /// The Fill Hole button was clicked, or the Mesh menu row chosen. Lands on the press like the delete
+    /// beside it: the command takes the whole mesh, so the cursor has nothing to say about the result.
+    pub fill_holes: bool,
     /// `Select > All`. Every component of the mode in use; the count depends on the mode, which is why
     /// this is a request rather than a set of ids - `Scene` is the only thing that can see the mesh.
     pub select_all: bool,
@@ -77,6 +80,10 @@ pub struct UiContext<'a> {
     /// Whether `Del` has something to remove right now, for the same reason again - the menu row and the
     /// button grey out for exactly the reason the key would report.
     pub can_delete: bool,
+    /// Whether the mesh has an opening to close right now. Unlike every other command here this one is a
+    /// property of the mesh rather than of the selection: filling takes the whole document, so the row is
+    /// live whenever a rim exists and grey exactly when it does not.
+    pub can_fill_holes: bool,
     /// Which orientation the transform gizmo is currently drawn and dragged in, so the button beside it can
     /// show the one that is live.
     pub space: Space,
@@ -144,6 +151,18 @@ fn delete_button_text(available: bool) -> &'static str {
     }
 }
 
+/// Button text for the fill command. No key is offered because Maya binds none to Fill Hole, and this app
+/// has not chosen one either - the command is a menu row and a button, which is also how it reads in Maya.
+/// What the button does say, live, is that it closes everything at once, since that is the part of this
+/// command a user cannot see coming.
+fn fill_holes_button_text(available: bool) -> &'static str {
+    if available {
+        "Fill Hole  (all openings)"
+    } else {
+        "Fill Hole"
+    }
+}
+
 /// Which commands can act on the selection and history as they stand, so a menu row greys out for the
 /// same reason the panel button beside the viewport does.
 ///
@@ -157,6 +176,7 @@ struct Availability {
     edge_loop: bool,
     bevel: bool,
     delete: bool,
+    fill_holes: bool,
 }
 
 impl Availability {
@@ -181,6 +201,9 @@ impl Availability {
             C::Delete if !available.delete => Some(
                 "Removes faces, so pick them with F11 or a corner with F9. Del on an edge would merge the \
                  two faces it joins, which is not built yet.",
+            ),
+            C::FillHoles if !available.fill_holes => Some(
+                "Caps every opening in the mesh, so there has to be one: delete a face with Del first.",
             ),
             _ => None,
         }
@@ -281,6 +304,7 @@ fn dispatch(command: Command, response: &mut UiResponse) {
         C::EdgeLoop => response.edge_loop = true,
         C::Bevel => response.bevel = true,
         C::Delete => response.delete = true,
+        C::FillHoles => response.fill_holes = true,
         C::CycleReferenceSystem => response.cycle_space = true,
         C::SelectAll => response.select_all = true,
         C::SelectNone => response.select_none = true,
@@ -348,6 +372,7 @@ impl UiState {
             can_insert_edge_loop,
             can_bevel,
             can_delete,
+            can_fill_holes,
             space: current_space,
             notice,
         } = current;
@@ -366,6 +391,7 @@ impl UiState {
                 edge_loop: can_insert_edge_loop,
                 bevel: can_bevel,
                 delete: can_delete,
+                fill_holes: can_fill_holes,
             },
             &mut response,
         );
@@ -524,6 +550,14 @@ impl UiState {
                 if ui.add_enabled(can_delete, delete_button).clicked() {
                     response.delete = true;
                 }
+                // Fill Hole goes directly beside the command that opens the mesh, because that is the pair
+                // it forms: Del takes a face out, this one puts a face back. It also greys on the opposite
+                // condition to every button in this row - the mesh's own state, not the selection - which is
+                // worth seeing next to the others rather than hidden in the menu.
+                let fill_button = egui::Button::new(fill_holes_button_text(can_fill_holes));
+                if ui.add_enabled(can_fill_holes, fill_button).clicked() {
+                    response.fill_holes = true;
+                }
                 ui.separator();
                 ui.label(format!("Mode: {}", current_mode.label()));
                 let count_str = match current_mode {
@@ -640,6 +674,7 @@ mod tests {
             can_insert_edge_loop: false,
             can_bevel: false,
             can_delete: false,
+            can_fill_holes: false,
 
             notice: None,
             space: Space::World,
@@ -1006,6 +1041,7 @@ mod tests {
             can_insert_edge_loop: false,
             can_bevel: false,
             can_delete: false,
+            can_fill_holes: false,
 
             notice: None,
             space: Space::World,

@@ -93,6 +93,19 @@ pub struct DeleteCommit {
     pub vertices: usize,
 }
 
+/// What a fill closed, for the command echo.
+///
+/// Counts and corner tallies, never ids: the caps are new, so the ids naming them mean something only
+/// until the next delete renumbers the document, which is exactly when an echoed number would start
+/// pointing at a different face.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FillCommit {
+    /// Openings closed, which is one cap each.
+    pub faces: usize,
+    /// How many corners each cap took, in the order the caps were grown.
+    pub corners: Vec<usize>,
+}
+
 /// An extrude awaiting the depth the mouse is giving it.
 #[derive(Clone, Debug)]
 struct ActiveExtrude {
@@ -734,6 +747,55 @@ impl Scene {
                  mode and delete the faces to remove"
                     .to_string(),
             ]),
+        }
+    }
+
+    /// Whether an opening anywhere on the mesh can be closed right now.
+    ///
+    /// Shared by the menu row and the Tools panel so a button greys out for the same reason the command
+    /// would refuse. This is the only edit whose availability is a property of the mesh rather than of the
+    /// selection, because [`Scene::fill_holes`] takes the whole document - and a boundary edge is exactly
+    /// what an opening is, so the check is one scan and cannot disagree with the operation about whether
+    /// there is work to do.
+    pub fn can_fill_holes(&self) -> bool {
+        !self.mesh.boundary_edges().is_empty()
+    }
+
+    /// Grows a face across every opening in the mesh: Maya's *Fill Hole*. One undoable step.
+    ///
+    /// This is the inverse of [`Scene::delete_selected`] - delete opens the shell where the selection was,
+    /// filling closes it again - and the two differ in exactly one respect that matters to this layer. A
+    /// fill **appends**: it adds a face and the half-edges bounding it and removes nothing, so no id moves
+    /// and there is no [`crate::mesh_edit::IdRemap`] to carry. The selection is therefore left exactly
+    /// where it was, which is also what Maya does with a command that was never driven by the selection in
+    /// the first place. Whatever the user was holding stays valid, and nothing needs re-checking against
+    /// the rebuilt mesh the way a delete's does.
+    ///
+    /// Every opening closes in the one step, including any the user did not mean to touch - the honest
+    /// reading of a command with no selection to scope it. It is worth knowing before pressing, and it is
+    /// why the echo counts: "Filled 2 openings" is the warning when the mesh had more holes than expected.
+    ///
+    /// Returns what was closed, or every reason nothing can be, the document and history untouched.
+    pub fn fill_holes(&mut self) -> Result<FillCommit, TopologyErrors> {
+        self.begin_action("Fill Hole");
+        let mut mesh = self.mesh.clone();
+        match mesh.fill_holes() {
+            Ok(closed) => {
+                let commit = FillCommit {
+                    faces: closed.faces.len(),
+                    corners: closed.corners,
+                };
+                self.mesh = mesh;
+                self.dirty = true;
+                self.end_action();
+                Ok(commit)
+            }
+            Err(errors) => {
+                // Nothing reached the mesh, so there is no step worth recording - and an action left open
+                // would file the *next* edit under this one.
+                self.cancel_action();
+                Err(errors)
+            }
         }
     }
 
@@ -2477,5 +2539,204 @@ mod tests {
             .delete_selected()
             .expect_err("a dead face id names nothing to remove");
         expect_reason(&errors, "no face is selected");
+    }
+
+    #[test]
+    fn fill_is_off_until_the_mesh_has_an_opening() {
+        let scene = Scene::new();
+        assert!(
+            !scene.can_fill_holes(),
+            "a closed cube has nothing to close, so the row must not look live"
+        );
+
+        let mut opened = scene_holding_faces(&[0]);
+        opened
+            .delete_selected()
+            .expect("one selected face of the cube should delete");
+        assert!(
+            opened.can_fill_holes(),
+            "the moment there is a rim, the button and the menu row come alive"
+        );
+
+        // Availability is a property of the mesh, not of the mode or the selection: the command takes the
+        // whole document, so it has to look live in Object mode with nothing held, exactly as it does in
+        // Face mode. A button that greyed out on an empty selection would be refusing for a reason the
+        // command itself does not have.
+        opened.set_mode(EditMode::Object);
+        opened.selection.faces_mut().clear();
+        assert!(
+            opened.can_fill_holes(),
+            "the opening is still there, so the row stays live with nothing selected"
+        );
+
+        let mut closing = scene_holding_faces(&[0]);
+        closing
+            .delete_selected()
+            .expect("open the cube, then close it again");
+        closing.fill_holes().expect("the opening should close");
+        assert!(
+            !closing.can_fill_holes(),
+            "once the shell is closed the row goes grey again"
+        );
+    }
+
+    #[test]
+    fn filling_closes_the_opening_a_delete_left_in_one_undoable_step() {
+        let mut scene = scene_holding_faces(&[0]);
+        scene
+            .delete_selected()
+            .expect("open the cube by deleting its front face");
+        let opened = scene.mesh().clone();
+        assert_eq!(scene.mesh().faces.len(), 5);
+
+        let closed = scene
+            .fill_holes()
+            .expect("the opening should close without further ceremony");
+
+        assert_eq!(closed.faces, 1);
+        assert_eq!(
+            closed.corners,
+            vec![4],
+            "the cap is the quad that was deleted"
+        );
+        assert_eq!(scene.mesh().faces.len(), 6);
+        assert!(
+            scene.mesh().boundary_edges().is_empty(),
+            "nothing is left open, so the shell is a solid again"
+        );
+        assert_eq!(scene.undo_label(), Some("Fill Hole"));
+
+        assert!(scene.undo(), "one press of Ctrl+Z opens it again");
+        assert_eq!(
+            scene.mesh(),
+            &opened,
+            "undo lands exactly on the opened document"
+        );
+        assert!(scene.redo(), "and redo closes it once more");
+        assert_eq!(scene.mesh().faces.len(), 6);
+    }
+
+    #[test]
+    fn deleting_then_filling_gives_the_solid_back_but_not_its_numbers() {
+        // Delete renumbers and fill appends, so the round trip restores the *shape* and not the ids -
+        // §3.5's caveat arriving in the user's hands rather than in a primitive's return value. A face held
+        // across the pair does not name what it named before, and no amount of remapping at the fill fixes
+        // that, because the fill is the one half with nothing to remap. Pinning it here is what stops
+        // "delete then fill is a no-op" ever being assumed.
+        let mut scene = scene_holding_faces(&[0]);
+        let cube = scene.mesh().clone();
+        let centres: Vec<Point3<f32>> = (0..cube.faces.len())
+            .map(|index| cube.face_center(FaceId(index)))
+            .collect();
+
+        scene
+            .delete_selected()
+            .expect("open the cube by deleting its front face");
+        scene.fill_holes().expect("close it again");
+
+        let mesh = scene.mesh();
+        assert_eq!(mesh.faces.len(), 6);
+        assert!(mesh.boundary_edges().is_empty());
+        mesh.validate()
+            .unwrap_or_else(|errors| panic!("a refilled cube should validate: {errors:?}"));
+
+        for centre in &centres {
+            assert!(
+                (0..mesh.faces.len())
+                    .any(|index| (mesh.face_center(FaceId(index)) - *centre).magnitude() < 1e-6),
+                "a face was lost between the delete and the fill"
+            );
+        }
+
+        assert_ne!(
+            mesh.face_center(FaceId(0)),
+            centres[0],
+            "the deleted face was dense-packed out of the way, so index 0 is somebody else now"
+        );
+        assert!(
+            (mesh.face_center(FaceId(mesh.faces.len() - 1)) - centres[0]).magnitude() < 1e-6,
+            "it came back at the end of the list, which is where an append puts a face"
+        );
+    }
+
+    #[test]
+    fn a_fill_leaves_the_selection_exactly_where_it_was() {
+        // The promise that makes a fill need no remap pass: it appends, so a face id held across it still
+        // names the same geometry. Were filling ever rewritten to rebuild, this is the Scene-level test that
+        // would fail, one layer above where the ids are actually handed to the user.
+        let mut scene = scene_holding_faces(&[0]);
+        scene
+            .delete_selected()
+            .expect("open the cube by deleting its front face");
+        let held = FaceId(1);
+        scene.selection.faces_mut().clear();
+        scene.selection.faces_mut().insert(held);
+        let before = scene.mesh().face_positions(held);
+
+        scene.fill_holes().expect("close the opening");
+
+        assert_eq!(
+            scene.selection.faces(),
+            &std::collections::HashSet::from([held]),
+            "a fill removes nothing, so the highlight stays on the face it was on"
+        );
+        assert_eq!(
+            scene.mesh().face_positions(held),
+            before,
+            "and that id still names the corners it named before"
+        );
+    }
+
+    #[test]
+    fn every_opening_in_the_document_closes_in_one_history_step() {
+        let mut scene = scene_holding_faces(&[0, 2]);
+        scene
+            .delete_selected()
+            .expect("two opposite faces of the cube should delete");
+        assert_eq!(scene.mesh().faces.len(), 4);
+        assert_eq!(scene.mesh().boundary_edges().len(), 8);
+
+        let closed = scene
+            .fill_holes()
+            .expect("both ends of the tube should close together");
+
+        assert_eq!(closed.faces, 2, "one cap per opening");
+        assert_eq!(closed.corners, vec![4, 4]);
+        assert_eq!(scene.mesh().faces.len(), 6);
+        assert!(scene.mesh().boundary_edges().is_empty());
+
+        assert!(scene.undo(), "two caps, one step");
+        assert_eq!(
+            scene.mesh().faces.len(),
+            4,
+            "undo walks the whole fill back at once, not one cap at a time"
+        );
+    }
+
+    #[test]
+    fn filling_a_closed_document_records_nothing_in_history() {
+        // The same rule a delete holds to: a press that changed nothing must not leave a step for Ctrl+Z to
+        // walk back through, and must not wedge history open so the next real edit is filed under it.
+        let mut scene = Scene::new();
+        let before = scene.mesh().clone();
+        assert!(!scene.can_undo());
+
+        let errors = scene
+            .fill_holes()
+            .expect_err("a closed cube has no opening to close");
+        expect_reason(&errors, "no opening to fill");
+
+        assert_eq!(scene.mesh(), &before, "the document is untouched");
+        assert!(
+            !scene.can_undo(),
+            "a refusal must not leave a step behind for Ctrl+Z"
+        );
+
+        scene.set_mode(EditMode::Face);
+        scene.selection.faces_mut().insert(FaceId(0));
+        scene
+            .delete_selected()
+            .expect("the next real edit still records cleanly");
+        assert_eq!(scene.undo_label(), Some("Delete Face"));
     }
 }

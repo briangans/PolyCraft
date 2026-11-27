@@ -1037,6 +1037,51 @@ impl<'a> State<'a> {
         }
     }
 
+    /// Grows a face across every opening in the mesh and echoes how many closed.
+    ///
+    /// The gesture in flight is closed first for the reason `delete_selected` documents, and the reason is
+    /// as sharp here: an armed extrude previews from the snapshot taken when it was armed, so writing caps
+    /// into the document and then letting that drag settle would paste the pre-fill faces back over the
+    /// top of them. Nothing of its own follows a fill - the cursor decides nothing - so there is no state to
+    /// hand over, and a refusal arrives as a notice rather than silence.
+    pub fn fill_holes(&mut self) {
+        self.cancel_active_drag();
+
+        match self.scene.fill_holes() {
+            Ok(closed) => {
+                let mut echo = format!(
+                    "Filled {} {}",
+                    closed.faces,
+                    if closed.faces == 1 {
+                        "opening"
+                    } else {
+                        "openings"
+                    }
+                );
+                // Worth spelling out only when the caps were not all the same shape, because the count is
+                // what tells a user that the command reached openings they had not meant to close - and a
+                // triangle in the list is the sign the rim was not the clean quad a delete leaves. Read off
+                // `first` rather than indexed, so an echo can never be the thing that panics whatever the
+                // primitive handed back.
+                let mixed = closed
+                    .corners
+                    .first()
+                    .is_some_and(|&first| closed.corners.iter().any(|&corners| corners != first));
+                if mixed {
+                    let shapes = closed
+                        .corners
+                        .iter()
+                        .map(|corners| corners.to_string())
+                        .collect::<Vec<String>>()
+                        .join(", ");
+                    echo.push_str(&format!(" ({shapes} corners each)"));
+                }
+                self.notice = Some(echo);
+            }
+            Err(errors) => self.notice = Some(errors.join(" ")),
+        }
+    }
+
     /// Moves the cursor along the armed extrude's travel axis, re-previewing the lump where it now stands.
     fn track_extrude_drag(&mut self, ray: &Ray) {
         // `Scene` is the authority on whether a drag is open. A mode or tool switch arriving from the
@@ -1447,6 +1492,9 @@ impl<'a> State<'a> {
         if response.delete {
             self.delete_selected();
         }
+        if response.fill_holes {
+            self.fill_holes();
+        }
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -1479,6 +1527,7 @@ impl<'a> State<'a> {
                 can_insert_edge_loop: self.scene.can_insert_edge_loop(),
                 can_bevel: self.scene.can_bevel(),
                 can_delete: self.scene.can_delete(),
+                can_fill_holes: self.scene.can_fill_holes(),
                 space: self.scene.space(),
                 notice: self.notice.as_deref(),
             },
